@@ -1,0 +1,43 @@
+# Build artifacts
+build/
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+CTestTestfile.cmake
+cmake_install.cmake
+Makefile
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+*.dir/
+
+# Compiled objects / binaries
+*.obj
+*.o
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.a
+
+# Vela runtime sidecars (per-user state, not source)
+vela.config
+vela.recent
+vela.resume
+vela.session.m3u
+vela.window
+snapshot_*.png
+
+# Editor / IDE noise
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Leftover working file from earlier session - not source
+UIController_modified.txt
