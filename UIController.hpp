@@ -234,6 +234,14 @@ private:
     void cycleABLoop();
     void checkABLoop();
 
+    // Container chapters (MKV / MP4), cached at loadPath so the render loop
+    // doesn't walk fmt_ctx_->chapters every frame. Empty when the file has
+    // no chapters or nothing is loaded. Rendered as small ticks on the seek
+    // bar; Alt+Left/Right jump between them.
+    std::vector<VideoPlayer::Chapter> chapters_;
+    void seekPrevChapter();
+    void seekNextChapter();
+
     // External subtitles (auto-loaded from basename.srt / basename.smi).
     std::vector<SubtitleCue> subtitles_;
     bool subtitles_enabled_ = true;

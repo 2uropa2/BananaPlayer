@@ -591,6 +591,26 @@ void VideoPlayer::flushQueues() {
     if (audio_stream_) SDL_ClearAudioStream(audio_stream_);
 }
 
+std::vector<VideoPlayer::Chapter> VideoPlayer::getChapters() const {
+    std::vector<Chapter> out;
+    if (!fmt_ctx_ || fmt_ctx_->nb_chapters == 0) return out;
+    out.reserve(fmt_ctx_->nb_chapters);
+    for (unsigned int i = 0; i < fmt_ctx_->nb_chapters; ++i) {
+        const AVChapter* c = fmt_ctx_->chapters[i];
+        if (!c) continue;
+        Chapter ch;
+        double tb = av_q2d(c->time_base);
+        ch.start = (double)c->start * tb;
+        ch.end   = (double)c->end   * tb;
+        if (c->metadata) {
+            AVDictionaryEntry* t = av_dict_get(c->metadata, "title", nullptr, 0);
+            if (t && t->value) ch.title = t->value;
+        }
+        out.push_back(std::move(ch));
+    }
+    return out;
+}
+
 int VideoPlayer::getAudioTrackCount() const {
     if (!fmt_ctx_) return 0;
     int n = 0;

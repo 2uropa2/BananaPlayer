@@ -284,6 +284,8 @@ bool UIController::loadPath(const std::string& path) {
     {
         // Refresh onEnded (loadFile does not clear it, but be safe)
         if (!player_->onEnded) player_->onEnded = [this]() { handleNaturalEnd(); };
+        // Cache container chapters up front; empty vector for files without.
+        chapters_ = player_->getChapters();
         addRecent(path);
         // Update playlist current selection to match (or append)
         bool found = false;
@@ -717,6 +719,7 @@ void UIController::closeCurrent() {
     subtitle_cache_idx_ = 0;
     loop_a_ = -1.0;
     loop_b_ = -1.0;
+    chapters_.clear();
     // Not playing a YouTube-resolved stream anymore - drop the source URL
     // so the top-overlay quality pill disappears.
     current_yt_source_url_.clear();
@@ -966,6 +969,7 @@ void UIController::drawShortcutsPanel(int W, int H) {
             { "Home  /  End",    "Jump to start / near end" },
             { ",  /  .",         "Frame step" },
             { "A",               "A-B loop: set A / set B / clear" },
+            { "Alt + Left / Right","Previous / next chapter" },
         }},
         { "Sync", {
             { "Ctrl + Left / Right",       "Shift video by -/+ 30 ms" },
@@ -1353,6 +1357,56 @@ void UIController::drawSubtitles(int W, int H) {
         dl->AddText(font, base_px, ImVec2(x, y), fg, s.c_str());
         y += line_h;
     }
+}
+
+void UIController::seekPrevChapter() {
+    if (!player_->isLoaded() || chapters_.empty()) {
+        showOsd("No chapters", 1.4f);
+        return;
+    }
+    double t = player_->getCurrentTime();
+    // "Previous" jumps to the start of the current chapter if we're more
+    // than ~1.5 s in - matches the way a music player's Prev button works.
+    // Only skips to the chapter before that if we're already near its start.
+    int target = 0;
+    for (int i = (int)chapters_.size() - 1; i >= 0; --i) {
+        if (chapters_[i].start <= t + 1e-3) {
+            target = (t - chapters_[i].start > 1.5 || i == 0) ? i : i - 1;
+            break;
+        }
+    }
+    player_->seek(chapters_[target].start);
+    char buf[192];
+    if (!chapters_[target].title.empty()) {
+        std::snprintf(buf, sizeof(buf), "Chapter: %s", chapters_[target].title.c_str());
+    } else {
+        std::snprintf(buf, sizeof(buf), "Chapter %d / %d",
+                      target + 1, (int)chapters_.size());
+    }
+    showOsd(buf, 1.6f);
+}
+
+void UIController::seekNextChapter() {
+    if (!player_->isLoaded() || chapters_.empty()) {
+        showOsd("No chapters", 1.4f);
+        return;
+    }
+    double t = player_->getCurrentTime();
+    for (size_t i = 0; i < chapters_.size(); ++i) {
+        if (chapters_[i].start > t + 0.25) {   // ignore floating-point noise near boundary
+            player_->seek(chapters_[i].start);
+            char buf[192];
+            if (!chapters_[i].title.empty()) {
+                std::snprintf(buf, sizeof(buf), "Chapter: %s", chapters_[i].title.c_str());
+            } else {
+                std::snprintf(buf, sizeof(buf), "Chapter %d / %d",
+                              (int)i + 1, (int)chapters_.size());
+            }
+            showOsd(buf, 1.6f);
+            return;
+        }
+    }
+    showOsd("Last chapter", 1.4f);
 }
 
 void UIController::cycleABLoop() {
@@ -1990,6 +2044,62 @@ void UIController::drawBottomOverlay(int W, int H, float alpha) {
         ImVec2 rmax = ImGui::GetItemRectMax();
         last_seekbar_rect_ = ImVec4(rmin.x, rmin.y, rmax.x, rmax.y);
     }
+    // Draw chapter tick markers over the seek bar. A muted sky-blue post
+    // per chapter start, skipping the file-start (0.0) which would sit
+    // under the fill's left edge. When the cursor is over the seek bar
+    // AND near a chapter tick, a small floating title is rendered above
+    // the bar - independent of the hover-thumbnail feature so it works
+    // even when thumbnails are disabled.
+    if (dur > 0.0f && !chapters_.empty()) {
+        ImVec2 rmin = ImGui::GetItemRectMin();
+        ImVec2 rmax = ImGui::GetItemRectMax();
+        ImDrawList* sdl_dl = ImGui::GetWindowDrawList();
+        ImU32 tick_col = Style::Fade(IM_COL32(180, 220, 255, 210), alpha);
+        for (const auto& ch : chapters_) {
+            if (ch.start <= 0.05 || ch.start >= dur) continue;
+            float x = rmin.x + (float)(ch.start / dur) * (rmax.x - rmin.x);
+            sdl_dl->AddRectFilled(ImVec2(x - 1.0f, rmin.y - 2.0f),
+                                  ImVec2(x + 1.0f, rmax.y + 2.0f),
+                                  tick_col);
+        }
+        // Hover-based tooltip. Cursor must be over the seek bar rect and
+        // within +/- 6 px of a chapter tick's x. Uses foreground draw list
+        // so it lands above the seek fill.
+        ImGuiIO& io = ImGui::GetIO();
+        float mx = io.MousePos.x, my = io.MousePos.y;
+        if (mx >= rmin.x && mx <= rmax.x && my >= rmin.y - 2.0f && my <= rmax.y + 12.0f) {
+            const VideoPlayer::Chapter* hover_ch = nullptr;
+            for (const auto& ch : chapters_) {
+                if (ch.start <= 0.05 || ch.start >= dur) continue;
+                float x = rmin.x + (float)(ch.start / dur) * (rmax.x - rmin.x);
+                if (std::fabs(mx - x) < 6.0f) { hover_ch = &ch; break; }
+            }
+            if (hover_ch) {
+                char label[256];
+                if (!hover_ch->title.empty()) {
+                    std::snprintf(label, sizeof(label), "%s  (%s)",
+                                  hover_ch->title.c_str(),
+                                  formatTime(hover_ch->start).c_str());
+                } else {
+                    std::snprintf(label, sizeof(label), "Chapter at %s",
+                                  formatTime(hover_ch->start).c_str());
+                }
+                ImDrawList* fg = ImGui::GetForegroundDrawList();
+                ImVec2 tsz = ImGui::CalcTextSize(label);
+                float pad = 6.0f;
+                float tx = std::clamp(mx - tsz.x * 0.5f,
+                                      rmin.x, rmax.x - tsz.x - 2.0f * pad);
+                float ty = rmin.y - tsz.y - 10.0f;
+                if (ty < 4.0f) ty = rmax.y + 6.0f;    // flip below if too high
+                fg->AddRectFilled(ImVec2(tx, ty),
+                                  ImVec2(tx + tsz.x + 2.0f * pad, ty + tsz.y + 6.0f),
+                                  IM_COL32(20, 26, 36, 230), 4.0f);
+                fg->AddText(ImVec2(tx + pad, ty + 3.0f),
+                            IM_COL32(220, 232, 255, 255), label);
+            }
+        }
+    }
+
     // Draw A-B loop markers over the seek bar (uses the button's rect).
     if (dur > 0.0f && (loop_a_ >= 0.0 || loop_b_ >= 0.0)) {
         ImVec2 rmin = ImGui::GetItemRectMin();
@@ -2950,6 +3060,17 @@ void UIController::handleEvent(const SDL_Event& event) {
                 showOsd(buf);
                 markConfigDirty();
             }
+            return;
+        }
+        // Alt+Left / Alt+Right - previous / next container chapter. Falls
+        // back to a "No chapters" OSD when the file has none. Checked
+        // BEFORE the plain 5-second seek so Alt+arrow doesn't nudge time.
+        if (key == SDLK_LEFT && (mod & SDL_KMOD_ALT)) {
+            seekPrevChapter();
+            return;
+        }
+        if (key == SDLK_RIGHT && (mod & SDL_KMOD_ALT)) {
+            seekNextChapter();
             return;
         }
         if (key == SDLK_LEFT)  { if (player_->isLoaded()) { player_->seekRelative(-5.0); SEEK_OSD("- 5s"); } return; }

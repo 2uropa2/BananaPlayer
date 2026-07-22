@@ -77,6 +77,17 @@ public:
     // mixed images and videos doesn't blink past every image in a frame.
     bool isStillImage() const;
 
+    // Container chapters (MKV / MP4 chap0 boxes). Returned in file order
+    // with start / end in seconds; title empty when the container didn't
+    // set one. Cheap enough to call once per file load - UIController
+    // caches the result so the seek-bar draw path doesn't re-walk it.
+    struct Chapter {
+        double      start = 0.0;
+        double      end   = 0.0;
+        std::string title;
+    };
+    std::vector<Chapter> getChapters() const;
+
     // Clockwise rotation encoded in the container's video display matrix
     // (or the legacy `rotate` metadata as a fallback). 0 / 90 / 180 / 270.
     // Portrait phone videos are typically stored as landscape pixels with
