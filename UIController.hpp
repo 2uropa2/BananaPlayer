@@ -198,6 +198,22 @@ private:
     void drawSubtitles(int W, int H);
     void cycleSubtitleSize();
     float subtitleBasePx(int W) const;
+    // Shared subtitle-load path used by both the drag-drop handler and
+    // the Settings > Subtitles > Load Subtitle... menu item. Returns true
+    // on parse success; caller decides whether to OSD or not. Loads the
+    // file as UTF-8 (or CP949 fallback), parses SRT / SMI by extension,
+    // and swaps in the resulting cues without touching playback state.
+    bool loadSubtitleSidecar(const std::string& path);
+    // Presents a Win32 Open File dialog filtered to .srt / .smi and,
+    // on success, calls loadSubtitleSidecar with an appropriate OSD.
+    // No-ops with an OSD if no video is currently loaded.
+    void openSubtitleDialog();
+
+    // Ctrl+= : resize the window so its client area matches the video's
+    // post-rotation aspect ratio, filling up to ~85 % of the current
+    // display's usable bounds. No-ops (with OSD) if no video is loaded
+    // or the window is fullscreen; un-maximizes first if maximized.
+    void snapWindowToVideo();
 
     // Modal help panels.
     bool show_shortcuts_ = false;
