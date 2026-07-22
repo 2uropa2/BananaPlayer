@@ -250,6 +250,12 @@ bool UIController::loadPath(const std::string& path) {
     snapshotCurrentResume();
     if (resume_dirty_) writeResumeIndex();
 
+    // Loading a non-YouTube file (direct file/URL): the current YouTube
+    // source URL, if any, is now stale. The YouTube-resolve callers use
+    // loadResolvedYoutubeUrl() below which saves/restores this so a
+    // quality re-resolve doesn't lose the source URL.
+    current_yt_source_url_.clear();
+
     // A-B loop is per-file: clear it when the file changes.
     loop_a_ = -1.0;
     loop_b_ = -1.0;
@@ -392,6 +398,59 @@ bool UIController::isYoutubeUrl(const std::string& s) {
     return false;
 }
 
+namespace {
+
+// Human-readable label for the YouTube quality pill / menu items. Kept
+// short so the top-overlay pill stays compact at 640x400.
+const char* youtubeQualityLabel(YoutubeQuality q) {
+    switch (q) {
+        case YoutubeQuality::Auto:      return "Auto";
+        case YoutubeQuality::Q1080:     return "1080p";
+        case YoutubeQuality::Q720:      return "720p";
+        case YoutubeQuality::Q480:      return "480p";
+        case YoutubeQuality::AudioOnly: return "Audio";
+    }
+    return "Auto";
+}
+
+// yt-dlp -f selector string. Single-file selectors only - the
+// video+audio-merged path requires a two-URL refactor of VideoPlayer.
+const char* youtubeQualityFormat(YoutubeQuality q) {
+    switch (q) {
+        case YoutubeQuality::Auto:      return "best";
+        case YoutubeQuality::Q1080:     return "best[height<=1080]";
+        case YoutubeQuality::Q720:      return "best[height<=720]";
+        case YoutubeQuality::Q480:      return "best[height<=480]";
+        case YoutubeQuality::AudioOnly: return "bestaudio";
+    }
+    return "best";
+}
+
+// Parse the persisted string form (auto|1080|720|480|audio) back to the
+// enum. Unknown values fall back to Auto so hand-edited configs don't
+// break future starts.
+YoutubeQuality youtubeQualityFromString(const char* s) {
+    if      (std::strcmp(s, "auto")  == 0) return YoutubeQuality::Auto;
+    else if (std::strcmp(s, "1080")  == 0) return YoutubeQuality::Q1080;
+    else if (std::strcmp(s, "720")   == 0) return YoutubeQuality::Q720;
+    else if (std::strcmp(s, "480")   == 0) return YoutubeQuality::Q480;
+    else if (std::strcmp(s, "audio") == 0) return YoutubeQuality::AudioOnly;
+    return YoutubeQuality::Auto;
+}
+
+const char* youtubeQualityToString(YoutubeQuality q) {
+    switch (q) {
+        case YoutubeQuality::Auto:      return "auto";
+        case YoutubeQuality::Q1080:     return "1080";
+        case YoutubeQuality::Q720:      return "720";
+        case YoutubeQuality::Q480:      return "480";
+        case YoutubeQuality::AudioOnly: return "audio";
+    }
+    return "auto";
+}
+
+} // namespace
+
 void UIController::openAny(const std::string& path) {
     if (isYoutubeUrl(path)) {
         // Kick off a background yt-dlp resolve. The user sees the OSD
@@ -424,11 +483,27 @@ void UIController::openAny(const std::string& path) {
             }
             showOsd("Resolving YouTube...", 10.0f);
         }
-        pending_yt_request_id_ = yt_resolver_->requestResolve(path);
+        // Remember the source page URL BEFORE dispatching so the top-
+        // overlay quality pill has something to show as soon as playback
+        // begins. Also so that a quality change mid-playback can re-
+        // resolve the same source URL.
+        current_yt_source_url_ = path;
+        pending_yt_request_id_ = yt_resolver_->requestResolve(
+            path, youtubeQualityFormat(youtube_quality_));
         pending_yt_source_url_ = path;
         return;
     }
     loadPath(path);
+}
+
+bool UIController::loadResolvedYoutubeUrl(const std::string& media_url) {
+    // Preserve the source URL across the loadPath() call - loadPath clears
+    // current_yt_source_url_ unconditionally so a subsequent direct-file
+    // load doesn't hold onto a stale YouTube badge.
+    std::string saved = current_yt_source_url_;
+    bool ok = loadPath(media_url);
+    current_yt_source_url_ = std::move(saved);
+    return ok;
 }
 
 void UIController::addRecent(const std::string& path) {
@@ -642,6 +717,9 @@ void UIController::closeCurrent() {
     subtitle_cache_idx_ = 0;
     loop_a_ = -1.0;
     loop_b_ = -1.0;
+    // Not playing a YouTube-resolved stream anymore - drop the source URL
+    // so the top-overlay quality pill disappears.
+    current_yt_source_url_.clear();
     if (thumb_provider_) thumb_provider_->close();
     SDL_SetWindowTitle(window_, "Vela");
     showOsd("Closed");
@@ -1333,7 +1411,10 @@ void UIController::render(int W, int H) {
         while (yt_resolver_->tryDrainResult(yr)) {
             if (yr.id != pending_yt_request_id_) continue;   // stale
             if (yr.ok) {
-                loadPath(yr.media_url);
+                // Use the resolved-URL loader so current_yt_source_url_
+                // survives the load - the quality pill needs it, and a
+                // subsequent quality change needs to re-resolve it.
+                loadResolvedYoutubeUrl(yr.media_url);
             } else {
                 if (!yt_resolver_->ytDlpAvailable()) {
                     showOsd("yt-dlp not found - install: winget install yt-dlp", 4.5f);
@@ -1733,6 +1814,85 @@ void UIController::drawTopOverlay(int W, int H, float alpha) {
         if (Style::IconButton("close_fs", Style::Icon::Close, ImVec2(sz, sz),
                               "Exit fullscreen (Esc)", false, 1.0f, alpha)) {
             setFullscreen(false);
+        }
+    }
+
+    // YouTube quality pill - right-aligned, drawn only while a YouTube
+    // resolved stream is playing. Sits left of the fullscreen close
+    // button when in fullscreen. Click opens a popup with the 5 quality
+    // choices. Visual language matches the PLAYLIST N/M badge (rounded
+    // pill, blue accent) so the top-overlay row reads as one system.
+    if (!current_yt_source_url_.empty()) {
+        ImFont* font = ImGui::GetFont();
+        char pill_buf[24];
+        std::snprintf(pill_buf, sizeof(pill_buf), "YT  %s",
+                      youtubeQualityLabel(youtube_quality_));
+        const float pill_font_sz = 13.0f;
+        ImVec2 pd = font->CalcTextSizeA(pill_font_sz, FLT_MAX, 0.0f, pill_buf);
+        const float pad_x  = 12.0f;
+        const float pad_y  = 5.0f;
+        const float pill_w = pd.x + pad_x * 2.0f;
+        const float pill_h = pd.y + pad_y * 2.0f;
+        // Reserve room for the fullscreen close button so the pill never
+        // overlaps it. Right margin matches the close button's own margin
+        // for visual balance.
+        const float right_margin = 12.0f;
+        const float close_reserve = fullscreen_ ? (32.0f + 8.0f) : 0.0f;
+        float x = (float)W - right_margin - close_reserve - pill_w;
+        float y = 16.0f;
+        if (x < 8.0f) x = 8.0f;   // hard-guard against negatives at extreme widths
+        ImGui::SetCursorScreenPos(ImVec2(x, y));
+        ImGui::InvisibleButton("##yt_quality_pill", ImVec2(pill_w, pill_h));
+        bool hovered = ImGui::IsItemHovered();
+        bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+        if (hovered) {
+            ImGui::SetTooltip("YouTube quality  (click to change)");
+        }
+        if (clicked) {
+            ImGui::OpenPopup("##yt_quality_popup");
+        }
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        // Slightly brighter blue on hover for affordance, matching the
+        // hover tint IconButton uses elsewhere. Alpha rides the overlay
+        // fade so the pill vanishes with the rest of the chrome.
+        ImU32 bg = hovered
+            ? Style::Fade(IM_COL32(88, 156, 232, 235), alpha)
+            : Style::Fade(IM_COL32(64, 132, 216, 215), alpha);
+        ImVec2 tl(x, y);
+        ImVec2 br(x + pill_w, y + pill_h);
+        float br_r = pill_h * 0.5f;
+        dl->AddRectFilled(tl, br, bg, br_r);
+        // Same hairline highlight the Badge helper uses for a "physical"
+        // pill feel.
+        dl->AddLine(ImVec2(tl.x + br_r * 0.6f, tl.y + 0.5f),
+                    ImVec2(br.x - br_r * 0.6f, tl.y + 0.5f),
+                    Style::Fade(IM_COL32(255, 255, 255, 70), alpha), 1.0f);
+        dl->AddText(font, pill_font_sz, ImVec2(x + pad_x, y + pad_y),
+                    Style::Fade(IM_COL32(245, 250, 255, 255), alpha), pill_buf);
+
+        if (ImGui::BeginPopup("##yt_quality_popup")) {
+            struct Entry { const char* label; YoutubeQuality q; };
+            Entry opts[] = {
+                {"Auto (best available)", YoutubeQuality::Auto},
+                {"1080p",                 YoutubeQuality::Q1080},
+                {"720p",                  YoutubeQuality::Q720},
+                {"480p",                  YoutubeQuality::Q480},
+                {"Audio only",            YoutubeQuality::AudioOnly},
+            };
+            for (auto& e : opts) {
+                bool selected = (youtube_quality_ == e.q);
+                if (ImGui::MenuItem(e.label, nullptr, selected)) {
+                    youtube_quality_ = e.q;
+                    markConfigDirty();
+                    if (!current_yt_source_url_.empty()) {
+                        // Re-resolve the same source at the new quality.
+                        // Position is lost - accepted tradeoff, same as
+                        // the Settings-menu path.
+                        openAny(current_yt_source_url_);
+                    }
+                }
+            }
+            ImGui::EndPopup();
         }
     }
 
@@ -2242,6 +2402,35 @@ void UIController::drawMainMenuContents() {
         }
         ImGui::Separator();
         ImGui::TextDisabled("Ctrl+R cycles");
+        ImGui::EndMenu();
+    }
+
+    if (ImGui::BeginMenu("YouTube Quality")) {
+        struct Entry { const char* label; YoutubeQuality q; };
+        Entry opts[] = {
+            {"Auto (best available)", YoutubeQuality::Auto},
+            {"1080p",                 YoutubeQuality::Q1080},
+            {"720p",                  YoutubeQuality::Q720},
+            {"480p",                  YoutubeQuality::Q480},
+            {"Audio only",            YoutubeQuality::AudioOnly},
+        };
+        for (auto& e : opts) {
+            bool selected = (youtube_quality_ == e.q);
+            if (ImGui::MenuItem(e.label, nullptr, selected)) {
+                youtube_quality_ = e.q;
+                markConfigDirty();
+                // If a YouTube-resolved video is currently playing, re-
+                // resolve at the new quality. Position is lost - accepted
+                // tradeoff, same as switching audio track mid-play.
+                if (!current_yt_source_url_.empty()) {
+                    openAny(current_yt_source_url_);
+                } else {
+                    showOsd(std::string("YouTube quality: ") + youtubeQualityLabel(e.q));
+                }
+            }
+        }
+        ImGui::Separator();
+        ImGui::TextDisabled("Single-URL formats only");
         ImGui::EndMenu();
     }
 
@@ -3180,6 +3369,7 @@ void UIController::loadConfig() {
         }
         else if (std::strcmp(k, "shuffle") == 0)         playlist_.setShuffle(std::atoi(v) != 0);
         else if (std::strcmp(k, "thumbnail_preview") == 0) thumbnail_preview_enabled_ = std::atoi(v) != 0;
+        else if (std::strcmp(k, "youtube_quality") == 0) youtube_quality_ = youtubeQualityFromString(v);
         // A/V sync offset is deliberately NOT persisted - it's a per-file
         // transient (each file has its own encoder/mux quirks) and carrying
         // yesterday's -300 ms nudge into today's file would look like the
@@ -3210,6 +3400,7 @@ void UIController::saveConfig() {
     std::fprintf(fp, "repeat_mode=%d\n",        (int)playlist_.repeatMode());
     std::fprintf(fp, "shuffle=%d\n",            playlist_.shuffle() ? 1 : 0);
     std::fprintf(fp, "thumbnail_preview=%d\n",  thumbnail_preview_enabled_ ? 1 : 0);
+    std::fprintf(fp, "youtube_quality=%s\n",    youtubeQualityToString(youtube_quality_));
     // NOTE: rotation AND av_sync_offset are deliberately NOT saved -
     // both are per-file transients. See loadConfig for the ignore branches.
     std::fclose(fp);

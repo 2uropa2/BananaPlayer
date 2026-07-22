@@ -30,6 +30,18 @@ enum class SubtitleSize {
     XL,
 };
 
+// yt-dlp -f selector presets for YouTube playback. All entries are
+// single-file selectors because VideoPlayer::loadFile handles one URL;
+// a merged video+audio path (needed for true 1080p+ on YouTube) would
+// require a two-URL refactor that's out of scope for this slice.
+enum class YoutubeQuality {
+    Auto,       // "best"                - highest single-file quality
+    Q1080,      // "best[height<=1080]"  - cap at 1080
+    Q720,       // "best[height<=720]"
+    Q480,       // "best[height<=480]"
+    AudioOnly,  // "bestaudio"           - audio-only track (no picture)
+};
+
 class UIController {
 public:
     UIController(VideoPlayer* player, SDL_Window* window, SDL_Renderer* renderer);
@@ -271,6 +283,20 @@ private:
     std::unique_ptr<YoutubeResolver> yt_resolver_;
     uint64_t     pending_yt_request_id_ = 0;
     std::string  pending_yt_source_url_;
+
+    // Source YouTube page URL for the currently-playing video (empty when
+    // playback isn't from a YouTube resolve). Distinct from pending_yt_*:
+    // the pending one clears the moment the resolve completes; this one
+    // stays set as long as the YouTube-resolved stream plays, so quality
+    // changes mid-playback can re-resolve the same source URL.
+    std::string  current_yt_source_url_;
+    YoutubeQuality youtube_quality_ = YoutubeQuality::Auto;
+
+    // Internal load path used by the render drain block after a YouTube
+    // resolve completes. Same as loadPath() except it does NOT clear
+    // current_yt_source_url_ - we still need that URL to re-resolve if
+    // the user changes quality later.
+    bool loadResolvedYoutubeUrl(const std::string& media_url);
 
     // Modal help panels.
     bool show_shortcuts_ = false;

@@ -49,7 +49,13 @@ public:
     // Non-blocking. Returns a monotonically increasing request id. Calls
     // TerminateProcess on any yt-dlp child from a previous still-in-flight
     // request so only the newest one lands in the drain queue.
-    uint64_t requestResolve(const std::string& url);
+    //
+    // `format` is passed to yt-dlp as its `-f` selector. Defaults to "best"
+    // (highest single-file quality, no ext filter). Callers pick from a
+    // small enum of curated selectors in UIController; we don't validate
+    // here beyond passing the string through untouched.
+    uint64_t requestResolve(const std::string& url,
+                            const std::string& format = "best");
 
     // Main-thread poll. Returns true and fills `out` when a resolve
     // (matching or otherwise) has completed since the last drain. The
@@ -95,6 +101,7 @@ private:
     // TerminateProcess it if a newer request supersedes this one.
     bool runYtDlp(const std::string& yt_dlp_path,
                   const std::string& url,
+                  const std::string& format,
                   std::string&       out_media_url,
                   std::string&       err_msg);
 
@@ -117,6 +124,10 @@ private:
     bool        has_pending_       = false;
     uint64_t    pending_id_        = 0;
     std::string pending_url_;
+    // yt-dlp -f selector for the pending request. Threaded through the
+    // queue so quality changes made while a resolve is in flight take
+    // effect on the next request (the in-flight one is superseded).
+    std::string pending_format_;
     uint64_t    latest_request_id_ = 0;
     uint64_t    next_id_           = 1;
 
