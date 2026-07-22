@@ -159,6 +159,11 @@ private:
     // Ctrl+Shift+S: copies the current frame to the Windows clipboard as
     // a device-independent bitmap so it can be pasted into any app.
     void   snapshotToClipboard();
+    // Ctrl+V: read whatever is on the Windows clipboard - a dragged file
+    // (CF_HDROP), a URL, or a plain path (CF_UNICODETEXT) - and try to
+    // play it immediately. URLs go straight to FFmpeg's avformat_open_input;
+    // directory paths expand into a playlist just like drag-drop of a folder.
+    void   pasteAndPlay();
     // True if the given path's extension is one of our supported subtitle
     // formats (.srt, .smi). Used by the drop handler and the file dialog.
     static bool isSubtitleFile(const std::string& path);

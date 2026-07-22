@@ -440,6 +440,119 @@ void UIController::snapshotToClipboard() {
     CloseClipboard();
 }
 
+namespace {
+
+// Trim leading/trailing whitespace + surrounding angle brackets/quotes.
+// The angle-bracket case matters because email clients + Slack often
+// wrap pasted URLs in "<...>" or "\"...\"".
+std::string trimForClipboard(std::string s) {
+    auto is_ws = [](unsigned char c) {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == 0;
+    };
+    while (!s.empty() && is_ws((unsigned char)s.front())) s.erase(s.begin());
+    while (!s.empty() && is_ws((unsigned char)s.back()))  s.pop_back();
+    if (s.size() >= 2) {
+        char f = s.front(), b = s.back();
+        if ((f == '<' && b == '>') || (f == '"' && b == '"') ||
+            (f == '\'' && b == '\'')) {
+            s = s.substr(1, s.size() - 2);
+        }
+    }
+    return s;
+}
+
+bool looksLikeUrl(const std::string& s) {
+    // Cheap prefix check - avformat_open_input handles the actual protocol
+    // negotiation, we just decide whether to skip the "does this file exist"
+    // branch. Case-insensitive on the scheme.
+    static const char* kSchemes[] = {
+        "http://", "https://", "rtsp://", "rtmp://", "rtmps://",
+        "ftp://", "sftp://", "mms://", "mmsh://", "udp://", "srt://", "file://"
+    };
+    if (s.size() < 6) return false;
+    std::string lower = s.substr(0, 12);
+    for (auto& c : lower) c = (char)std::tolower((unsigned char)c);
+    for (const char* sch : kSchemes) {
+        size_t n = std::strlen(sch);
+        if (lower.size() >= n && lower.compare(0, n, sch) == 0) return true;
+    }
+    return false;
+}
+
+} // namespace
+
+void UIController::pasteAndPlay() {
+    if (!OpenClipboard(nullptr)) { showOsd("Clipboard busy"); return; }
+
+    std::string picked;
+
+    // Prefer CF_HDROP (a real file-drop token from Explorer) since it's
+    // unambiguous. Fall back to CF_UNICODETEXT which is what Ctrl+C on
+    // a URL or path produces from browsers / editors / chat apps.
+    if (HANDLE h = GetClipboardData(CF_HDROP)) {
+        HDROP drop = (HDROP)h;
+        UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+        if (count >= 1) {
+            wchar_t wbuf[MAX_PATH];
+            if (DragQueryFileW(drop, 0, wbuf, MAX_PATH) > 0) {
+                int u8len = WideCharToMultiByte(CP_UTF8, 0, wbuf, -1,
+                                                nullptr, 0, nullptr, nullptr);
+                if (u8len > 1) {
+                    std::string u8(u8len - 1, '\0');
+                    WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, u8.data(),
+                                        u8len, nullptr, nullptr);
+                    picked = u8;
+                }
+            }
+        }
+    }
+    if (picked.empty()) {
+        if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
+            if (wchar_t* wtext = (wchar_t*)GlobalLock(h)) {
+                int u8len = WideCharToMultiByte(CP_UTF8, 0, wtext, -1,
+                                                nullptr, 0, nullptr, nullptr);
+                if (u8len > 1) {
+                    std::string u8(u8len - 1, '\0');
+                    WideCharToMultiByte(CP_UTF8, 0, wtext, -1, u8.data(),
+                                        u8len, nullptr, nullptr);
+                    // Multi-line paste (e.g. copied a list): first non-empty
+                    // line wins. Rare, but leaves behavior predictable.
+                    size_t nl = u8.find_first_of("\r\n");
+                    if (nl != std::string::npos) u8 = u8.substr(0, nl);
+                    picked = u8;
+                }
+                GlobalUnlock(h);
+            }
+        }
+    }
+    CloseClipboard();
+
+    picked = trimForClipboard(std::move(picked));
+    if (picked.empty()) { showOsd("Clipboard is empty"); return; }
+
+    if (looksLikeUrl(picked)) {
+        showOsd("Opening URL...", 1.2f);
+        loadPath(picked);
+        return;
+    }
+
+    // Not a URL - assume file / folder path. Folders expand into the
+    // playlist the same way drag-drop of a folder does.
+    DWORD attrs = GetFileAttributesA(picked.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        // Might be a bare path without scheme that FFmpeg can still open
+        // (e.g. a UNC path). Try loadPath anyway; it will OSD "Cannot open"
+        // on failure so the user gets feedback either way.
+        loadPath(picked);
+        return;
+    }
+    if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+        enqueuePaths({ picked }, true);
+        return;
+    }
+    loadPath(picked);
+}
+
 void UIController::closeCurrent() {
     if (!player_->isLoaded()) return;
     // Snapshot resume before unload so the user can pick up where they
@@ -707,6 +820,7 @@ void UIController::drawShortcutsPanel(int W, int H) {
         { "Files & tracks", {
             { "Ctrl + O",        "Open file..." },
             { "Ctrl + Shift + O","Open folder..." },
+            { "Ctrl + V",        "Paste URL or path from clipboard and play" },
             { "Ctrl + W",        "Close current file" },
             { "Ctrl + S",        "Snapshot (PNG next to Vela.exe)" },
             { "Ctrl + Shift + S","Snapshot to clipboard" },
@@ -1767,6 +1881,7 @@ void UIController::drawSeekBarThumbnail(int W, int H, float duration) {
 void UIController::drawMainMenuContents() {
     if (ImGui::MenuItem("Open File...", "Ctrl+O")) openFileDialog();
     if (ImGui::MenuItem("Open Folder...", "Ctrl+Shift+O")) openFolderAsPlaylist();
+    if (ImGui::MenuItem("Paste URL / Path", "Ctrl+V")) pasteAndPlay();
     if (ImGui::BeginMenu("Open Recent", !recent_files_.empty())) {
         for (const auto& f : recent_files_) {
             if (ImGui::MenuItem(baseName(f.c_str()))) loadPath(f);
@@ -2293,6 +2408,13 @@ void UIController::handleEvent(const SDL_Event& event) {
             return;
         }
         if (sc == SDL_SCANCODE_O && (mod & SDL_KMOD_CTRL)) { openFileDialog(); return; }
+        // Ctrl+V: paste a URL / path / file-drop from the clipboard and play
+        // immediately. Fires before Ctrl+Shift+V or Ctrl+Alt+V variations
+        // exist, so no need to gate on !SHIFT.
+        if (sc == SDL_SCANCODE_V && (mod & SDL_KMOD_CTRL)) {
+            pasteAndPlay();
+            return;
+        }
         // Ctrl+Shift+S = snapshot to clipboard (checked before Ctrl+S file-save).
         if (sc == SDL_SCANCODE_S && (mod & SDL_KMOD_CTRL) && (mod & SDL_KMOD_SHIFT)) {
             snapshotToClipboard();
