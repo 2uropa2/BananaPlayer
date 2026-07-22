@@ -1001,6 +1001,8 @@ void UIController::drawShortcutsPanel(int W, int H) {
             { "L",               "Cycle repeat: Off / One / All" },
             { "H",               "Shuffle" },
             { "S  /  G",         "Toggle subs  /  cycle sub size" },
+            { "B",               "Toggle subtitle background box" },
+            { "Alt + Up/Down/0", "Raise / lower / reset subtitle position" },
             { "Drop a file",     "Play immediately" },
         }},
         { "View", {
@@ -1304,14 +1306,41 @@ void UIController::drawSubtitles(int W, int H) {
     }
 
     // Draw stacked from the bottom up, above the bottom overlay area.
+    // subtitle_vpos_ shifts the block vertically as a fraction of H:
+    // positive raises it, negative lowers it (clamped to keep the block
+    // inside the picture area).
     ImDrawList* dl = ImGui::GetForegroundDrawList();
-    float line_h = base_px * 1.15f;
-    float bottom_pad = 120.0f;  // sit above the ~108px bottom overlay
-    float y = (float)H - bottom_pad - line_h * lines.size();
+    float line_h    = base_px * 1.15f;
+    float bottom_pad = 120.0f;   // sit above the ~108px bottom overlay
+    float vshift    = std::clamp(subtitle_vpos_, -0.15f, 0.60f) * (float)H;
+    float block_h   = line_h * (float)lines.size();
+    float y_top     = (float)H - bottom_pad - block_h - vshift;
+    // Keep the block on-screen even at extreme nudges.
+    if (y_top < 8.0f) y_top = 8.0f;
+    if (y_top + block_h > (float)H - 8.0f) y_top = (float)H - 8.0f - block_h;
+
+    // Optional background box: one rounded rect that spans the widest
+    // line's width plus padding, sits behind ALL lines. Drawn first so
+    // the outlined text lands on top.
+    if (subtitle_bg_) {
+        float widest = 0.0f;
+        for (const auto& s : lines) {
+            ImVec2 sz = font->CalcTextSizeA(base_px, FLT_MAX, 0.0f, s.c_str());
+            if (sz.x > widest) widest = sz.x;
+        }
+        float pad_x = base_px * 0.5f;
+        float pad_y = base_px * 0.20f;
+        ImVec2 tl(((float)W - widest) * 0.5f - pad_x, y_top - pad_y);
+        ImVec2 br(((float)W + widest) * 0.5f + pad_x,
+                  y_top + block_h + pad_y);
+        dl->AddRectFilled(tl, br, IM_COL32(0, 0, 0, 170), base_px * 0.20f);
+    }
+
+    float y = y_top;
     for (const auto& s : lines) {
         ImVec2 sz = font->CalcTextSizeA(base_px, FLT_MAX, 0.0f, s.c_str());
         float x = ((float)W - sz.x) * 0.5f;
-        // Dark shadow / outline: draw the text 4x offset in dark, then once
+        // Dark shadow / outline: draw the text 8x offset in dark, then once
         // in white on top. Cheap but readable over any content.
         ImU32 sh = IM_COL32(0, 0, 0, 220);
         ImU32 fg = IM_COL32(255, 255, 255, 245);
@@ -2482,6 +2511,17 @@ void UIController::drawMainMenuContents() {
                       (int)std::lround(subtitle_offset_ * 1000.0));
         ImGui::MenuItem(sync_buf, nullptr, false, false);
         ImGui::TextDisabled("  Ctrl+Shift+Left/Right  .  Ctrl+Shift+0 reset");
+        ImGui::Separator();
+        if (ImGui::MenuItem("Background box", "B", subtitle_bg_)) {
+            subtitle_bg_ = !subtitle_bg_;
+            markConfigDirty();
+        }
+        char vpos_buf[64];
+        std::snprintf(vpos_buf, sizeof(vpos_buf),
+                      "Position: %+d%%",
+                      (int)std::lround(subtitle_vpos_ * 100.0f));
+        ImGui::MenuItem(vpos_buf, nullptr, false, false);
+        ImGui::TextDisabled("  Alt+Up/Down  .  Alt+0 reset");
         ImGui::EndMenu();
     }
 
@@ -2914,6 +2954,36 @@ void UIController::handleEvent(const SDL_Event& event) {
         }
         if (key == SDLK_LEFT)  { if (player_->isLoaded()) { player_->seekRelative(-5.0); SEEK_OSD("- 5s"); } return; }
         if (key == SDLK_RIGHT) { if (player_->isLoaded()) { player_->seekRelative( 5.0); SEEK_OSD("+ 5s"); } return; }
+        // Alt+Up / Alt+Down / Alt+0 - shift the subtitle line vertically
+        // as a fraction of viewport height. Positive = raise (useful when
+        // the video has burned-in captions eating the default position);
+        // negative = lower. Reset with Alt+0. Persistent across launches.
+        // Checked BEFORE the plain volume handlers so Alt+arrows don't
+        // fall through to volume adjust.
+        if (key == SDLK_UP && (mod & SDL_KMOD_ALT)) {
+            subtitle_vpos_ = std::min(0.60f, subtitle_vpos_ + 0.03f);
+            char buf[48]; std::snprintf(buf, sizeof(buf),
+                                        "Sub position %+d%%",
+                                        (int)std::lround(subtitle_vpos_ * 100.0f));
+            showOsd(buf);
+            markConfigDirty();
+            return;
+        }
+        if (key == SDLK_DOWN && (mod & SDL_KMOD_ALT)) {
+            subtitle_vpos_ = std::max(-0.15f, subtitle_vpos_ - 0.03f);
+            char buf[48]; std::snprintf(buf, sizeof(buf),
+                                        "Sub position %+d%%",
+                                        (int)std::lround(subtitle_vpos_ * 100.0f));
+            showOsd(buf);
+            markConfigDirty();
+            return;
+        }
+        if (key == SDLK_0 && (mod & SDL_KMOD_ALT) && !(mod & SDL_KMOD_CTRL)) {
+            subtitle_vpos_ = 0.0f;
+            showOsd("Sub position reset");
+            markConfigDirty();
+            return;
+        }
         if (key == SDLK_UP) {
             float v = std::min(2.0f, player_->getVolume() + 0.05f);
             player_->setVolume(v);
@@ -3053,6 +3123,14 @@ void UIController::handleEvent(const SDL_Event& event) {
         // Subtitle size cycle (G).
         if (sc == SDL_SCANCODE_G && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT))) {
             cycleSubtitleSize();
+            return;
+        }
+        // Subtitle background box toggle (plain B - Ctrl+B is prev-playlist
+        // and remains gated on the CTRL branch below).
+        if (sc == SDL_SCANCODE_B && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT))) {
+            subtitle_bg_ = !subtitle_bg_;
+            showOsd(subtitle_bg_ ? "Sub background on" : "Sub background off");
+            markConfigDirty();
             return;
         }
         if (key == SDLK_PAGEUP)   { if (player_->isLoaded()) { player_->seekRelative( 30.0); SEEK_OSD("+ 30s"); } return; }
@@ -3360,6 +3438,11 @@ void UIController::loadConfig() {
             subtitle_size_ = (SubtitleSize)i;
         }
         else if (std::strcmp(k, "subtitle_offset") == 0) subtitle_offset_ = std::atof(v);
+        else if (std::strcmp(k, "subtitle_vpos") == 0) {
+            float f = (float)std::atof(v);
+            subtitle_vpos_ = std::clamp(f, -0.15f, 0.60f);
+        }
+        else if (std::strcmp(k, "subtitle_bg") == 0)     subtitle_bg_ = (std::atoi(v) != 0);
         else if (std::strcmp(k, "subtitles_enabled") == 0) subtitles_enabled_ = std::atoi(v) != 0;
         else if (std::strcmp(k, "always_on_top") == 0)   always_on_top_ = std::atoi(v) != 0;
         else if (std::strcmp(k, "repeat_mode") == 0) {
@@ -3395,6 +3478,8 @@ void UIController::saveConfig() {
     std::fprintf(fp, "muted=%d\n",              player_->isMuted() ? 1 : 0);
     std::fprintf(fp, "subtitle_size=%d\n",      (int)subtitle_size_);
     std::fprintf(fp, "subtitle_offset=%.4f\n",  subtitle_offset_);
+    std::fprintf(fp, "subtitle_vpos=%.3f\n",    subtitle_vpos_);
+    std::fprintf(fp, "subtitle_bg=%d\n",        subtitle_bg_ ? 1 : 0);
     std::fprintf(fp, "subtitles_enabled=%d\n",  subtitles_enabled_ ? 1 : 0);
     std::fprintf(fp, "always_on_top=%d\n",      always_on_top_ ? 1 : 0);
     std::fprintf(fp, "repeat_mode=%d\n",        (int)playlist_.repeatMode());

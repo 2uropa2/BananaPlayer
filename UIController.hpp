@@ -243,6 +243,16 @@ private:
     // displays them EARLIER. Persistent across files (many subs from the
     // same source share the same drift).
     double subtitle_offset_ = 0.0;
+    // Vertical position tweak as a fraction of viewport height. Positive
+    // values raise the subtitle line above its default resting point (just
+    // above the bottom-overlay area); negative values lower it. Alt+Up /
+    // Alt+Down step by ~3 %; Alt+0 resets. Persistent so a user who wants
+    // subs above burned-in captions doesn't re-nudge every launch.
+    float subtitle_vpos_ = 0.0f;
+    // Draw a semi-transparent rounded background behind subtitle lines
+    // when true. Toggled by plain B; persisted. Helps on busy / high-key
+    // backgrounds where the outline alone isn't enough.
+    bool subtitle_bg_ = false;
     void loadCompanionSubs(const std::string& video_path);
     const SubtitleCue* currentSubtitle(double t);
     void drawSubtitles(int W, int H);
