@@ -70,9 +70,80 @@ std::string tailError(const std::string& s, size_t max_len = 200) {
 
 } // namespace
 
+namespace {
+
+// Compute whole-day delta between a file's LastWriteTime and now. Returns
+// -1 on any failure (missing file, malformed time). We use FileTime deltas
+// so DST / timezone shenanigans don't skew the count.
+int fileAgeDays(const std::string& path) {
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &a)) return -1;
+    FILETIME now_ft{};
+    GetSystemTimeAsFileTime(&now_ft);
+    ULARGE_INTEGER now_i{};   now_i.LowPart = now_ft.dwLowDateTime;
+                              now_i.HighPart = now_ft.dwHighDateTime;
+    ULARGE_INTEGER file_i{};  file_i.LowPart = a.ftLastWriteTime.dwLowDateTime;
+                              file_i.HighPart = a.ftLastWriteTime.dwHighDateTime;
+    if (now_i.QuadPart <= file_i.QuadPart) return 0;
+    // FILETIME ticks are 100 ns. Convert to days.
+    const uint64_t kTicksPerDay = 10ULL * 1000 * 1000 * 60 * 60 * 24;
+    uint64_t delta = now_i.QuadPart - file_i.QuadPart;
+    return (int)(delta / kTicksPerDay);
+}
+
+// Run `<yt_dlp_path> --version` and return the trimmed stdout. Bounded at
+// 2 s because it's synchronous during construction and we don't want to
+// hold up UIController for a hung binary.
+std::string probeYtDlpVersion(const std::string& yt_dlp_path) {
+    if (yt_dlp_path.empty()) return {};
+    HANDLE read_h  = nullptr;
+    HANDLE write_h = nullptr;
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength        = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    if (!CreatePipe(&read_h, &write_h, &sa, 0)) return {};
+    SetHandleInformation(read_h, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si{};
+    si.cb         = sizeof(si);
+    si.dwFlags    = STARTF_USESTDHANDLES;
+    si.hStdOutput = write_h;
+    si.hStdError  = write_h;
+    si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+
+    PROCESS_INFORMATION pi{};
+    std::string cmd = "\"" + yt_dlp_path + "\" --version";
+    std::vector<char> cmd_buf(cmd.begin(), cmd.end());
+    cmd_buf.push_back('\0');
+    BOOL ok = CreateProcessA(nullptr, cmd_buf.data(), nullptr, nullptr, TRUE,
+                             CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    CloseHandle(write_h);
+    if (!ok) { CloseHandle(read_h); return {}; }
+
+    if (WaitForSingleObject(pi.hProcess, 2000) != WAIT_OBJECT_0) {
+        TerminateProcess(pi.hProcess, 1);
+    }
+    std::string out = readAllFromPipe(read_h);
+    CloseHandle(read_h);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    // First non-empty line only. yt-dlp normally prints a single version
+    // like "2025.10.22"; anything else is unexpected.
+    std::string first = trimWs(out);
+    size_t nl = first.find_first_of("\r\n");
+    if (nl != std::string::npos) first = trimWs(first.substr(0, nl));
+    return first;
+}
+
+} // namespace
+
 YoutubeResolver::YoutubeResolver() {
     yt_dlp_path_      = locateYtDlp();
     yt_dlp_available_ = !yt_dlp_path_.empty();
+    if (yt_dlp_available_) {
+        yt_dlp_age_days_ = fileAgeDays(yt_dlp_path_);
+        yt_dlp_version_  = probeYtDlpVersion(yt_dlp_path_);
+    }
     worker_ = std::thread(&YoutubeResolver::workerLoop, this);
 }
 

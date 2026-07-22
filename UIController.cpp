@@ -408,6 +408,17 @@ void UIController::openAny(const std::string& path) {
             // the same failure result; we just show the OSD once here.
             showOsd("yt-dlp not found - install: winget install yt-dlp", 4.5f);
         } else {
+            // YouTube rotates internal protocols on a ~week cadence, so
+            // stale yt-dlp binaries stop resolving without a clear error.
+            // Nudge once per session when the exe is >30 days old.
+            int age = yt_resolver_->ytDlpAgeDays();
+            if (age > 30 && !yt_outdated_warned_) {
+                char buf[128];
+                std::snprintf(buf, sizeof(buf),
+                              "yt-dlp is %d days old - winget upgrade yt-dlp", age);
+                showOsd(buf, 4.5f);
+                yt_outdated_warned_ = true;
+            }
             showOsd("Resolving YouTube...", 10.0f);
         }
         pending_yt_request_id_ = yt_resolver_->requestResolve(path);
@@ -1142,9 +1153,31 @@ void UIController::drawInfoPanel(int W, int H) {
     ImGui::PopStyleColor();
     ImGui::SameLine(200.0f);
     if (yt_resolver_ && yt_resolver_->ytDlpAvailable()) {
-        ImGui::TextUnformatted("yt-dlp detected - paste a URL to play");
+        std::string ver  = yt_resolver_->ytDlpVersion();
+        std::string ppth = yt_resolver_->ytDlpPath();
+        int         age  = yt_resolver_->ytDlpAgeDays();
+        char line[256];
+        if (!ver.empty() && age >= 0) {
+            std::snprintf(line, sizeof(line), "yt-dlp %s  (%d days old)",
+                          ver.c_str(), age);
+        } else if (!ver.empty()) {
+            std::snprintf(line, sizeof(line), "yt-dlp %s", ver.c_str());
+        } else {
+            std::snprintf(line, sizeof(line), "yt-dlp detected");
+        }
+        ImGui::TextUnformatted(line);
+        if (age > 30) {
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 200.0f);
+            ImGui::TextDisabled("Update: winget upgrade yt-dlp");
+        }
+        if (!ppth.empty()) {
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 200.0f);
+            ImGui::TextDisabled("%s", ppth.c_str());
+        }
     } else {
-        ImGui::TextUnformatted("yt-dlp not installed  (winget install yt-dlp)");
+        ImGui::TextUnformatted("not installed");
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 200.0f);
+        ImGui::TextDisabled("Install: winget install yt-dlp");
     }
 
     ImGui::Spacing();

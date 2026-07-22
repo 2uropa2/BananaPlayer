@@ -175,6 +175,10 @@ private:
     // play it immediately. URLs go straight to FFmpeg's avformat_open_input;
     // directory paths expand into a playlist just like drag-drop of a folder.
     void   pasteAndPlay();
+    // Fires the "yt-dlp is N days old" nudge exactly once per session so
+    // repeated YouTube pastes don't keep spamming the OSD. Reset only on
+    // process restart - intentional; the point is a gentle reminder.
+    bool   yt_outdated_warned_ = false;
     // True if the given path's extension is one of our supported subtitle
     // formats (.srt, .smi). Used by the drop handler and the file dialog.
     static bool isSubtitleFile(const std::string& path);

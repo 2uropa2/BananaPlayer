@@ -53,6 +53,19 @@ public:
     // be actionable.
     bool ytDlpAvailable() const { return yt_dlp_available_; }
 
+    // Freshness signals populated at construction. YouTube changes internal
+    // protocols (signature ciphering, DASH manifests) every few weeks and
+    // yt-dlp releases follow within days - so we surface age and version
+    // to the caller who can nudge the user to update. Returns:
+    //  - ytDlpAgeDays: exe's LastWriteTime delta in whole days, or -1 if
+    //    yt-dlp isn't available / stat failed.
+    //  - ytDlpVersion: whatever `yt-dlp --version` printed (usually a date
+    //    like "2025.10.22"), or empty on failure / when not installed.
+    //  - ytDlpPath: absolute path we resolved, or empty when not installed.
+    int         ytDlpAgeDays() const { return yt_dlp_age_days_; }
+    std::string ytDlpVersion() const { return yt_dlp_version_; }
+    std::string ytDlpPath()    const { return yt_dlp_path_; }
+
 private:
     void workerLoop();
 
@@ -71,6 +84,8 @@ private:
 
     std::string yt_dlp_path_;
     bool        yt_dlp_available_ = false;
+    int         yt_dlp_age_days_  = -1;
+    std::string yt_dlp_version_;
 
     // Producer/consumer queue slot. Only the newest request matters; the
     // worker compares against latest_request_id_ before enqueueing a
