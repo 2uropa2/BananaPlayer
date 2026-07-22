@@ -1,6 +1,7 @@
 #include "UIController.hpp"
 #include "Thumbnail.hpp"
 #include "Version.hpp"
+#include "Youtube.hpp"
 
 #include "imgui_impl_sdl3.h"
 #include "imgui_impl_sdlrenderer3.h"
@@ -105,6 +106,7 @@ UIController::UIController(VideoPlayer* player, SDL_Window* window, SDL_Renderer
     : player_(player), window_(window), renderer_(renderer) {
     player_->onEnded = [this]() { handleNaturalEnd(); };
     thumb_provider_ = std::make_unique<ThumbnailProvider>(renderer_);
+    yt_resolver_    = std::make_unique<YoutubeResolver>();
     loadResumeIndex();
     loadConfig();
     loadRecents();
@@ -359,6 +361,62 @@ void UIController::enqueuePaths(const std::vector<std::string>& paths, bool play
     }
 }
 
+bool UIController::isYoutubeUrl(const std::string& s) {
+    // Case-insensitive lowercase copy for prefix / substring checks.
+    // Path-and-query parts of a URL are technically case-sensitive on the
+    // server side but the host is not, and we only match on host + a small
+    // set of well-known path prefixes.
+    std::string lower;
+    lower.reserve(s.size());
+    for (char c : s) lower.push_back((char)std::tolower((unsigned char)c));
+
+    // Strip optional scheme so the host check is uniform.
+    const char* p = lower.c_str();
+    if (std::strncmp(p, "https://", 8) == 0)      p += 8;
+    else if (std::strncmp(p, "http://", 7) == 0)  p += 7;
+    // Strip optional www./m./music. prefix on the host.
+    if      (std::strncmp(p, "www.", 4) == 0)     p += 4;
+    else if (std::strncmp(p, "m.", 2) == 0)       p += 2;
+    else if (std::strncmp(p, "music.", 6) == 0)   p += 6;
+
+    // Now p should start with either "youtube.com/..." or "youtu.be/...".
+    if (std::strncmp(p, "youtu.be/", 9) == 0) return true;
+    if (std::strncmp(p, "youtube.com/", 12) == 0) {
+        const char* path = p + 12;
+        if (std::strncmp(path, "watch",  5) == 0) return true;
+        if (std::strncmp(path, "shorts/", 7) == 0) return true;
+        if (std::strncmp(path, "live/",  5) == 0) return true;
+        if (std::strncmp(path, "embed/", 6) == 0) return true;
+        if (std::strncmp(path, "v/",     2) == 0) return true;
+    }
+    return false;
+}
+
+void UIController::openAny(const std::string& path) {
+    if (isYoutubeUrl(path)) {
+        // Kick off a background yt-dlp resolve. The user sees the OSD
+        // immediately so they know the click landed; when the direct URL
+        // arrives (typically 2-5 s later) the render loop drains the
+        // resolver and hands it off to loadPath.
+        if (!yt_resolver_) {
+            showOsd("YouTube resolver unavailable", 2.5f);
+            return;
+        }
+        if (!yt_resolver_->ytDlpAvailable()) {
+            // Front-run the drain so first-time users get actionable
+            // guidance without a delay. The resolver will also enqueue
+            // the same failure result; we just show the OSD once here.
+            showOsd("yt-dlp not found - install: winget install yt-dlp", 4.5f);
+        } else {
+            showOsd("Resolving YouTube...", 10.0f);
+        }
+        pending_yt_request_id_ = yt_resolver_->requestResolve(path);
+        pending_yt_source_url_ = path;
+        return;
+    }
+    loadPath(path);
+}
+
 void UIController::addRecent(const std::string& path) {
     auto it = std::find(recent_files_.begin(), recent_files_.end(), path);
     if (it != recent_files_.end()) recent_files_.erase(it);
@@ -531,8 +589,14 @@ void UIController::pasteAndPlay() {
     if (picked.empty()) { showOsd("Clipboard is empty"); return; }
 
     if (looksLikeUrl(picked)) {
-        showOsd("Opening URL...", 1.2f);
-        loadPath(picked);
+        // openAny routes YouTube page URLs through the yt-dlp resolver and
+        // hands everything else straight to loadPath / avformat_open_input.
+        if (isYoutubeUrl(picked)) {
+            openAny(picked);
+        } else {
+            showOsd("Opening URL...", 1.2f);
+            loadPath(picked);
+        }
         return;
     }
 
@@ -1066,6 +1130,23 @@ void UIController::drawInfoPanel(int W, int H) {
         row("Duration",     buf);
     }
 
+    // yt-dlp status - lets first-time users discover that Vela can play
+    // YouTube URLs by pasting one, and shows install guidance when the
+    // binary isn't on PATH (or dropped next to Vela.exe).
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::SetCursorPosX(20.0f);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.68f, 0.78f, 0.96f, 1.0f));
+    ImGui::TextUnformatted("YouTube");
+    ImGui::PopStyleColor();
+    ImGui::SameLine(200.0f);
+    if (yt_resolver_ && yt_resolver_->ytDlpAvailable()) {
+        ImGui::TextUnformatted("yt-dlp detected - paste a URL to play");
+    } else {
+        ImGui::TextUnformatted("yt-dlp not installed  (winget install yt-dlp)");
+    }
+
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
@@ -1196,6 +1277,30 @@ void UIController::newFrame() {
 void UIController::render(int W, int H) {
     ImGuiIO& io = ImGui::GetIO();
     float dt = io.DeltaTime;
+
+    // Drain any completed YouTube URL resolutions. Runs BEFORE the load
+    // check so a just-arrived direct URL flips `loaded` this same frame
+    // and the splash gets replaced with the video immediately.
+    if (yt_resolver_) {
+        YoutubeResolver::Result yr;
+        while (yt_resolver_->tryDrainResult(yr)) {
+            if (yr.id != pending_yt_request_id_) continue;   // stale
+            if (yr.ok) {
+                loadPath(yr.media_url);
+            } else {
+                if (!yt_resolver_->ytDlpAvailable()) {
+                    showOsd("yt-dlp not found - install: winget install yt-dlp", 4.5f);
+                } else {
+                    std::string m = yr.message.empty()
+                        ? std::string("resolve failed")
+                        : yr.message;
+                    showOsd(std::string("YouTube resolve failed: ") + m, 3.5f);
+                }
+            }
+            pending_yt_request_id_ = 0;
+            pending_yt_source_url_.clear();
+        }
+    }
 
     bool loaded = player_->isLoaded();
 

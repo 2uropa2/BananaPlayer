@@ -104,11 +104,20 @@ int main(int argc, char* argv[]) {
     bool screensaver_disabled = false;
 
     if (argc > 1) {
-        // Any extra args become a playlist; the first one starts playing.
-        std::vector<std::string> paths;
-        paths.reserve(argc - 1);
-        for (int i = 1; i < argc; ++i) paths.emplace_back(argv[i]);
-        ui.enqueuePaths(paths, /*play_first=*/true);
+        // A single arg that looks like a YouTube page URL takes the
+        // yt-dlp resolve path (openAny) - not enqueuePaths, whose
+        // GetFileAttributesA / directory-expansion has nothing useful
+        // to do with a URL and would fall through to loadFile which
+        // FFmpeg can't open for youtube.com HTML.
+        if (argc == 2 && UIController::isYoutubeUrl(argv[1])) {
+            ui.openAny(argv[1]);
+        } else {
+            // Any extra args become a playlist; the first one starts playing.
+            std::vector<std::string> paths;
+            paths.reserve(argc - 1);
+            for (int i = 1; i < argc; ++i) paths.emplace_back(argv[i]);
+            ui.enqueuePaths(paths, /*play_first=*/true);
+        }
     }
 
     while (!quit) {

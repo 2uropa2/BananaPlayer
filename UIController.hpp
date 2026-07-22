@@ -7,12 +7,14 @@
 #include "Style.hpp"
 #include "Subtitles.hpp"
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
 class ThumbnailProvider;
+class YoutubeResolver;
 
 enum class RotationMode {
     Deg0,
@@ -52,6 +54,15 @@ public:
     // playlist use the return value to skip broken items.
     bool loadPath(const std::string& path);
     void enqueuePaths(const std::vector<std::string>& paths, bool play_first = true);
+    // Unified open entry point: routes YouTube URLs through the yt-dlp
+    // resolver and everything else through loadPath. Used by pasteAndPlay,
+    // the CLI-arg path in main.cpp, and any future URL-open dialog so all
+    // three surfaces share the same YouTube branch.
+    void openAny(const std::string& path);
+    // Case-insensitive URL detection for YouTube pages we know yt-dlp
+    // handles - watch, shorts, live, youtu.be short-form, music. Exposed
+    // as a static so unit tests could reach it without an SDL context.
+    static bool isYoutubeUrl(const std::string& s);
 
     RotationMode getRotation() const { return rotation_; }
 
@@ -247,6 +258,15 @@ private:
     std::unique_ptr<ThumbnailProvider> thumb_provider_;
     bool thumbnail_preview_enabled_ = false;
     void drawSeekBarThumbnail(int W, int H, float duration);
+
+    // Background yt-dlp resolver for pasted YouTube URLs. Owns its own
+    // worker thread; the render loop drains completed resolutions and
+    // hands the resulting direct media URL to loadPath. pending_yt_*
+    // tracks the most recent request so stale results (from a superseded
+    // cancellation) are ignored.
+    std::unique_ptr<YoutubeResolver> yt_resolver_;
+    uint64_t     pending_yt_request_id_ = 0;
+    std::string  pending_yt_source_url_;
 
     // Modal help panels.
     bool show_shortcuts_ = false;
