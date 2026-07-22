@@ -89,6 +89,39 @@ if(WIN32 AND TARGET SDL3::SDL3-shared)
         VERBATIM)
 endif()
 
+# -------- yt-dlp bundle --------
+# YouTube URL playback needs yt-dlp. We fetch the latest standalone .exe
+# from GitHub Releases at configure time and drop it next to Vela.exe so
+# YoutubeResolver's portable-drop lookup finds it without a PATH probe.
+# The installer (NSIS/ZIP) then picks it up via the install rule below.
+#
+# Refresh policy: cached in build/yt-dlp.exe; delete that file and re-run
+# cmake to pull a newer release. YouTube changes internal protocols every
+# few weeks and yt-dlp releases roll about as often - the in-app age nudge
+# reminds users to update once shipped, but shipping fresh is still nice.
+set(YT_DLP_EXE "${CMAKE_BINARY_DIR}/yt-dlp.exe")
+if(WIN32 AND NOT EXISTS "${YT_DLP_EXE}")
+    message(STATUS "Downloading latest yt-dlp.exe...")
+    file(DOWNLOAD
+        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+        "${YT_DLP_EXE}"
+        SHOW_PROGRESS
+        STATUS YT_DLP_DL_STATUS
+        TIMEOUT 180)
+    list(GET YT_DLP_DL_STATUS 0 YT_DLP_DL_CODE)
+    if(NOT YT_DLP_DL_CODE EQUAL 0)
+        message(WARNING "yt-dlp download failed (${YT_DLP_DL_STATUS}); YouTube URLs will need manual install")
+        file(REMOVE "${YT_DLP_EXE}")
+    endif()
+endif()
+if(WIN32 AND EXISTS "${YT_DLP_EXE}")
+    add_custom_command(TARGET Vela POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${YT_DLP_EXE}"
+                $<TARGET_FILE_DIR:Vela>/yt-dlp.exe
+        VERBATIM)
+endif()
+
 # -------- Install rules --------
 install(TARGETS Vela RUNTIME DESTINATION bin)
 if(WIN32)
@@ -105,6 +138,12 @@ if(WIN32)
     install(PROGRAMS ${CMAKE_INSTALLED_SYSTEM_RUNTIME_LIBS} DESTINATION bin)
 endif()
 install(FILES resources/icon.ico DESTINATION share/icons)
+# yt-dlp bundle - shipped as a PROGRAM so NSIS gives it +x on install and
+# strips it on uninstall. Only installed if the download succeeded at
+# configure time.
+if(WIN32 AND EXISTS "${YT_DLP_EXE}")
+    install(PROGRAMS "${YT_DLP_EXE}" DESTINATION bin)
+endif()
 
 # -------- CPack: installer + zip --------
 set(CPACK_PACKAGE_NAME              "Vela")
