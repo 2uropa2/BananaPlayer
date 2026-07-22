@@ -402,15 +402,18 @@ void UIController::openAny(const std::string& path) {
             showOsd("YouTube resolver unavailable", 2.5f);
             return;
         }
-        if (!yt_resolver_->ytDlpAvailable()) {
+        YtDlpProbeState pst = yt_resolver_->probeState();
+        if (pst == YtDlpProbeState::Missing) {
             // Front-run the drain so first-time users get actionable
             // guidance without a delay. The resolver will also enqueue
             // the same failure result; we just show the OSD once here.
             showOsd("yt-dlp not found - install: winget install yt-dlp", 4.5f);
         } else {
-            // YouTube rotates internal protocols on a ~week cadence, so
-            // stale yt-dlp binaries stop resolving without a clear error.
-            // Nudge once per session when the exe is >30 days old.
+            // Probing OR Available - either way the worker takes it. If
+            // still probing, the request sits in has_pending_ until phase
+            // 1 finishes (~500 ms after startup at worst), then proceeds
+            // normally. Age nudge only fires once probe is done (age is
+            // -1 in the probing state so the > 30 test naturally skips).
             int age = yt_resolver_->ytDlpAgeDays();
             if (age > 30 && !yt_outdated_warned_) {
                 char buf[128];
@@ -1152,7 +1155,11 @@ void UIController::drawInfoPanel(int W, int H) {
     ImGui::TextUnformatted("YouTube");
     ImGui::PopStyleColor();
     ImGui::SameLine(200.0f);
-    if (yt_resolver_ && yt_resolver_->ytDlpAvailable()) {
+    YtDlpProbeState yt_pst = yt_resolver_ ? yt_resolver_->probeState()
+                                          : YtDlpProbeState::Missing;
+    if (yt_pst == YtDlpProbeState::Probing) {
+        ImGui::TextUnformatted("detecting...");
+    } else if (yt_pst == YtDlpProbeState::Available) {
         std::string ver  = yt_resolver_->ytDlpVersion();
         std::string ppth = yt_resolver_->ytDlpPath();
         int         age  = yt_resolver_->ytDlpAgeDays();

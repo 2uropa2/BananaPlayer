@@ -138,12 +138,11 @@ std::string probeYtDlpVersion(const std::string& yt_dlp_path) {
 } // namespace
 
 YoutubeResolver::YoutubeResolver() {
-    yt_dlp_path_      = locateYtDlp();
-    yt_dlp_available_ = !yt_dlp_path_.empty();
-    if (yt_dlp_available_) {
-        yt_dlp_age_days_ = fileAgeDays(yt_dlp_path_);
-        yt_dlp_version_  = probeYtDlpVersion(yt_dlp_path_);
-    }
+    // Ctor stays instant. The locate + version probe (2 child processes,
+    // ~500 ms cold) now runs as the first phase of the worker thread so
+    // Vela's startup path - especially the Explorer-double-click case
+    // where UIController is constructed before the first frame draws -
+    // doesn't stall waiting for where.exe + `yt-dlp --version`.
     worker_ = std::thread(&YoutubeResolver::workerLoop, this);
 }
 
@@ -236,8 +235,14 @@ uint64_t YoutubeResolver::requestResolve(const std::string& url) {
 
         // yt-dlp missing: enqueue the failure result immediately from
         // the caller's thread. Cheaper than a round trip through the
-        // worker and lets the OSD fire on the next frame.
-        if (!yt_dlp_available_) {
+        // worker and lets the OSD fire on the next frame. We can ONLY
+        // do this once the initial probe has finished - before that
+        // yt_dlp_available_ is default-false and would falsely fail
+        // legitimate requests. During the probe window (~500 ms after
+        // startup) the worker handles the request after it finishes
+        // probing, which is exactly the ordering we want.
+        if (probe_done_.load(std::memory_order_acquire)
+            && !yt_dlp_available_) {
             Result r;
             r.id         = id;
             r.source_url = url;
@@ -260,6 +265,31 @@ bool YoutubeResolver::tryDrainResult(Result& out) {
 }
 
 void YoutubeResolver::workerLoop() {
+    // Phase 1 - probe. Runs off the main thread so the app startup path
+    // (especially Explorer double-click of a video where UIController is
+    // constructed before the first frame draws) doesn't stall on where.exe
+    // + `yt-dlp --version`. Any resolve requests queued during this window
+    // sit in has_pending_ until we finish probing, then get picked up
+    // naturally by the request loop below.
+    {
+        std::string path = locateYtDlp();
+        bool        avail = !path.empty();
+        int         age = -1;
+        std::string ver;
+        if (avail) {
+            age = fileAgeDays(path);
+            ver = probeYtDlpVersion(path);
+        }
+        std::lock_guard<std::mutex> lk(mutex_);
+        yt_dlp_path_      = std::move(path);
+        yt_dlp_available_ = avail;
+        yt_dlp_age_days_  = age;
+        yt_dlp_version_   = std::move(ver);
+        probe_done_.store(true, std::memory_order_release);
+    }
+    cv_.notify_all();   // wake anyone that Ctrl+V'd during the probe window
+
+    // Phase 2 - normal request loop.
     for (;;) {
         uint64_t    id;
         std::string url;

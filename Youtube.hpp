@@ -23,6 +23,16 @@
 #include <string>
 #include <thread>
 
+// Probe state is a tri-state: not yet run (worker still starting), done +
+// available (yt-dlp found), done + missing. Callers that need to distinguish
+// "detecting" from "not installed" use probeState() rather than the plain
+// ytDlpAvailable() boolean.
+enum class YtDlpProbeState {
+    Probing = 0,
+    Available,
+    Missing,
+};
+
 class YoutubeResolver {
 public:
     struct Result {
@@ -50,8 +60,14 @@ public:
     // False when neither `where yt-dlp.exe` nor `<vela dir>\yt-dlp.exe`
     // resolved on construction. The caller uses this to distinguish
     // "install yt-dlp" from a normal resolve failure so the OSD text can
-    // be actionable.
-    bool ytDlpAvailable() const { return yt_dlp_available_; }
+    // be actionable. During the brief probe window at startup this returns
+    // false too; use probeState() when you need to distinguish "probing".
+    bool            ytDlpAvailable() const { return yt_dlp_available_; }
+    YtDlpProbeState probeState() const {
+        if (!probe_done_.load(std::memory_order_acquire)) return YtDlpProbeState::Probing;
+        return yt_dlp_available_ ? YtDlpProbeState::Available
+                                 : YtDlpProbeState::Missing;
+    }
 
     // Freshness signals populated at construction. YouTube changes internal
     // protocols (signature ciphering, DASH manifests) every few weeks and
@@ -86,6 +102,10 @@ private:
     bool        yt_dlp_available_ = false;
     int         yt_dlp_age_days_  = -1;
     std::string yt_dlp_version_;
+    // Set once the worker has finished the initial locate+version probe.
+    // Ctor stays instant - previously locate + `yt-dlp --version` ran
+    // synchronously and added ~500 ms to Vela startup on cold cache.
+    std::atomic<bool> probe_done_{false};
 
     // Producer/consumer queue slot. Only the newest request matters; the
     // worker compares against latest_request_id_ before enqueueing a
