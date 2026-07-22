@@ -219,6 +219,11 @@ int main(int argc, char* argv[]) {
 
     if (video_texture) SDL_DestroyTexture(video_texture);
 
+    // Free UI-owned SDL textures (thumbnail cache) before the renderer is
+    // destroyed. UIController itself is stack-scoped to end-of-main, so
+    // its destructor runs AFTER SDL_Quit - too late for texture cleanup.
+    ui.shutdownBeforeSdl();
+
     ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();

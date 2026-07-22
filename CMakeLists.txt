@@ -49,6 +49,7 @@ set(VELA_SOURCES
     UIController.cpp
     Style.cpp
     Subtitles.cpp
+    Thumbnail.cpp
 )
 
 # On Windows, compile the .rc so Explorer/taskbar pick up icon + version info.
