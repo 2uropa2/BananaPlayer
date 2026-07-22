@@ -215,7 +215,8 @@ std::string YoutubeResolver::locateYtDlp() {
     return first;
 }
 
-uint64_t YoutubeResolver::requestResolve(const std::string& url) {
+uint64_t YoutubeResolver::requestResolve(const std::string& url,
+                                        const std::string& format) {
     uint64_t id = 0;
     {
         std::lock_guard<std::mutex> lk(mutex_);
@@ -229,9 +230,10 @@ uint64_t YoutubeResolver::requestResolve(const std::string& url) {
         if (current_child_) {
             TerminateProcess((HANDLE)current_child_, 1);
         }
-        pending_id_  = id;
-        pending_url_ = url;
-        has_pending_ = true;
+        pending_id_     = id;
+        pending_url_    = url;
+        pending_format_ = format.empty() ? std::string("best") : format;
+        has_pending_    = true;
 
         // yt-dlp missing: enqueue the failure result immediately from
         // the caller's thread. Cheaper than a round trip through the
@@ -293,6 +295,7 @@ void YoutubeResolver::workerLoop() {
     for (;;) {
         uint64_t    id;
         std::string url;
+        std::string format;
         std::string yt_path;
         {
             std::unique_lock<std::mutex> lk(mutex_);
@@ -300,6 +303,7 @@ void YoutubeResolver::workerLoop() {
             if (quit_.load()) return;
             id           = pending_id_;
             url          = pending_url_;
+            format       = pending_format_;
             yt_path      = yt_dlp_path_;
             has_pending_ = false;
         }
@@ -313,7 +317,7 @@ void YoutubeResolver::workerLoop() {
         } else {
             std::string media;
             std::string err;
-            r.ok = runYtDlp(yt_path, url, media, err);
+            r.ok = runYtDlp(yt_path, url, format, media, err);
             if (r.ok) r.media_url = media;
             else      r.message   = err.empty() ? std::string("resolve failed") : err;
         }
@@ -330,6 +334,7 @@ void YoutubeResolver::workerLoop() {
 
 bool YoutubeResolver::runYtDlp(const std::string& yt_dlp_path,
                                const std::string& url,
+                               const std::string& format,
                                std::string&       out_media_url,
                                std::string&       err_msg) {
     out_media_url.clear();
@@ -364,12 +369,15 @@ bool YoutubeResolver::runYtDlp(const std::string& yt_dlp_path,
 
     // yt-dlp -g prints the direct URL(s) to stdout. --no-playlist keeps
     // us on the single video even when the URL has a list= parameter.
-    // The format selector prefers a single-file mp4 so our existing
-    // avformat_open_input pipeline stays happy (audio+video already
-    // merged); falls back to whatever "best" is if mp4 isn't available.
+    // The format selector is caller-provided so the UI can offer quality
+    // choices (Auto / 1080 / 720 / 480 / AudioOnly). All curated selectors
+    // are single-file (no + merging) because our VideoPlayer::loadFile is
+    // single-URL - the two-URL video+audio refactor is a future slice.
+    // Empty format falls back to "best" defensively.
+    const std::string& fmt = format.empty() ? std::string("best") : format;
     std::string cmd = "\"" + yt_dlp_path + "\""
         + " --no-warnings --no-playlist"
-        + " -f \"best[ext=mp4]/best\""
+        + " -f \"" + fmt + "\""
         + " -g"
         + " \"" + url + "\"";
 
