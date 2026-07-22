@@ -15,6 +15,27 @@ namespace {
 
 // ---------- shared helpers ----------
 
+// std::fopen on Windows treats the path as ANSI (CP949 on Korean locale),
+// but SDL3 drop events and our own drag-drop pipeline deliver UTF-8. A path
+// with characters outside CP949 - and even a Korean-named file that Windows
+// happens to store as UTF-16 in the file system - fails to open through
+// plain fopen because the CP949 round-trip loses information. Wide-path the
+// UTF-8 -> UTF-16 conversion and call _wfopen so the actual filesystem
+// lookup runs against Unicode. Non-Windows paths keep the plain fopen path.
+std::FILE* fopenUtf8(const std::string& path, const char* mode) {
+#ifdef _WIN32
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    if (wlen <= 0) return nullptr;
+    std::wstring wpath(wlen - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen);
+    wchar_t wmode[8] = {0};
+    for (int i = 0; mode[i] && i < 7; ++i) wmode[i] = (wchar_t)mode[i];
+    return _wfopen(wpath.c_str(), wmode);
+#else
+    return std::fopen(path.c_str(), mode);
+#endif
+}
+
 bool iequals(std::string_view a, std::string_view b) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); ++i) {
@@ -337,7 +358,7 @@ std::vector<SubtitleCue> parseSMI(std::string_view utf8, std::string_view prefer
 // ---------- decode + load ----------
 
 std::string decodeSubtitleFileToUtf8(const std::string& path) {
-    std::FILE* f = std::fopen(path.c_str(), "rb");
+    std::FILE* f = fopenUtf8(path, "rb");
     if (!f) return {};
     std::fseek(f, 0, SEEK_END);
     long n = std::ftell(f);
@@ -382,7 +403,7 @@ std::vector<SubtitleCue> loadCompanionSubtitles(const std::string& video_path) {
     };
     for (const auto& c : cands) {
         std::string path = base + c.ext;
-        std::FILE* f = std::fopen(path.c_str(), "rb");
+        std::FILE* f = fopenUtf8(path, "rb");
         if (!f) continue;
         std::fclose(f);
         std::string content = decodeSubtitleFileToUtf8(path);
