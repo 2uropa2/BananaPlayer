@@ -8,8 +8,11 @@
 #include "Subtitles.hpp"
 
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
+
+class ThumbnailProvider;
 
 enum class RotationMode {
     Deg0,
@@ -36,6 +39,12 @@ public:
 
     bool isFullscreen() const { return fullscreen_; }
     void setFullscreen(bool val);
+
+    // Explicit shutdown hook so main.cpp can tear down SDL-texture-owning
+    // subsystems (thumbnail cache) BEFORE SDL_DestroyRenderer runs. The
+    // UIController itself lives until end-of-main, whose destructor would
+    // otherwise fire after the renderer is gone.
+    void shutdownBeforeSdl();
 
     void openFileDialog();
     // Returns true if the file loaded and playback started; false on failure
@@ -223,6 +232,16 @@ private:
     // display's usable bounds. No-ops (with OSD) if no video is loaded
     // or the window is fullscreen; un-maximizes first if maximized.
     void snapWindowToVideo();
+
+    // Seek-bar hover thumbnail preview. Off by default; togglable from the
+    // Settings menu and persisted to vela.config. When enabled AND the
+    // cursor is over the seek bar AND we're not mid-drag, we ask the
+    // ThumbnailProvider for a preview and float a small popup above the
+    // cursor. The provider owns its own AVFormatContext + worker thread so
+    // it never contends with the primary decode pipeline.
+    std::unique_ptr<ThumbnailProvider> thumb_provider_;
+    bool thumbnail_preview_enabled_ = false;
+    void drawSeekBarThumbnail(int W, int H, float duration);
 
     // Modal help panels.
     bool show_shortcuts_ = false;

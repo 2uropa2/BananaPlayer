@@ -1,4 +1,5 @@
 #include "UIController.hpp"
+#include "Thumbnail.hpp"
 #include "Version.hpp"
 
 #include "imgui_impl_sdl3.h"
@@ -103,6 +104,7 @@ std::string openFileDialogWin() {
 UIController::UIController(VideoPlayer* player, SDL_Window* window, SDL_Renderer* renderer)
     : player_(player), window_(window), renderer_(renderer) {
     player_->onEnded = [this]() { handleNaturalEnd(); };
+    thumb_provider_ = std::make_unique<ThumbnailProvider>(renderer_);
     loadResumeIndex();
     loadConfig();
     loadRecents();
@@ -121,6 +123,20 @@ UIController::~UIController() {
     saveRecents();
     saveLastPlaylist();
     // captureWindowGeometry();   // See ctor note.
+    // Defensive: if main.cpp forgot to call shutdownBeforeSdl(), destroy
+    // the thumbnail provider here anyway. On this path SDL_DestroyRenderer
+    // has already run and the SDL_DestroyTexture calls become no-ops on
+    // stale handles - not a crash, just leaked GPU memory the OS reclaims
+    // on process exit.
+    thumb_provider_.reset();
+}
+
+void UIController::shutdownBeforeSdl() {
+    // Tear down the thumbnail provider (worker thread + textures) while
+    // the SDL renderer is still valid, so cache-eviction SDL_DestroyTexture
+    // calls hit a live renderer. Called from main.cpp just before
+    // ImGui/SDL shutdown.
+    thumb_provider_.reset();
 }
 
 void UIController::loadResumeIndex() {
@@ -294,6 +310,11 @@ bool UIController::loadPath(const std::string& path) {
                                         player_->getHardwareDecoderName());
             showOsd(buf, 1.4f);
         }
+
+        // Prime the thumbnail provider on the newly-loaded file so hover
+        // previews are ready without a first-hover cold miss. openFile is
+        // cheap (posts to the worker thread and returns).
+        if (thumb_provider_) thumb_provider_->openFile(path);
     }
     return true;
 }
@@ -430,6 +451,7 @@ void UIController::closeCurrent() {
     subtitle_cache_idx_ = 0;
     loop_a_ = -1.0;
     loop_b_ = -1.0;
+    if (thumb_provider_) thumb_provider_->close();
     SDL_SetWindowTitle(window_, "Vela");
     showOsd("Closed");
     nudgeVisible();
@@ -1111,6 +1133,11 @@ void UIController::render(int W, int H) {
         if (overlay_alpha_ > 0.01f) {
             drawTopOverlay(W, H, overlay_alpha_);
             drawBottomOverlay(W, H, overlay_alpha_);
+            // Seek-bar hover thumbnail sits above the overlay so it can
+            // float above the cursor. Fully hidden when the overlay is
+            // faded out (nothing to hover), while dragging, or when the
+            // setting is off.
+            drawSeekBarThumbnail(W, H, (float)std::max(player_->getDuration(), 0.1));
         }
         if (show_playlist_ && overlay_alpha_ > 0.01f) {
             drawPlaylistPanel(W, H, overlay_alpha_);
@@ -1659,6 +1686,84 @@ void UIController::drawBottomOverlay(int W, int H, float alpha) {
     ImGui::PopStyleVar(3);
 }
 
+void UIController::drawSeekBarThumbnail(int W, int H, float duration) {
+    if (!thumbnail_preview_enabled_) return;
+    if (!thumb_provider_) return;
+    if (!player_->isLoaded()) return;
+    // Never intrude while the user is actively dragging - the seek bar
+    // already reflects the target and the popup would be visual noise.
+    if (seek_dragging_) return;
+    // No hit-testing surface this frame (bottom overlay hidden). The
+    // rect is zeroed by callers when the overlay isn't drawn.
+    const ImVec4& r = last_seekbar_rect_;
+    if (r.z <= r.x || r.w <= r.y) return;
+
+    ImGuiIO& io = ImGui::GetIO();
+    ImVec2 mp = io.MousePos;
+    if (mp.x < r.x || mp.x > r.z || mp.y < r.y || mp.y > r.w) return;
+
+    if (duration <= 0.1f) return;
+    float frac = (mp.x - r.x) / std::max(1.0f, r.z - r.x);
+    if (frac < 0.0f) frac = 0.0f;
+    if (frac > 1.0f) frac = 1.0f;
+    double t = (double)frac * (double)duration;
+
+    ThumbnailProvider::Result res = thumb_provider_->requestAt(t);
+
+    // Compute popup geometry - even without a texture yet, draw a small
+    // "loading..." placeholder so the user sees feedback while the first
+    // decode is in flight.
+    const float pad = 4.0f;
+    const float label_h = ImGui::GetFontSize() + 2.0f;
+    int tw = res.tex ? res.w : 200;
+    int th = res.tex ? res.h : 112;
+    // Fall back to a 16:9 placeholder if we don't know the aspect yet.
+    if (tw <= 0) tw = 200;
+    if (th <= 0) th = 112;
+
+    float box_w = (float)tw + pad * 2.0f;
+    float box_h = (float)th + pad * 2.0f + label_h;
+    float box_x = mp.x - box_w * 0.5f;
+    float box_y = mp.y - box_h - 10.0f;
+
+    // Clamp horizontally so the popup never runs off screen.
+    if (box_x < 4.0f) box_x = 4.0f;
+    if (box_x + box_w > (float)W - 4.0f) box_x = (float)W - 4.0f - box_w;
+    // If the popup would sit above the top edge, flip it below the cursor.
+    if (box_y < 4.0f) box_y = mp.y + 18.0f;
+    if (box_y + box_h > (float)H - 4.0f) box_y = (float)H - 4.0f - box_h;
+
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    dl->AddRectFilled(ImVec2(box_x, box_y),
+                      ImVec2(box_x + box_w, box_y + box_h),
+                      IM_COL32(20, 22, 32, 220), 6.0f);
+    dl->AddRect(ImVec2(box_x, box_y),
+                ImVec2(box_x + box_w, box_y + box_h),
+                IM_COL32(90, 110, 160, 180), 6.0f, 0, 1.5f);
+
+    ImVec2 img_min(box_x + pad, box_y + pad);
+    ImVec2 img_max(img_min.x + (float)tw, img_min.y + (float)th);
+    if (res.tex) {
+        dl->AddImage((ImTextureID)(intptr_t)res.tex, img_min, img_max);
+    } else {
+        // Placeholder rectangle so the popup still looks intentional
+        // during the first-frame cold miss.
+        dl->AddRectFilled(img_min, img_max, IM_COL32(40, 44, 58, 255), 4.0f);
+        const char* msg = "...";
+        ImVec2 tsz = ImGui::CalcTextSize(msg);
+        dl->AddText(ImVec2((img_min.x + img_max.x) * 0.5f - tsz.x * 0.5f,
+                           (img_min.y + img_max.y) * 0.5f - tsz.y * 0.5f),
+                    IM_COL32(200, 210, 230, 220), msg);
+    }
+
+    // Time label below the image.
+    std::string tlabel = formatTime(t);
+    ImVec2 lsz = ImGui::CalcTextSize(tlabel.c_str());
+    float lx = box_x + (box_w - lsz.x) * 0.5f;
+    float ly = img_max.y + 2.0f;
+    dl->AddText(ImVec2(lx, ly), IM_COL32(220, 230, 250, 255), tlabel.c_str());
+}
+
 void UIController::drawMainMenuContents() {
     if (ImGui::MenuItem("Open File...", "Ctrl+O")) openFileDialog();
     if (ImGui::MenuItem("Open Folder...", "Ctrl+Shift+O")) openFolderAsPlaylist();
@@ -1809,6 +1914,14 @@ void UIController::drawMainMenuContents() {
         always_on_top_ = !always_on_top_;
         SDL_SetWindowAlwaysOnTop(window_, always_on_top_);
         showOsd(always_on_top_ ? "Always on top" : "Always on top off");
+        markConfigDirty();
+    }
+    if (ImGui::MenuItem("Thumbnail preview on seek bar", nullptr,
+                        thumbnail_preview_enabled_)) {
+        thumbnail_preview_enabled_ = !thumbnail_preview_enabled_;
+        showOsd(thumbnail_preview_enabled_
+                    ? "Seek preview on"
+                    : "Seek preview off");
         markConfigDirty();
     }
 
@@ -2591,6 +2704,7 @@ void UIController::loadConfig() {
             playlist_.setRepeatMode((Playlist::RepeatMode)i);
         }
         else if (std::strcmp(k, "shuffle") == 0)         playlist_.setShuffle(std::atoi(v) != 0);
+        else if (std::strcmp(k, "thumbnail_preview") == 0) thumbnail_preview_enabled_ = std::atoi(v) != 0;
         // A/V sync offset is deliberately NOT persisted - it's a per-file
         // transient (each file has its own encoder/mux quirks) and carrying
         // yesterday's -300 ms nudge into today's file would look like the
@@ -2620,6 +2734,7 @@ void UIController::saveConfig() {
     std::fprintf(fp, "always_on_top=%d\n",      always_on_top_ ? 1 : 0);
     std::fprintf(fp, "repeat_mode=%d\n",        (int)playlist_.repeatMode());
     std::fprintf(fp, "shuffle=%d\n",            playlist_.shuffle() ? 1 : 0);
+    std::fprintf(fp, "thumbnail_preview=%d\n",  thumbnail_preview_enabled_ ? 1 : 0);
     // NOTE: rotation AND av_sync_offset are deliberately NOT saved -
     // both are per-file transients. See loadConfig for the ignore branches.
     std::fclose(fp);
