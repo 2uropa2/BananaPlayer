@@ -801,19 +801,26 @@ const SubtitleCue* UIController::currentSubtitle(double t) {
     return nullptr;
 }
 
-float UIController::subtitleBasePx(int W) const {
-    // Base sizes scale with the picked bucket, with a mild narrow-window
-    // squeeze (identical clamp shape as the old drawSubtitles path so
-    // Medium at wide viewport matches the previous default of 34 px).
-    float sz = 34.0f;
+float UIController::subtitleBasePx(int W, int H) const {
+    // Height-anchored ratios so subtitles scale up with the viewport.
+    // The old width-based clamp locked Medium at 34 px above 900 px wide,
+    // which meant a 1080p fullscreen showed the same tiny text as a small
+    // windowed session - and 4K displays looked even worse. Anchoring off
+    // H (video area height) tracks how "big" the picture feels to the user.
+    float ratio = 0.045f;
     switch (subtitle_size_) {
-        case SubtitleSize::Small:  sz = 24.0f; break;
-        case SubtitleSize::Medium: sz = 34.0f; break;
-        case SubtitleSize::Large:  sz = 44.0f; break;
-        case SubtitleSize::XL:     sz = 56.0f; break;
+        case SubtitleSize::Small:  ratio = 0.030f; break;
+        case SubtitleSize::Medium: ratio = 0.045f; break;
+        case SubtitleSize::Large:  ratio = 0.060f; break;
+        case SubtitleSize::XL:     ratio = 0.075f; break;
     }
-    if (W < 900) sz *= 0.78f;
-    if (W < 640) sz *= 0.65f;
+    float sz = (float)H * ratio;
+    // Legibility floor for tiny windows (640x400 minimum).
+    if (sz < 18.0f) sz = 18.0f;
+    // Narrow-window squeeze so a 640x-tall window doesn't overshoot when
+    // the height is also large (portrait-ish shapes).
+    if (W < 900) sz *= 0.95f;
+    if (W < 640) sz *= 0.85f;
     return sz;
 }
 
@@ -1205,7 +1212,7 @@ void UIController::drawSubtitles(int W, int H) {
     // Use the merged font; size selected by the user (S/M/L/XL) with a
     // narrow-window squeeze so it stays readable at 640 px.
     ImFont* font = ImGui::GetFont();
-    float base_px = subtitleBasePx(W);
+    float base_px = subtitleBasePx(W, H);
 
     // Split into physical lines and measure each.
     std::vector<std::string> lines;

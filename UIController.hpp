@@ -235,7 +235,7 @@ private:
     const SubtitleCue* currentSubtitle(double t);
     void drawSubtitles(int W, int H);
     void cycleSubtitleSize();
-    float subtitleBasePx(int W) const;
+    float subtitleBasePx(int W, int H) const;
     // Shared subtitle-load path used by both the drag-drop handler and
     // the Settings > Subtitles > Load Subtitle... menu item. Returns true
     // on parse success; caller decides whether to OSD or not. Loads the
