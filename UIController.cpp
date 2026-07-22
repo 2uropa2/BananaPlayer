@@ -2086,8 +2086,8 @@ void UIController::handleEvent(const SDL_Event& event) {
         }
         if (key == SDLK_PAGEUP)   { if (player_->isLoaded()) { player_->seekRelative( 30.0); SEEK_OSD("+ 30s"); } return; }
         if (key == SDLK_PAGEDOWN) { if (player_->isLoaded()) { player_->seekRelative(-30.0); SEEK_OSD("- 30s"); } return; }
-        if (key == SDLK_COMMA)    { if (player_->isLoaded()) { player_->stepFrame(-1.0/30.0); SEEK_OSD("< step"); } return; }
-        if (key == SDLK_PERIOD)   { if (player_->isLoaded()) { player_->stepFrame( 1.0/30.0); SEEK_OSD("step >"); } return; }
+        if (key == SDLK_COMMA)    { if (player_->isLoaded()) { double fps = player_->getVideoFrameRate(); double step = (fps > 0.0) ? 1.0 / fps : 1.0 / 30.0; player_->stepFrame(-step); SEEK_OSD("< step"); } return; }
+        if (key == SDLK_PERIOD)   { if (player_->isLoaded()) { double fps = player_->getVideoFrameRate(); double step = (fps > 0.0) ? 1.0 / fps : 1.0 / 30.0; player_->stepFrame( step); SEEK_OSD("step >"); } return; }
         // Playlist next/prev. Ctrl+N/Ctrl+B kept for muscle memory; plain N
         // is the shorter standard-player binding when no letter conflicts.
         if (key == SDLK_N && (mod & SDL_KMOD_CTRL))         { playNextInPlaylist(); return; }
@@ -2207,6 +2207,18 @@ void UIController::handleEvent(const SDL_Event& event) {
     } else if (event.type == SDL_EVENT_MOUSE_MOTION) {
         nudgeVisible();
     } else if (event.type == SDL_EVENT_MOUSE_WHEEL) {
+        // Shift+Wheel adjusts playback speed +/-0.05 (mirrors [ / ] keys),
+        // clamped to the same 0.25-3.0 range. Checked before the seekbar/volume
+        // branches so it fires anywhere over the window.
+        if ((SDL_GetModState() & SDL_KMOD_SHIFT) && player_->isLoaded()) {
+            float step = (event.wheel.y > 0 ? 0.05f : -0.05f);
+            float r = std::clamp(player_->getPlaybackRate() + step, 0.25f, 3.0f);
+            player_->setPlaybackRate(r);
+            char buf[32]; std::snprintf(buf, sizeof(buf), "Speed %.2fx", r);
+            showOsd(buf);
+            nudgeVisible();
+            return;
+        }
         // Wheel over the seek bar seeks; wheel elsewhere (over the video)
         // adjusts volume. The rect is captured each frame during render.
         {
