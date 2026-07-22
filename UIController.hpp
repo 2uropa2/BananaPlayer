@@ -156,10 +156,12 @@ private:
     bool  request_context_menu_ = false;
     ImVec2 context_menu_pos_{0, 0};
 
-    // Defer single-click play/pause so it doesn't fire on the first press of a
-    // double-click-to-fullscreen. Timer counts down in render().
-    bool  pending_video_click_ = false;
-    float pending_video_click_timer_ = 0.0f;
+    // Toggle-and-undo pattern for click play/pause: the first left-click
+    // toggles immediately so it feels responsive. If a second click arrives
+    // (double-click-to-fullscreen), we undo the toggle so the net effect is
+    // just fullscreen. This flag records that the first click's toggle is
+    // still standing and can be reverted.
+    bool  click_toggle_undoable_ = false;
 
     // A-B segment loop. -1 = unset. Press A to advance the state machine:
     // both unset -> set A; A set -> set B (must be > A); both set -> clear.

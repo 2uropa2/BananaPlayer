@@ -106,7 +106,11 @@ UIController::UIController(VideoPlayer* player, SDL_Window* window, SDL_Renderer
     loadConfig();
     loadRecents();
     loadLastPlaylist();
-    applyStoredWindowGeometry();
+    // NOTE: window geometry restore intentionally disabled - the earlier
+    // implementation left users with a window pinned to (0, 0) that
+    // couldn't be dragged (SDL_MaximizeWindow + a bad clamp interaction
+    // on the CENTERED sentinel). Re-enable only after both are fixed.
+    // applyStoredWindowGeometry();
 }
 
 UIController::~UIController() {
@@ -115,7 +119,7 @@ UIController::~UIController() {
     saveConfig();
     saveRecents();
     saveLastPlaylist();
-    captureWindowGeometry();
+    // captureWindowGeometry();   // See ctor note.
 }
 
 void UIController::loadResumeIndex() {
@@ -222,6 +226,16 @@ bool UIController::loadPath(const std::string& path) {
     // A-B loop is per-file: clear it when the file changes.
     loop_a_ = -1.0;
     loop_b_ = -1.0;
+    // Rotation is a per-file transient - drop the user's Ctrl+R from
+    // the previous file so a rotation set for a portrait clip doesn't
+    // get carried into the next (landscape) clip and turn it sideways.
+    // Intrinsic rotation still applies (it's read fresh from the new
+    // file's display-matrix on every render).
+    rotation_ = RotationMode::Deg0;
+    // Same rationale for A/V sync: yesterday's -300 ms nudge for a lip-
+    // sync mismatch on some other file must not silently follow the user
+    // into every subsequent load.
+    player_->setAVSyncOffset(0.0);
     // Attempt to auto-load companion .srt / .smi.
     loadCompanionSubs(path);
 
@@ -753,6 +767,10 @@ void UIController::drawInfoPanel(int W, int H) {
                               ? (std::string("HW  ") + player_->getHardwareDecoderName())
                               : std::string("Software"));
 
+        int rot_intrinsic = player_->getIntrinsicRotation();
+        std::snprintf(buf, sizeof(buf), "%d deg  (from container)", rot_intrinsic);
+        row("Rotation",     buf);
+
         if (player_->hasAudio()) {
             const char* ac = player_->getAudioCodecName();
             row("Audio codec", (ac && *ac) ? ac : "-");
@@ -956,20 +974,8 @@ void UIController::render(int W, int H) {
         if (snapshot_flash_ < 0.0f) snapshot_flash_ = 0.0f;
     }
 
-    // Deferred single-click play/pause: fires once the double-click window
-    // has passed without a second click arriving.
-    if (pending_video_click_) {
-        pending_video_click_timer_ -= dt;
-        if (pending_video_click_timer_ <= 0.0f) {
-            pending_video_click_ = false;
-            pending_video_click_timer_ = 0.0f;
-            if (player_->isLoaded()) {
-                bool was_playing = player_->isPlaying();
-                player_->togglePause();
-                showOsd(was_playing ? "Pause" : "Play");
-            }
-        }
-    }
+    // (Click play/pause now fires immediately in handleEvent; a follow-up
+    // double-click undoes it. No deferred timer required.)
 
     // ---- Draw ----
     if (!loaded) {
@@ -2251,11 +2257,10 @@ void UIController::handleEvent(const SDL_Event& event) {
         // Middle click (wheel button) toggles fullscreen. Bypass the ImGui
         // capture check for the same reason as X1/X2 - no widget uses the
         // middle button, and the user expects it to work anywhere on the
-        // window. Also cancel any pending single-click play/pause so the
-        // fullscreen switch doesn't come with a phantom toggle.
+        // window. Middle click never participates in the left-click
+        // double-click sequence, so no undo bookkeeping needed here.
         if (event.button.button == SDL_BUTTON_MIDDLE) {
-            pending_video_click_ = false;
-            pending_video_click_timer_ = 0.0f;
+            click_toggle_undoable_ = false;
             setFullscreen(!fullscreen_);
             nudgeVisible();
             return;
@@ -2271,15 +2276,26 @@ void UIController::handleEvent(const SDL_Event& event) {
         if (io.WantCaptureMouse) return;
         if (event.button.button == SDL_BUTTON_LEFT) {
             if (event.button.clicks >= 2) {
-                // Double-click: cancel any pending single-click toggle so the
-                // fullscreen switch doesn't come with a phantom pause/play.
-                pending_video_click_ = false;
-                pending_video_click_timer_ = 0.0f;
+                // Double-click -> fullscreen. The first click of this pair
+                // already toggled play/pause a moment ago; undo it here so
+                // the net effect is JUST fullscreen. This "immediate + undo"
+                // pattern is what makes single clicks feel snappy - waiting
+                // out the full ~500 ms Windows double-click window before
+                // toggling (the old behavior) felt laggy compared to Space.
+                if (click_toggle_undoable_ && player_->isLoaded()) {
+                    player_->togglePause();
+                    if (!osd_.empty()) osd_.pop_back();  // drop the phantom "Pause"/"Play"
+                }
+                click_toggle_undoable_ = false;
                 setFullscreen(!fullscreen_);
             } else if (player_->isLoaded()) {
-                // Defer play/pause until we know a second click isn't coming.
-                pending_video_click_ = true;
-                pending_video_click_timer_ = 0.28f;
+                // Single click: toggle immediately. If this turns out to be
+                // the first half of a double-click, the clicks>=2 branch
+                // above will revert this before switching fullscreen.
+                bool was_playing = player_->isPlaying();
+                player_->togglePause();
+                showOsd(was_playing ? "Pause" : "Play");
+                click_toggle_undoable_ = true;
             }
         }
     }
@@ -2378,12 +2394,17 @@ void UIController::loadConfig() {
             playlist_.setRepeatMode((Playlist::RepeatMode)i);
         }
         else if (std::strcmp(k, "shuffle") == 0)         playlist_.setShuffle(std::atoi(v) != 0);
-        else if (std::strcmp(k, "av_sync_offset") == 0)  player_->setAVSyncOffset(std::atof(v));
-        else if (std::strcmp(k, "rotation") == 0) {
-            int i = std::atoi(v);
-            if (i < 0) i = 0; else if (i > 3) i = 3;
-            rotation_ = (RotationMode)i;
-        }
+        // A/V sync offset is deliberately NOT persisted - it's a per-file
+        // transient (each file has its own encoder/mux quirks) and carrying
+        // yesterday's -300 ms nudge into today's file would look like the
+        // player just broke. Kept the key here so old config files parse
+        // cleanly. Same rationale as rotation.
+        else if (std::strcmp(k, "av_sync_offset") == 0) { /* ignore */ }
+        // Rotation is intentionally NOT persisted - it's a per-file
+        // transient. Persisting it caused landscape videos to appear
+        // portrait after any earlier Ctrl+R press. Kept the case here
+        // to eat the key silently so old config files don't fail parsing.
+        else if (std::strcmp(k, "rotation") == 0) { /* ignore */ }
     }
     std::fclose(fp);
     if (always_on_top_) SDL_SetWindowAlwaysOnTop(window_, true);
@@ -2402,8 +2423,8 @@ void UIController::saveConfig() {
     std::fprintf(fp, "always_on_top=%d\n",      always_on_top_ ? 1 : 0);
     std::fprintf(fp, "repeat_mode=%d\n",        (int)playlist_.repeatMode());
     std::fprintf(fp, "shuffle=%d\n",            playlist_.shuffle() ? 1 : 0);
-    std::fprintf(fp, "av_sync_offset=%.4f\n",   player_->getAVSyncOffset());
-    std::fprintf(fp, "rotation=%d\n",           (int)rotation_);
+    // NOTE: rotation AND av_sync_offset are deliberately NOT saved -
+    // both are per-file transients. See loadConfig for the ignore branches.
     std::fclose(fp);
     config_dirty_ = false;
 }
