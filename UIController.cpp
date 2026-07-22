@@ -13,6 +13,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commdlg.h>
+#include <shellapi.h>
 
 // Seek nudges (+/-5s, +/-30s, frame step) fire while the user is watching and
 // the seek bar already reflects the change - the OSD popup on top of it feels
@@ -432,6 +433,54 @@ void UIController::closeCurrent() {
     SDL_SetWindowTitle(window_, "Vela");
     showOsd("Closed");
     nudgeVisible();
+}
+
+void UIController::jumpToPlaylistIndex(size_t i) {
+    if (i >= playlist_.size()) return;
+    playlist_.setCurrent(i);
+    loadPath(playlist_.current());
+}
+
+void UIController::revealInExplorer(const std::string& path) {
+    if (path.empty()) { showOsd("No path"); return; }
+    // /select,"<path>" opens the containing folder with the file highlighted.
+    // Quote the path so folder names with spaces survive the command line.
+    std::string args = "/select,\"" + path + "\"";
+    HINSTANCE h = ShellExecuteA(nullptr, "open", "explorer.exe",
+                                args.c_str(), nullptr, SW_SHOWNORMAL);
+    // ShellExecute returns a value > 32 on success. Anything <= 32 is an
+    // error code (per Microsoft docs).
+    if ((INT_PTR)h <= 32) showOsd("Reveal failed");
+}
+
+void UIController::copyPathToClipboard(const std::string& path) {
+    if (path.empty()) { showOsd("No path"); return; }
+    // Widen the UTF-8 path to UTF-16 so non-ASCII file names survive the
+    // clipboard round-trip. CF_UNICODETEXT is what modern Windows apps read.
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(),
+                                   (int)path.size(), nullptr, 0);
+    if (wlen <= 0) { showOsd("Copy failed"); return; }
+    // +1 for the null terminator required by CF_UNICODETEXT.
+    size_t bytes = (size_t)(wlen + 1) * sizeof(wchar_t);
+    HGLOBAL hmem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!hmem) { showOsd("Copy failed"); return; }
+    if (wchar_t* p = (wchar_t*)GlobalLock(hmem)) {
+        MultiByteToWideChar(CP_UTF8, 0, path.c_str(), (int)path.size(), p, wlen);
+        p[wlen] = L'\0';
+        GlobalUnlock(hmem);
+    }
+    if (!OpenClipboard(nullptr)) {
+        GlobalFree(hmem);
+        showOsd("Copy failed"); return;
+    }
+    EmptyClipboard();
+    if (SetClipboardData(CF_UNICODETEXT, hmem)) {
+        showOsd("Path copied");
+    } else {
+        GlobalFree(hmem);
+        showOsd("Copy failed");
+    }
+    CloseClipboard();
 }
 
 void UIController::playNextInPlaylist() {
@@ -1768,11 +1817,15 @@ void UIController::drawPlaylistPanel(int W, int H, float alpha) {
 
     // Deferred playlist mutations - never mutate mid-loop because ImGui
     // Selectable IDs are stable across the frame and we want the row height
-    // math to stay consistent within one draw pass.
-    int    remove_idx    = -1;
-    int    move_up_idx   = -1;
-    int    move_down_idx = -1;
-    size_t play_idx      = (size_t)-1;
+    // math to stay consistent within one draw pass. Reveal-in-Explorer and
+    // Copy-Path fire immediately from the popup (no playlist mutation), so
+    // they don't need to be deferred.
+    int    remove_idx        = -1;
+    int    move_up_idx       = -1;
+    int    move_down_idx     = -1;
+    int    move_top_idx      = -1;
+    int    move_bottom_idx   = -1;
+    size_t play_idx          = (size_t)-1;
 
     // On narrow panels (below ~300 px inside width) up/down would eat the
     // filename column, so we hide them and leave only the X. The keyboard
@@ -1802,6 +1855,31 @@ void UIController::drawPlaylistPanel(int W, int H, float alpha) {
             // file is which. Cheap - Selectable already gets us the hover.
             ImGui::SetTooltip("%s", playlist_.items()[i].c_str());
         }
+        // Right-click context menu. BeginPopupContextItem uses the last
+        // item (the Selectable above) as the trigger and the PushID/PopID
+        // guarantees each row gets its own popup id. Reveal + Copy fire
+        // immediately (no playlist mutation); the four mutating actions
+        // record intent into the deferred *_idx variables applied below.
+        if (ImGui::BeginPopupContextItem("pl_ctx")) {
+            if (ImGui::MenuItem("Play now"))       play_idx        = i;
+            ImGui::Separator();
+            ImGui::BeginDisabled(i == 0);
+            if (ImGui::MenuItem("Move to top"))    move_top_idx    = (int)i;
+            ImGui::EndDisabled();
+            ImGui::BeginDisabled(i + 1 >= playlist_.size());
+            if (ImGui::MenuItem("Move to bottom")) move_bottom_idx = (int)i;
+            ImGui::EndDisabled();
+            ImGui::Separator();
+            if (ImGui::MenuItem("Reveal in Explorer")) {
+                revealInExplorer(playlist_.items()[i]);
+            }
+            if (ImGui::MenuItem("Copy path")) {
+                copyPathToClipboard(playlist_.items()[i]);
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Remove"))         remove_idx      = (int)i;
+            ImGui::EndPopup();
+        }
         if (show_reorder) {
             ImGui::SameLine();
             if (Style::TextButton("^", ImVec2(btn_sz, btn_sz), false)) move_up_idx   = (int)i;
@@ -1824,11 +1902,12 @@ void UIController::drawPlaylistPanel(int W, int H, float alpha) {
     // Apply deferred mutations. Order matters: play before reorder/remove so
     // "click a row" always wins if the user happens to double-tap fast.
     if (play_idx != (size_t)-1) {
-        playlist_.setCurrent(play_idx);
-        loadPath(playlist_.current());
+        jumpToPlaylistIndex(play_idx);
     }
-    if (move_up_idx   >= 0) playlist_.moveUp((size_t)move_up_idx);
-    if (move_down_idx >= 0) playlist_.moveDown((size_t)move_down_idx);
+    if (move_up_idx     >= 0) playlist_.moveUp((size_t)move_up_idx);
+    if (move_down_idx   >= 0) playlist_.moveDown((size_t)move_down_idx);
+    if (move_top_idx    >= 0) playlist_.moveToTop((size_t)move_top_idx);
+    if (move_bottom_idx >= 0) playlist_.moveToBottom((size_t)move_bottom_idx);
     if (remove_idx    >= 0) {
         bool was_current = ((size_t)remove_idx == playlist_.index());
         playlist_.remove((size_t)remove_idx);
