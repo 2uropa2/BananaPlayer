@@ -50,6 +50,7 @@ set(VELA_SOURCES
     Style.cpp
     Subtitles.cpp
     Thumbnail.cpp
+    Youtube.cpp
 )
 
 # On Windows, compile the .rc so Explorer/taskbar pick up icon + version info.
