@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <cwctype>
 #include <string>
 
 #ifdef _WIN32
@@ -386,6 +387,94 @@ std::string decodeSubtitleFileToUtf8(const std::string& path) {
 #else
     return buf;
 #endif
+}
+
+std::vector<SubtitleTrack> enumerateCompanionSubtitles(const std::string& video_path) {
+    std::vector<SubtitleTrack> out;
+#ifdef _WIN32
+    // Split path -> (dir, basename-without-ext, ext). Chapter picker uses
+    // both the directory (for FindFirstFile scan) and the basename (for
+    // the wildcard).
+    auto slash = video_path.find_last_of("\\/");
+    std::string dir  = (slash == std::string::npos) ? std::string(".")
+                                                    : video_path.substr(0, slash);
+    std::string fname = (slash == std::string::npos) ? video_path
+                                                     : video_path.substr(slash + 1);
+    auto dot = fname.find_last_of('.');
+    std::string base = (dot == std::string::npos) ? fname : fname.substr(0, dot);
+
+    // FindFirstFileA operates on ANSI paths - the same UTF-8 vs CP949
+    // trap that broke subtitle open before. Wide-path it via FindFirstFileW.
+    std::string pattern_utf8 = dir + "\\" + base + "*";
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, pattern_utf8.c_str(), -1, nullptr, 0);
+    if (wlen <= 0) return out;
+    std::wstring wpattern(wlen - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, pattern_utf8.c_str(), -1, wpattern.data(), wlen);
+
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(wpattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return out;
+
+    auto endsWithI = [](std::wstring_view s, std::wstring_view suf) {
+        if (s.size() < suf.size()) return false;
+        for (size_t i = 0; i < suf.size(); ++i) {
+            wchar_t a = (wchar_t)std::towlower(s[s.size() - suf.size() + i]);
+            wchar_t b = (wchar_t)std::towlower(suf[i]);
+            if (a != b) return false;
+        }
+        return true;
+    };
+
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        std::wstring wname = fd.cFileName;
+        bool is_srt = endsWithI(wname, L".srt");
+        bool is_smi = endsWithI(wname, L".smi");
+        if (!is_srt && !is_smi) continue;
+
+        // Widen -> UTF-8 for our string_view world.
+        int u8len = WideCharToMultiByte(CP_UTF8, 0, wname.c_str(), -1,
+                                        nullptr, 0, nullptr, nullptr);
+        if (u8len <= 1) continue;
+        std::string u8(u8len - 1, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, wname.c_str(), -1, u8.data(),
+                            u8len, nullptr, nullptr);
+
+        SubtitleTrack t;
+        t.path = dir + "\\" + u8;
+        // Label: strip base name from the front and the .srt/.smi from the
+        // back. `movie.ko.srt` -> ".ko" -> "ko". `movie.srt` -> "" -> "default".
+        std::string mid;
+        if (u8.size() > base.size()) {
+            mid = u8.substr(base.size());
+            // strip extension
+            size_t d2 = mid.find_last_of('.');
+            if (d2 != std::string::npos) mid = mid.substr(0, d2);
+            // strip a leading dot
+            if (!mid.empty() && mid.front() == '.') mid = mid.substr(1);
+        }
+        if (mid.empty()) mid = is_smi ? "default (smi)" : "default";
+        t.label = std::move(mid);
+        out.push_back(std::move(t));
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+
+    // Sort: non-default entries alphabetically first (language tags), then
+    // the plain default, then any .smi. The current path already tends to
+    // interleave; sort by label makes the picker menu predictable.
+    std::sort(out.begin(), out.end(),
+              [](const SubtitleTrack& a, const SubtitleTrack& b) {
+                  auto rank = [](const std::string& l) {
+                      if (l == "default") return 1;
+                      if (l == "default (smi)") return 2;
+                      return 0;
+                  };
+                  int ra = rank(a.label), rb = rank(b.label);
+                  if (ra != rb) return ra < rb;
+                  return a.label < b.label;
+              });
+#endif
+    return out;
 }
 
 std::vector<SubtitleCue> loadCompanionSubtitles(const std::string& video_path) {

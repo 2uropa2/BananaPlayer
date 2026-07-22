@@ -716,7 +716,9 @@ void UIController::closeCurrent() {
     if (resume_dirty_) writeResumeIndex();
     player_->unload();
     subtitles_.clear();
-    subtitle_cache_idx_ = 0;
+    subtitle_cache_idx_     = 0;
+    subtitle_tracks_.clear();
+    subtitle_track_active_  = -1;
     loop_a_ = -1.0;
     loop_b_ = -1.0;
     chapters_.clear();
@@ -806,8 +808,18 @@ void UIController::playPrevInPlaylist() {
 }
 
 void UIController::loadCompanionSubs(const std::string& video_path) {
-    subtitles_ = loadCompanionSubtitles(video_path);
-    subtitle_cache_idx_ = 0;
+    // Enumerate every sidecar (movie.ko.srt, movie.en.srt, movie.srt, ...)
+    // so a picker can present them; load the first one so out-of-box the
+    // user gets subs without having to open Settings.
+    subtitle_tracks_       = enumerateCompanionSubtitles(video_path);
+    subtitle_track_active_ = -1;
+    subtitles_.clear();
+    subtitle_cache_idx_    = 0;
+    if (!subtitle_tracks_.empty()) {
+        if (loadSubtitleSidecar(subtitle_tracks_.front().path)) {
+            subtitle_track_active_ = 0;
+        }
+    }
 }
 
 bool UIController::loadSubtitleSidecar(const std::string& path) {
@@ -2595,6 +2607,30 @@ void UIController::drawMainMenuContents() {
         if (ImGui::MenuItem("Enabled", "S", subtitles_enabled_)) {
             subtitles_enabled_ = !subtitles_enabled_;
             markConfigDirty();
+        }
+        // Track picker: only shown when the current video has more than
+        // one sidecar next to it (movie.ko.srt + movie.en.srt + ...).
+        // A single-track file already gets its subs auto-loaded so a
+        // picker would just clutter the menu.
+        if (subtitle_tracks_.size() > 1) {
+            if (ImGui::BeginMenu("Track")) {
+                for (size_t i = 0; i < subtitle_tracks_.size(); ++i) {
+                    bool active = (int)i == subtitle_track_active_;
+                    if (ImGui::MenuItem(subtitle_tracks_[i].label.c_str(),
+                                        nullptr, active)) {
+                        if (loadSubtitleSidecar(subtitle_tracks_[i].path)) {
+                            subtitle_track_active_ = (int)i;
+                            char buf[192];
+                            std::snprintf(buf, sizeof(buf), "Subs: %s",
+                                          subtitle_tracks_[i].label.c_str());
+                            showOsd(buf, 1.6f);
+                        } else {
+                            showOsd("Subtitle load failed", 2.0f);
+                        }
+                    }
+                }
+                ImGui::EndMenu();
+            }
         }
         ImGui::Separator();
         if (ImGui::BeginMenu("Size")) {

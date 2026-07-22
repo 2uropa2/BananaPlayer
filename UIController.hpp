@@ -242,6 +242,12 @@ private:
     void seekPrevChapter();
     void seekNextChapter();
 
+    // Sidecar subtitle tracks discovered next to the video (movie.ko.srt,
+    // movie.en.srt, ...). Populated at loadPath. UI presents a picker
+    // under Settings > Subtitles when the vector has more than one entry.
+    std::vector<SubtitleTrack> subtitle_tracks_;
+    int subtitle_track_active_ = -1;   // index into subtitle_tracks_, -1 = none loaded
+
     // External subtitles (auto-loaded from basename.srt / basename.smi).
     std::vector<SubtitleCue> subtitles_;
     bool subtitles_enabled_ = true;

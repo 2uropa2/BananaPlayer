@@ -37,3 +37,18 @@ std::string decodeSubtitleFileToUtf8(const std::string& path);
 // Given a video path (e.g. `C:\videos\clip.mp4`), look for `clip.srt` then
 // `clip.smi` next to it and return parsed cues. Empty vector if none.
 std::vector<SubtitleCue> loadCompanionSubtitles(const std::string& video_path);
+
+// One sidecar subtitle track discovered next to the video: an absolute
+// `path` plus a UI `label` derived from the tag between basename and
+// extension (e.g. `movie.ko.srt` -> "ko", `movie.srt` -> "default").
+struct SubtitleTrack {
+    std::string path;
+    std::string label;
+};
+
+// Enumerate every `<basename>*.srt` / `<basename>*.smi` next to the video
+// path. Used to build a track picker when a folder has multiple language
+// sidecars (movie.ko.srt, movie.en.srt, ...). Order: `basename.<tag>.srt`
+// entries alphabetically, then the plain `basename.srt`, then the .smi
+// variants (which are rarer for multi-language content).
+std::vector<SubtitleTrack> enumerateCompanionSubtitles(const std::string& video_path);
