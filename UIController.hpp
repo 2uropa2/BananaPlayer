@@ -133,6 +133,12 @@ private:
     // the user can pick another entry. Called from the keyboard handler
     // and the right-click context menu.
     void   closeCurrent();
+    // Playlist row context-menu helpers. jumpToPlaylistIndex sets the
+    // current index and loads the file; the other two are Windows shell
+    // conveniences invoked from the per-row right-click popup.
+    void   jumpToPlaylistIndex(size_t i);
+    void   revealInExplorer(const std::string& path);
+    void   copyPathToClipboard(const std::string& path);
     // Ctrl+Shift+S: copies the current frame to the Windows clipboard as
     // a device-independent bitmap so it can be pasted into any app.
     void   snapshotToClipboard();
