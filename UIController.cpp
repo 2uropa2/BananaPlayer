@@ -450,6 +450,49 @@ void UIController::loadCompanionSubs(const std::string& video_path) {
     subtitle_cache_idx_ = 0;
 }
 
+bool UIController::loadSubtitleSidecar(const std::string& path) {
+    // Shared with the drop-file branch of handleEvent. Reads the sidecar
+    // via decodeSubtitleFileToUtf8 (which handles UTF-8 / CP949) and
+    // picks a parser by lowercased extension.
+    if (path.empty()) return false;
+    std::string utf8 = decodeSubtitleFileToUtf8(path);
+    std::string ext = path.size() >= 4 ? path.substr(path.size() - 4) : "";
+    for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
+    std::vector<SubtitleCue> cues;
+    if (ext == ".srt") cues = parseSRT(utf8);
+    else               cues = parseSMI(utf8);
+    if (cues.empty()) return false;
+    subtitles_ = std::move(cues);
+    subtitle_cache_idx_ = 0;
+    subtitles_enabled_ = true;
+    return true;
+}
+
+void UIController::openSubtitleDialog() {
+    if (!player_->isLoaded()) {
+        showOsd("No video loaded");
+        return;
+    }
+    OPENFILENAMEA ofn = {};
+    char szFile[MAX_PATH] = {0};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = sizeof(szFile);
+    ofn.lpstrFilter =
+        "Subtitle Files (*.srt;*.smi)\0*.srt;*.smi\0"
+        "All Files (*.*)\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
+    if (!GetOpenFileNameA(&ofn)) return;   // user cancelled
+    std::string picked(szFile);
+    if (loadSubtitleSidecar(picked)) {
+        showOsd("Subtitle loaded");
+    } else {
+        showOsd("Subtitle load failed");
+    }
+    nudgeVisible();
+}
+
 const SubtitleCue* UIController::currentSubtitle(double t) {
     if (subtitles_.empty()) return nullptr;
     // Apply user-adjustable sync offset. Positive offset means subs are
@@ -1567,6 +1610,9 @@ void UIController::drawMainMenuContents() {
     }
 
     if (ImGui::BeginMenu("Subtitles")) {
+        if (ImGui::MenuItem("Load Subtitle...", nullptr, false, player_->isLoaded())) {
+            openSubtitleDialog();
+        }
         if (ImGui::MenuItem("Enabled", "S", subtitles_enabled_)) {
             subtitles_enabled_ = !subtitles_enabled_;
             markConfigDirty();
@@ -2064,6 +2110,15 @@ void UIController::handleEvent(const SDL_Event& event) {
             markConfigDirty();
             return;
         }
+        // Ctrl+= : snap the window's client area to the video aspect within
+        // ~85 % of the current display's usable bounds. Explicitly excludes
+        // Shift so a future Ctrl+Shift+= (or Ctrl++ on some layouts) stays
+        // free. No auto-repeat - single press only.
+        if (sc == SDL_SCANCODE_EQUALS
+            && (mod & SDL_KMOD_CTRL) && !(mod & SDL_KMOD_SHIFT)) {
+            snapWindowToVideo();
+            return;
+        }
         // Shuffle toggle (H, no modifiers).
         if (sc == SDL_SCANCODE_H && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT))) {
             playlist_.setShuffle(!playlist_.shuffle());
@@ -2154,16 +2209,7 @@ void UIController::handleEvent(const SDL_Event& event) {
             // Dropping a subtitle file onto a loaded video swaps in the
             // sidecar cues without touching playback state - matches VLC.
             if (isSubtitleFile(p) && player_->isLoaded()) {
-                std::string utf8 = decodeSubtitleFileToUtf8(p);
-                std::vector<SubtitleCue> cues;
-                std::string ext = p.size() >= 4 ? p.substr(p.size() - 4) : "";
-                for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
-                if (ext == ".srt") cues = parseSRT(utf8);
-                else               cues = parseSMI(utf8);
-                if (!cues.empty()) {
-                    subtitles_ = std::move(cues);
-                    subtitle_cache_idx_ = 0;
-                    subtitles_enabled_ = true;
+                if (loadSubtitleSidecar(p)) {
                     char buf[128];
                     std::snprintf(buf, sizeof(buf), "Subs  %s",
                                   baseName(p.c_str()));
@@ -2488,6 +2534,72 @@ void UIController::applyStoredWindowGeometry() {
         SDL_SetWindowPosition(window_, x, y);
     }
     if (maximized) SDL_MaximizeWindow(window_);
+}
+
+void UIController::snapWindowToVideo() {
+    // Resize the window so its client area matches the video's post-rotation
+    // aspect ratio, filling up to ~85 % of the current display's usable
+    // bounds without going off-screen. Un-maximizes first if needed.
+    // Silently no-ops in fullscreen (with a brief OSD) because SDL ignores
+    // SDL_SetWindowSize on a fullscreen window and the resize would just be
+    // stashed for the eventual restore anyway.
+    if (!player_->isLoaded()) {
+        showOsd("No video loaded");
+        return;
+    }
+    int vw = player_->getVideoWidth();
+    int vh = player_->getVideoHeight();
+    if (vw <= 0 || vh <= 0) {
+        showOsd("No video loaded");
+        return;
+    }
+    if (fullscreen_
+        || (SDL_GetWindowFlags(window_) & SDL_WINDOW_FULLSCREEN) != 0) {
+        showOsd("Not while fullscreen");
+        return;
+    }
+    // Effective aspect after intrinsic + user rotation (matches the render
+    // path in main.cpp so the picture fills the client area exactly).
+    int total_deg = ((player_->getIntrinsicRotation()
+                      + ((int)rotation_ * 90)) % 360 + 360) % 360;
+    bool rot90 = (total_deg == 90 || total_deg == 270);
+    int eff_w = rot90 ? vh : vw;
+    int eff_h = rot90 ? vw : vh;
+    // Fetch the display the window is currently on; fall back to primary.
+    SDL_DisplayID disp = SDL_GetDisplayForWindow(window_);
+    if (disp == 0) disp = SDL_GetPrimaryDisplay();
+    SDL_Rect bounds{};
+    if (!SDL_GetDisplayUsableBounds(disp, &bounds)) {
+        if (!SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &bounds)) {
+            showOsd("Cannot query display");
+            return;
+        }
+    }
+    // Un-maximize before resizing so the OS actually honors the new size
+    // rather than snapping the frame right back to the work-area edges.
+    if ((SDL_GetWindowFlags(window_) & SDL_WINDOW_MAXIMIZED) != 0) {
+        SDL_RestoreWindow(window_);
+    }
+    const float fill = 0.85f;
+    float max_w = (float)bounds.w * fill;
+    float max_h = (float)bounds.h * fill;
+    float src_aspect = (float)eff_w / (float)eff_h;
+    // Fit the largest aspect-preserving rectangle into (max_w, max_h).
+    float target_w = max_w;
+    float target_h = target_w / src_aspect;
+    if (target_h > max_h) {
+        target_h = max_h;
+        target_w = target_h * src_aspect;
+    }
+    int tw = (int)target_w;
+    int th = (int)target_h;
+    // Clamp to the declared minimum window size (project policy: 640x400).
+    if (tw < 640) tw = 640;
+    if (th < 400) th = 400;
+    SDL_SetWindowSize(window_, tw, th);
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "Snap %dx%d", tw, th);
+    showOsd(buf);
 }
 
 void UIController::captureWindowGeometry() {
