@@ -155,9 +155,18 @@ private:
     static bool isSubtitleFile(const std::string& path);
 
     // Seek-drag state: pause playback while the user drags the seek bar,
-    // then resume if it was playing before the drag started.
+    // then resume if it was playing before the drag started. Additional
+    // rate-limiting fields prevent the demux thread from thrashing on
+    // every mouse pixel: during drag we track the pending target locally
+    // and issue player_->seek() at most every ~120 ms wallclock. On
+    // release the final target is always committed. Without this, rapid
+    // drag would flush + re-decode the pipeline dozens of times per
+    // second and paused viewers saw stray intermediate frames catch up.
     bool seek_dragging_ = false;
     bool seek_resume_on_release_ = false;
+    float  seek_pending_val_ = 0.0f;
+    Uint64 seek_last_issue_ticks_ = 0;
+    float  seek_last_issued_val_ = -1.0f;
 
     // Screen-space rect of the SeekBar last frame, so the wheel handler
     // can seek (instead of adjusting volume) when the cursor is over the

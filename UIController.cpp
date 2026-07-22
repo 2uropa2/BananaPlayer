@@ -1423,13 +1423,38 @@ void UIController::drawBottomOverlay(int W, int H, float alpha) {
         seek_dragging_ = true;
         seek_resume_on_release_ = player_->isPlaying();
         if (seek_resume_on_release_) player_->pause();
+        seek_pending_val_ = seek_val;
+        seek_last_issue_ticks_ = 0;   // force first issue below to happen immediately
+        seek_last_issued_val_ = -1.0f;
     }
-    if (seek_changed) {
+    if (seek_dragging_) {
+        // Rate-limited scrubbing: track the freshest target locally, but
+        // only actually call player_->seek() every ~120 ms of wallclock.
+        // This keeps a live-preview feel without letting the demux thread
+        // flush + re-decode the pipeline on every mouse pixel.
+        if (seek_changed) seek_pending_val_ = seek_val;
+        Uint64 now_ticks = SDL_GetTicks();
+        bool first_issue = (seek_last_issue_ticks_ == 0);
+        bool time_ok     = (now_ticks - seek_last_issue_ticks_) >= 120;
+        bool val_moved   = std::fabs(seek_pending_val_ - seek_last_issued_val_) > 0.05f;
+        if ((first_issue || time_ok) && val_moved) {
+            player_->seek(seek_pending_val_);
+            seek_last_issue_ticks_ = now_ticks;
+            seek_last_issued_val_  = seek_pending_val_;
+            nudgeVisible();
+        }
+    } else if (seek_changed) {
+        // Not a drag - a single click on the track counts as one seek.
         player_->seek(seek_val);
         nudgeVisible();
     }
     if (!seek_held && seek_dragging_) {
-        // Drag ended: resume if we paused for this drag.
+        // Drag ended: always commit the final position, even if rate-limit
+        // would have skipped this one, so the user lands exactly where they
+        // let go rather than at the last throttled sample.
+        if (std::fabs(seek_pending_val_ - seek_last_issued_val_) > 1e-4f) {
+            player_->seek(seek_pending_val_);
+        }
         seek_dragging_ = false;
         if (seek_resume_on_release_) player_->play();
         seek_resume_on_release_ = false;
