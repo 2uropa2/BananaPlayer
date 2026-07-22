@@ -205,9 +205,17 @@ void UIController::setFullscreen(bool val) {
     SDL_SetWindowFullscreen(window_, val);
     if (val) {
         SDL_HideCursor();
+        cursor_visible_ = false;
         ui_visible_timer_ = 2.0f;
+        cursor_idle_timer_ = 1.0f;
     } else {
+        // Exiting fullscreen: cursor must come back immediately regardless
+        // of the previous hidden/shown state. nudgeVisible() below would do
+        // it via the !cursor_visible_ branch, but we set the flag here
+        // explicitly so the state stays coherent even if callers ever bypass
+        // nudgeVisible.
         SDL_ShowCursor();
+        cursor_visible_ = true;
     }
     nudgeVisible();
 }
@@ -344,6 +352,15 @@ void UIController::showOsd(const std::string& text, float duration) {
 void UIController::nudgeVisible() {
     ui_visible_timer_ = 3.0f;
     overlay_target_ = 1.0f;
+    // Cursor gets its own (shorter) idle timer. Reset alongside the overlay
+    // timer on every real activity nudge, and force the cursor back on if
+    // we had hidden it - so any mouse motion / key press / wheel event
+    // brings the pointer back instantly.
+    cursor_idle_timer_ = 1.0f;
+    if (!cursor_visible_) {
+        SDL_ShowCursor();
+        cursor_visible_ = true;
+    }
 }
 
 void UIController::takeSnapshot() {
@@ -941,19 +958,37 @@ void UIController::render(int W, int H) {
         bool item_active   = ImGui::IsAnyItemActive();               // click-drag in progress
         bool popup_open    = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopup);
         bool panel_open    = show_playlist_;                          // keep visible while browsing tracks
-        if (moved || item_active || popup_open || panel_open) ui_visible_timer_ = 3.0f;
+        if (moved || item_active || popup_open || panel_open) {
+            ui_visible_timer_ = 3.0f;
+            cursor_idle_timer_ = 1.0f;
+        }
         ui_visible_timer_ -= dt;
+        cursor_idle_timer_ -= dt;
         overlay_target_ = (ui_visible_timer_ > 0.0f) ? 1.0f : 0.0f;
         // Cursor only auto-hides in fullscreen; windowed keeps it visible so
-        // the user can still reach the title bar and other windows.
+        // the user can still reach the title bar and other windows. The
+        // cursor uses its own ~1 s timer (independent of the 3 s overlay
+        // fade) so the pointer stops covering the picture quickly while the
+        // seek bar / play button stay visible for a while longer.
         if (fullscreen_) {
-            if (overlay_target_ > 0.5f) SDL_ShowCursor(); else SDL_HideCursor();
-        } else {
+            bool want_visible = (cursor_idle_timer_ > 0.0f);
+            if (want_visible && !cursor_visible_) {
+                SDL_ShowCursor();
+                cursor_visible_ = true;
+            } else if (!want_visible && cursor_visible_) {
+                SDL_HideCursor();
+                cursor_visible_ = false;
+            }
+        } else if (!cursor_visible_) {
             SDL_ShowCursor();
+            cursor_visible_ = true;
         }
     } else {
         overlay_target_ = 1.0f;
-        SDL_ShowCursor();
+        if (!cursor_visible_) {
+            SDL_ShowCursor();
+            cursor_visible_ = true;
+        }
     }
 
     // Smooth fade toward target. Snap in fast on activity, fade out gently.

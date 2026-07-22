@@ -73,6 +73,14 @@ private:
     float overlay_alpha_ = 1.0f;
     float overlay_target_ = 1.0f;
     float ui_visible_timer_ = 3.0f;
+    // Cursor hides faster than the overlay bar (typical player behavior:
+    // pointer disappears after ~1 s so it stops covering the picture, but
+    // the overlay stays for its full 3 s so a viewer glancing down still
+    // sees the seek bar / play button). Only ticks in fullscreen; windowed
+    // keeps the cursor visible unconditionally. `cursor_visible_` tracks
+    // our locally-owned state so we don't hammer SDL every frame.
+    float cursor_idle_timer_ = 1.0f;
+    bool  cursor_visible_ = true;
 
     struct OsdMsg { std::string text; float remaining; float total; };
     std::vector<OsdMsg> osd_;
