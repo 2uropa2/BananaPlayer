@@ -242,6 +242,25 @@ private:
     void seekPrevChapter();
     void seekNextChapter();
 
+    // User-set bookmarks (Ctrl+M) - per-file, persisted to a `vela.bookmarks`
+    // sidecar next to the exe. Same MRU pattern as resume_index_. Rendered
+    // as amber diamond ticks below the seek track so they're visually
+    // distinct from chapter posts (sky-blue) and A-B loop markers.
+    struct BookmarkEntry {
+        std::string         path;
+        std::vector<double> times;   // seconds, sorted ascending
+    };
+    std::vector<BookmarkEntry> bookmark_index_;
+    std::vector<double>        bookmarks_current_;
+    bool                       bookmark_dirty_ = false;
+    void loadBookmarkIndex();
+    void writeBookmarkIndex();
+    void loadBookmarksForCurrent();     // pulls times for the currently-playing file
+    void writeBookmarksForCurrent();    // stores current times back to the index
+    void addBookmark();                 // Ctrl+M - insert at current playhead
+    void removeBookmark(size_t idx);
+    void clearBookmarks();
+
     // Sidecar subtitle tracks discovered next to the video (movie.ko.srt,
     // movie.en.srt, ...). Populated at loadPath. UI presents a picker
     // under Settings > Subtitles when the vector has more than one entry.

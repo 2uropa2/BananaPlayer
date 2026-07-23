@@ -79,6 +79,16 @@ std::string resumeIndexPath() {
     return (p == std::string::npos) ? "vela.resume" : (s.substr(0, p) + "\\vela.resume");
 }
 
+std::string bookmarkIndexPath() {
+    char buf[MAX_PATH];
+    DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return "vela.bookmarks";
+    std::string s(buf, n);
+    size_t p = s.find_last_of("\\/");
+    return (p == std::string::npos) ? "vela.bookmarks"
+                                    : (s.substr(0, p) + "\\vela.bookmarks");
+}
+
 std::string openFileDialogWin() {
     OPENFILENAMEA ofn = {};
     char szFile[MAX_PATH] = {0};
@@ -108,6 +118,7 @@ UIController::UIController(VideoPlayer* player, SDL_Window* window, SDL_Renderer
     thumb_provider_ = std::make_unique<ThumbnailProvider>(renderer_);
     yt_resolver_    = std::make_unique<YoutubeResolver>();
     loadResumeIndex();
+    loadBookmarkIndex();
     loadConfig();
     loadRecents();
     loadLastPlaylist();
@@ -121,6 +132,7 @@ UIController::UIController(VideoPlayer* player, SDL_Window* window, SDL_Renderer
 UIController::~UIController() {
     snapshotCurrentResume();
     if (resume_dirty_) writeResumeIndex();
+    if (bookmark_dirty_) writeBookmarkIndex();
     saveConfig();
     saveRecents();
     saveLastPlaylist();
@@ -204,6 +216,125 @@ void UIController::clearResume(const std::string& path) {
     if (resume_index_.size() != n_before) resume_dirty_ = true;
 }
 
+// ---------- Bookmarks (Ctrl+M) ----------
+
+void UIController::loadBookmarkIndex() {
+    bookmark_index_.clear();
+    std::FILE* f = std::fopen(bookmarkIndexPath().c_str(), "rb");
+    if (!f) return;
+    // Line format:  t1,t2,t3\t<path>
+    // Times are decimal seconds ascending.
+    char buf[8192];
+    while (std::fgets(buf, sizeof(buf), f)) {
+        std::string line(buf);
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+        if (line.empty()) continue;
+        size_t tab = line.find('\t');
+        if (tab == std::string::npos) continue;
+        BookmarkEntry e;
+        e.path = line.substr(tab + 1);
+        if (e.path.empty()) continue;
+        std::string times = line.substr(0, tab);
+        size_t pos = 0;
+        while (pos < times.size()) {
+            size_t comma = times.find(',', pos);
+            if (comma == std::string::npos) comma = times.size();
+            double t = std::atof(times.substr(pos, comma - pos).c_str());
+            if (t >= 0.0) e.times.push_back(t);
+            pos = comma + 1;
+        }
+        std::sort(e.times.begin(), e.times.end());
+        if (!e.times.empty()) bookmark_index_.push_back(std::move(e));
+    }
+    std::fclose(f);
+    if (bookmark_index_.size() > 200) bookmark_index_.resize(200);
+}
+
+void UIController::writeBookmarkIndex() {
+    std::FILE* f = std::fopen(bookmarkIndexPath().c_str(), "wb");
+    if (!f) return;
+    size_t n = std::min<size_t>(bookmark_index_.size(), 200);
+    for (size_t i = 0; i < n; ++i) {
+        const auto& e = bookmark_index_[i];
+        if (e.times.empty()) continue;
+        for (size_t j = 0; j < e.times.size(); ++j) {
+            std::fprintf(f, "%s%.3f", j ? "," : "", e.times[j]);
+        }
+        std::fprintf(f, "\t%s\n", e.path.c_str());
+    }
+    std::fclose(f);
+    bookmark_dirty_ = false;
+}
+
+void UIController::loadBookmarksForCurrent() {
+    bookmarks_current_.clear();
+    if (!player_->isLoaded()) return;
+    const std::string& p = player_->getFilename();
+    if (p.empty()) return;
+    for (const auto& e : bookmark_index_) {
+        if (e.path == p) { bookmarks_current_ = e.times; return; }
+    }
+}
+
+void UIController::writeBookmarksForCurrent() {
+    if (!player_->isLoaded()) return;
+    const std::string& p = player_->getFilename();
+    if (p.empty()) return;
+    // Drop any existing entry for this path.
+    bookmark_index_.erase(
+        std::remove_if(bookmark_index_.begin(), bookmark_index_.end(),
+                       [&](const BookmarkEntry& e){ return e.path == p; }),
+        bookmark_index_.end());
+    if (!bookmarks_current_.empty()) {
+        BookmarkEntry e;
+        e.path  = p;
+        e.times = bookmarks_current_;
+        std::sort(e.times.begin(), e.times.end());
+        // MRU: newest file's entry goes to the front.
+        bookmark_index_.insert(bookmark_index_.begin(), std::move(e));
+        if (bookmark_index_.size() > 200) bookmark_index_.resize(200);
+    }
+    bookmark_dirty_ = true;
+}
+
+void UIController::addBookmark() {
+    if (!player_->isLoaded()) { showOsd("No file loaded", 1.4f); return; }
+    if (bookmarks_current_.size() >= 50) {
+        showOsd("Bookmark limit reached (50)", 2.0f);
+        return;
+    }
+    double t = player_->getCurrentTime();
+    // Ignore duplicates within +/- 1 s of an existing bookmark - the user's
+    // clicking Ctrl+M twice in a row usually means "one bookmark here".
+    for (double existing : bookmarks_current_) {
+        if (std::fabs(existing - t) < 1.0) {
+            showOsd("Already bookmarked here", 1.6f);
+            return;
+        }
+    }
+    bookmarks_current_.push_back(t);
+    std::sort(bookmarks_current_.begin(), bookmarks_current_.end());
+    writeBookmarksForCurrent();
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "Bookmark added at %s",
+                  formatTime(t).c_str());
+    showOsd(buf, 1.8f);
+}
+
+void UIController::removeBookmark(size_t idx) {
+    if (idx >= bookmarks_current_.size()) return;
+    bookmarks_current_.erase(bookmarks_current_.begin() + idx);
+    writeBookmarksForCurrent();
+    showOsd("Bookmark removed", 1.4f);
+}
+
+void UIController::clearBookmarks() {
+    if (bookmarks_current_.empty()) return;
+    bookmarks_current_.clear();
+    writeBookmarksForCurrent();
+    showOsd("Bookmarks cleared", 1.4f);
+}
+
 void UIController::snapshotCurrentResume() {
     if (!player_->isLoaded()) return;
     const std::string& p = player_->getFilename();
@@ -249,6 +380,8 @@ bool UIController::loadPath(const std::string& path) {
     // a later crash doesn't lose the resume mark for the file we just closed.
     snapshotCurrentResume();
     if (resume_dirty_) writeResumeIndex();
+    if (bookmark_dirty_) writeBookmarkIndex();
+    bookmarks_current_.clear();
 
     // Loading a non-YouTube file (direct file/URL): the current YouTube
     // source URL, if any, is now stale. The YouTube-resolve callers use
@@ -286,6 +419,8 @@ bool UIController::loadPath(const std::string& path) {
         if (!player_->onEnded) player_->onEnded = [this]() { handleNaturalEnd(); };
         // Cache container chapters up front; empty vector for files without.
         chapters_ = player_->getChapters();
+        // Pull any prior bookmarks for this file into bookmarks_current_.
+        loadBookmarksForCurrent();
         addRecent(path);
         // Update playlist current selection to match (or append)
         bool found = false;
@@ -722,6 +857,7 @@ void UIController::closeCurrent() {
     loop_a_ = -1.0;
     loop_b_ = -1.0;
     chapters_.clear();
+    bookmarks_current_.clear();
     // Not playing a YouTube-resolved stream anymore - drop the source URL
     // so the top-overlay quality pill disappears.
     current_yt_source_url_.clear();
@@ -982,6 +1118,7 @@ void UIController::drawShortcutsPanel(int W, int H) {
             { ",  /  .",         "Frame step" },
             { "A",               "A-B loop: set A / set B / clear" },
             { "Alt + Left / Right","Previous / next chapter" },
+            { "Ctrl + M",        "Add bookmark at current time" },
         }},
         { "Sync", {
             { "Ctrl + Left / Right",       "Shift video by -/+ 30 ms" },
@@ -2112,6 +2249,63 @@ void UIController::drawBottomOverlay(int W, int H, float alpha) {
         }
     }
 
+    // Draw user bookmark markers - small amber diamonds SITTING BELOW the
+    // track so they're clearly separated from chapter posts (sky-blue,
+    // spanning the track height) and A-B markers (green / orange posts).
+    // Hover reveals the timestamp.
+    if (dur > 0.0f && !bookmarks_current_.empty()) {
+        ImVec2 rmin = ImGui::GetItemRectMin();
+        ImVec2 rmax = ImGui::GetItemRectMax();
+        ImDrawList* sdl_dl = ImGui::GetWindowDrawList();
+        ImU32 mk_fill = Style::Fade(IM_COL32(255, 190, 100, 235), alpha);
+        ImU32 mk_edge = Style::Fade(IM_COL32(120,  70,  20, 220), alpha);
+        float diamond_y = rmax.y + 6.0f;
+        float diamond_r = 4.5f;
+        for (size_t i = 0; i < bookmarks_current_.size(); ++i) {
+            double t = bookmarks_current_[i];
+            if (t < 0.0 || t > dur) continue;
+            float x = rmin.x + (float)(t / dur) * (rmax.x - rmin.x);
+            ImVec2 pts[4] = {
+                ImVec2(x, diamond_y - diamond_r),
+                ImVec2(x + diamond_r, diamond_y),
+                ImVec2(x, diamond_y + diamond_r),
+                ImVec2(x - diamond_r, diamond_y),
+            };
+            sdl_dl->AddConvexPolyFilled(pts, 4, mk_fill);
+            sdl_dl->AddPolyline(pts, 4, mk_edge, ImDrawFlags_Closed, 1.0f);
+        }
+        // Hover tooltip for the nearest bookmark within +/- 6 px.
+        ImGuiIO& io = ImGui::GetIO();
+        float mx = io.MousePos.x, my = io.MousePos.y;
+        if (mx >= rmin.x && mx <= rmax.x
+            && my >= diamond_y - diamond_r - 4.0f
+            && my <= diamond_y + diamond_r + 4.0f) {
+            int hit = -1;
+            for (size_t i = 0; i < bookmarks_current_.size(); ++i) {
+                double t = bookmarks_current_[i];
+                if (t < 0.0 || t > dur) continue;
+                float x = rmin.x + (float)(t / dur) * (rmax.x - rmin.x);
+                if (std::fabs(mx - x) < 6.0f) { hit = (int)i; break; }
+            }
+            if (hit >= 0) {
+                char label[128];
+                std::snprintf(label, sizeof(label), "Bookmark  %s",
+                              formatTime(bookmarks_current_[(size_t)hit]).c_str());
+                ImDrawList* fg = ImGui::GetForegroundDrawList();
+                ImVec2 tsz = ImGui::CalcTextSize(label);
+                float pad = 6.0f;
+                float tx = std::clamp(mx - tsz.x * 0.5f,
+                                      rmin.x, rmax.x - tsz.x - 2.0f * pad);
+                float ty = diamond_y + diamond_r + 6.0f;
+                fg->AddRectFilled(ImVec2(tx, ty),
+                                  ImVec2(tx + tsz.x + 2.0f * pad, ty + tsz.y + 6.0f),
+                                  IM_COL32(24, 20, 12, 230), 4.0f);
+                fg->AddText(ImVec2(tx + pad, ty + 3.0f),
+                            IM_COL32(255, 220, 170, 255), label);
+            }
+        }
+    }
+
     // Draw A-B loop markers over the seek bar (uses the button's rect).
     if (dur > 0.0f && (loop_a_ >= 0.0 || loop_b_ >= 0.0)) {
         ImVec2 rmin = ImGui::GetItemRectMin();
@@ -2692,6 +2886,47 @@ void UIController::drawMainMenuContents() {
 
     if (ImGui::MenuItem("Snapshot", "Ctrl+S", false, player_->isLoaded())) takeSnapshot();
 
+    if (ImGui::BeginMenu("Bookmarks", player_->isLoaded())) {
+        if (ImGui::MenuItem("Add bookmark at current time", "Ctrl+M", false,
+                            player_->isLoaded())) addBookmark();
+        if (bookmarks_current_.empty()) {
+            ImGui::Separator();
+            ImGui::TextDisabled("No bookmarks");
+        } else {
+            ImGui::Separator();
+            // Snapshot the vector because iteration + mutation on click
+            // would invalidate our indices. Apply the intended action at
+            // end-of-menu.
+            int click_seek   = -1;
+            int click_remove = -1;
+            bool click_clear = false;
+            for (size_t i = 0; i < bookmarks_current_.size(); ++i) {
+                char label[96];
+                std::snprintf(label, sizeof(label), "%zu.  %s",
+                              i + 1,
+                              formatTime(bookmarks_current_[i]).c_str());
+                if (ImGui::MenuItem(label)) click_seek = (int)i;
+                ImGui::SameLine();
+                ImGui::PushID((int)i);
+                if (ImGui::SmallButton("x")) click_remove = (int)i;
+                ImGui::PopID();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Clear all")) click_clear = true;
+
+            if (click_seek >= 0
+                && click_seek < (int)bookmarks_current_.size()) {
+                player_->seek(bookmarks_current_[(size_t)click_seek]);
+                nudgeVisible();
+            } else if (click_remove >= 0) {
+                removeBookmark((size_t)click_remove);
+            } else if (click_clear) {
+                clearBookmarks();
+            }
+        }
+        ImGui::EndMenu();
+    }
+
     if (ImGui::BeginMenu("Repeat")) {
         struct Entry { const char* label; Playlist::RepeatMode m; };
         Entry opts[] = {
@@ -3194,6 +3429,13 @@ void UIController::handleEvent(const SDL_Event& event) {
         // so the user can pick something else without re-scanning).
         if (sc == SDL_SCANCODE_W && (mod & SDL_KMOD_CTRL)) {
             closeCurrent();
+            return;
+        }
+        // Ctrl+M: add a user bookmark at the current playhead. Per-file,
+        // persisted to vela.bookmarks. Duplicate protection: a Ctrl+M
+        // within 1 s of an existing mark is a no-op.
+        if (sc == SDL_SCANCODE_M && (mod & SDL_KMOD_CTRL)) {
+            addBookmark();
             return;
         }
         // Number keys 0-9 (no modifiers): jump to N * 10 % of the file.
