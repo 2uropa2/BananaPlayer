@@ -187,6 +187,12 @@ private:
     std::atomic<bool> quit_{false};
     std::atomic<bool> seek_requested_{false};
     std::atomic<double> seek_target_{0.0};
+    // When stepFrame(negative delta) issues a seek, we set this so
+    // updateTexture drops every frame the decoder emits between the
+    // nearest keyframe and the exact target - otherwise the user sees
+    // the video "play forward" from the keyframe up to the target,
+    // which looks like a stutter. Sentinel < 0 = not stepping.
+    std::atomic<double> step_back_target_{-1.0};
     std::atomic<bool> eof_{false};
     std::atomic<bool> ended_signaled_{false};
     // Set true at end of loadFile, cleared after the "un-stick audio"

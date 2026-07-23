@@ -350,6 +350,11 @@ void VideoPlayer::seek(double seconds) {
     if (!loaded_) return;
     double d = duration_ > 0.0 ? duration_ : 0.0;
     seconds = std::clamp(seconds, 0.0, d);
+    // Any external seek invalidates a still-pending backward-step target.
+    // stepFrame() re-sets it AFTER calling seek() so its own use case
+    // survives, but a user drag or arrow-key seek shouldn't have to know
+    // about the mask.
+    step_back_target_.store(-1.0, std::memory_order_release);
     seek_target_ = seconds;
     seek_requested_ = true;
     eof_ = false;
@@ -367,7 +372,13 @@ void VideoPlayer::stepFrame(double delta) {
     if (delta < 0.0) {
         bool was_playing = playing_;
         if (was_playing) pause();
-        seek(getCurrentTime() + delta);
+        // Order matters: seek() clears step_back_target_ (so a plain user
+        // seek doesn't get stuck behind a stale mask). Set our target
+        // AFTER seek() so this step's mask survives. Any race is < 1 us
+        // between the two atomic writes vs a demux/decode round-trip.
+        double target = getCurrentTime() + delta;
+        seek(target);
+        step_back_target_.store(target, std::memory_order_release);
         return;
     }
     // Forward step: cheap - just advance the master clock; updateTexture will pull
@@ -966,12 +977,31 @@ bool VideoPlayer::updateTexture(SDL_Texture* texture) {
 
     AVFrame* best = nullptr;
     bool video_empty = false;
+    // Backward-step mask: drop every decoded frame whose pts is more than
+    // half a frame BEHIND the target. Once we reach a frame within +/- one
+    // frame of the target, clear the mask and release that frame normally.
+    // Half-a-frame tolerance for common framerates:
+    //   30 fps -> 0.0167 s per frame -> half = 0.0083 s
+    //   60 fps -> 0.0083 s per frame -> half = 0.0042 s
+    // A single 20 ms tolerance covers both without measuring fps here.
+    double step_target = step_back_target_.load(std::memory_order_acquire);
     {
         std::lock_guard<std::mutex> lk(video_queue_mutex_);
         while (video_queue_.size() > 1 && video_queue_.front().pts < now_time - 0.2) {
             AVFrame* f = video_queue_.front().frame;
             av_frame_free(&f);
             video_queue_.pop_front();
+        }
+        // Extra pass while step-back is active: drop frames strictly before
+        // the target so the user only ever sees the final frame, never the
+        // GOP-replay leading up to it.
+        if (step_target >= 0.0) {
+            while (!video_queue_.empty()
+                   && video_queue_.front().pts < step_target - 0.020) {
+                AVFrame* f = video_queue_.front().frame;
+                av_frame_free(&f);
+                video_queue_.pop_front();
+            }
         }
         if (!video_queue_.empty()) {
             double head_pts = video_queue_.front().pts;
@@ -983,6 +1013,11 @@ bool VideoPlayer::updateTexture(SDL_Texture* texture) {
                 best = video_queue_.front().frame;
                 video_queue_.pop_front();
                 video_queue_cv_.notify_one();
+                // Frame we're about to display satisfies the backward-step
+                // request; drop the mask so subsequent frames render again.
+                if (step_target >= 0.0) {
+                    step_back_target_.store(-1.0, std::memory_order_release);
+                }
             }
         }
         video_empty = video_queue_.empty();

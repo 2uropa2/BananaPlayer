@@ -1066,7 +1066,11 @@ void UIController::cycleSubtitleSize() {
 void UIController::drawShortcutsPanel(int W, int H) {
     if (!show_shortcuts_) return;
 
-    ImDrawList* bg = ImGui::GetForegroundDrawList();
+    // Background draw list so the ImGui window's text (drawn to the window's
+    // own list) lands ON TOP of these rects. If we used the foreground draw
+    // list here - the pattern About uses - our text would be overpainted by
+    // the panel fill and the modal would look empty.
+    ImDrawList* bg = ImGui::GetBackgroundDrawList();
     // Dim the whole window behind the modal.
     bg->AddRectFilled(ImVec2(0, 0), ImVec2((float)W, (float)H),
                       IM_COL32(0, 0, 0, 160));
@@ -1294,7 +1298,9 @@ void UIController::drawAboutPanel(int W, int H) {
 void UIController::drawInfoPanel(int W, int H) {
     if (!show_info_) return;
 
-    ImDrawList* bg = ImGui::GetForegroundDrawList();
+    // See drawShortcutsPanel comment - background list so window text sits
+    // above the panel rects rather than being overpainted.
+    ImDrawList* bg = ImGui::GetBackgroundDrawList();
     bg->AddRectFilled(ImVec2(0, 0), ImVec2((float)W, (float)H),
                       IM_COL32(0, 0, 0, 160));
 
@@ -1440,7 +1446,9 @@ void UIController::drawInfoPanel(int W, int H) {
 void UIController::drawHistoryPanel(int W, int H) {
     if (!show_history_) return;
 
-    ImDrawList* bg = ImGui::GetForegroundDrawList();
+    // See drawShortcutsPanel comment - background list so scrollable child
+    // window text lands above the panel rects.
+    ImDrawList* bg = ImGui::GetBackgroundDrawList();
     bg->AddRectFilled(ImVec2(0, 0), ImVec2((float)W, (float)H),
                       IM_COL32(0, 0, 0, 160));
 
@@ -3396,7 +3404,8 @@ void UIController::handleEvent(const SDL_Event& event) {
             bool holdable =
                 arrow_no_ctrl ||
                 (key == SDLK_PAGEUP) || (key == SDLK_PAGEDOWN) ||
-                (key == SDLK_UP)     || (key == SDLK_DOWN);
+                (key == SDLK_UP)     || (key == SDLK_DOWN) ||
+                (key == SDLK_COMMA)  || (key == SDLK_PERIOD);
             if (!holdable) return;
         }
 
