@@ -187,20 +187,36 @@ private:
     std::atomic<bool> quit_{false};
     std::atomic<bool> seek_requested_{false};
     std::atomic<double> seek_target_{0.0};
-    // When stepFrame(negative delta) issues a seek, we set this so
-    // updateTexture drops every frame the decoder emits between the
-    // nearest keyframe and the exact target - otherwise the user sees
-    // the video "play forward" from the keyframe up to the target,
-    // which looks like a stutter. Sentinel < 0 = not stepping.
-    std::atomic<double> step_back_target_{-1.0};
-    // Set true alongside step_back_target_ in stepFrame(-delta); worker
-    // clears it after flushQueues() runs during seek processing. Until
-    // that transition, updateTexture must NOT release any frame - the
-    // queue may still hold pre-seek frames near the target that would
-    // fake-satisfy the mask and cause a premature clear. Once cleared,
-    // the queue is guaranteed empty and any subsequent frames belong
-    // to the post-seek GOP decode.
-    std::atomic<bool> step_back_awaiting_flush_{false};
+    // Frame history ring - a small memory-capped store of the last N
+    // decoded YUV frames the player has displayed. Powers seek-less
+    // frame stepping in BOTH directions: stepFrame(-delta) walks back,
+    // stepFrame(+delta) walks forward. Only when the walk falls off the
+    // end of the ring do we resort to a real seek. Byte budget is used
+    // (not frame count) so 1080p and 4K clips get consistent history
+    // depth in wall-clock terms without ballooning memory on tall clips.
+    struct HistoryFrame {
+        AVFrame* frame = nullptr;   // owned deep-cloned YUV420P frame
+        double   pts   = 0.0;
+    };
+    std::mutex             history_mutex_;
+    std::deque<HistoryFrame> frame_history_;
+    // Offset from the newest history entry we're viewing.
+    //  0 = at newest, playback and normal stepping run untouched
+    //  N > 0 = viewing history_[size-1-N], i.e. N frames older
+    std::atomic<int>       history_offset_{0};
+    // Approx bytes currently held; cap at 128 MB so a 1080p clip carries
+    // ~40 frames of history and a 4K clip still gets ~10.
+    uint64_t               history_bytes_       = 0;
+    static constexpr uint64_t kHistoryBytesCap  = 128ULL * 1024 * 1024;
+
+    // Push a deep clone of frame into frame_history_ and trim from the
+    // front until the byte budget is met. Called from updateTexture on
+    // every normal-path frame release.
+    void   pushHistory_(AVFrame* frame, double pts);
+    // Free every AVFrame in the history and reset the offset. Called on
+    // any external seek, on unload, and when play() resumes from a
+    // walked-back position.
+    void   clearHistory_();
     std::atomic<bool> eof_{false};
     std::atomic<bool> ended_signaled_{false};
     // Set true at end of loadFile, cleared after the "un-stick audio"

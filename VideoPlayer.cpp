@@ -95,6 +95,7 @@ void VideoPlayer::unload() {
         std::lock_guard<std::mutex> lk(last_frame_mutex_);
         if (last_frame_) av_frame_free(&last_frame_);
     }
+    clearHistory_();
 
     if (swr_ctx_) swr_free(&swr_ctx_);
     if (sws_ctx_) { sws_freeContext(sws_ctx_); sws_ctx_ = nullptr; }
@@ -276,6 +277,26 @@ void VideoPlayer::play() {
     if (!loaded_) return;
     if (eof_) seek(0.0);
     if (playing_) return;
+    // If the user is currently viewing an old history frame (walked back
+    // with `,`), resume playback from THAT frame's pts - not from where
+    // the master clock was frozen before the walk. Seek there and clear
+    // the ring so normal playback continues cleanly. clearHistory_() is
+    // called by seek() itself.
+    {
+        int off = history_offset_.load(std::memory_order_acquire);
+        if (off > 0) {
+            double resume_pts = 0.0;
+            bool   have = false;
+            {
+                std::lock_guard<std::mutex> lk(history_mutex_);
+                int idx = (int)frame_history_.size() - 1 - off;
+                if (idx >= 0) { resume_pts = frame_history_[(size_t)idx].pts; have = true; }
+            }
+            if (have) {
+                seek(resume_pts);   // implicitly clears history + resets offset
+            }
+        }
+    }
     // "First play after load" must NOT be detected by inspecting
     // audio_pushed_bytes_ - decode thread may not have pushed a single
     // byte by the time loadPath calls play() (fast CPU, slow first-packet
@@ -350,11 +371,9 @@ void VideoPlayer::seek(double seconds) {
     if (!loaded_) return;
     double d = duration_ > 0.0 ? duration_ : 0.0;
     seconds = std::clamp(seconds, 0.0, d);
-    // Any external seek invalidates a still-pending backward-step target.
-    // stepFrame() re-sets it AFTER calling seek() so its own use case
-    // survives, but a user drag or arrow-key seek shouldn't have to know
-    // about the mask.
-    step_back_target_.store(-1.0, std::memory_order_release);
+    // Any user-initiated seek invalidates the frame history - the frames
+    // it holds are no longer contiguous with the new playback position.
+    clearHistory_();
     seek_target_ = seconds;
     seek_requested_ = true;
     eof_ = false;
@@ -372,28 +391,41 @@ void VideoPlayer::stepFrame(double delta) {
     if (delta < 0.0) {
         bool was_playing = playing_;
         if (was_playing) pause();
+        // Walk the frame history if we have a prior frame in it.
+        // updateTexture picks up the new offset next tick and re-uploads
+        // the target frame from the ring - no seek, no GOP replay.
+        {
+            std::lock_guard<std::mutex> lk(history_mutex_);
+            int off = history_offset_.load(std::memory_order_relaxed);
+            int size = (int)frame_history_.size();
+            if (off + 1 < size) {
+                history_offset_.store(off + 1, std::memory_order_release);
+                return;
+            }
+        }
+        // Ring exhausted -> real seek. clearHistory_ has been called by
+        // seek() implicitly.
         double target = getCurrentTime() + delta;
         seek(target);
-        // Order matters. seek() cleared step_back_target_ (so a plain
-        // user seek can't get stuck behind a stale mask). Set our mask
-        // AFTER seek() so this step's target survives. Also arm the
-        // "awaiting flush" gate: updateTexture must not release ANY
-        // frame while this is true - the queue may still hold pre-seek
-        // frames near the target that would fake-satisfy the release
-        // condition. The worker clears the flag after flushQueues()
-        // runs during seek processing.
-        step_back_target_.store(target, std::memory_order_release);
-        step_back_awaiting_flush_.store(true, std::memory_order_release);
         return;
     }
-    // Forward step: usually cheap - advance the master clock, updateTexture
-    // pulls the next frame from the queue. But long holds race the clock
-    // ahead of decoded content: eventually queue drains and the picture
-    // freezes because no more frames satisfy the (head_pts <= clock)
-    // condition. When we detect the clock would advance more than a few
-    // seconds past the latest decoded frame OR the queue is empty, fall
-    // back to a real seek so the decoder catches up. Slower per press but
-    // never freezes.
+    // Forward step. If we're currently walked back inside the history
+    // ring, take a step toward newest instead of advancing the clock -
+    // that keeps us inside the ring and eventually lands back at
+    // offset 0 (normal playback state).
+    {
+        std::lock_guard<std::mutex> lk(history_mutex_);
+        int off = history_offset_.load(std::memory_order_relaxed);
+        if (off > 0) {
+            history_offset_.store(off - 1, std::memory_order_release);
+            return;
+        }
+    }
+    // At the newest history entry (offset 0). Advance the clock so the
+    // next queued frame gets released. Cap at duration - 50 ms and fall
+    // back to a real seek if the queue is empty or the proposed clock
+    // would race past the latest decoded frame - either case would
+    // otherwise freeze the picture until the decoder catches up.
     double cap = (duration_ > 0.0) ? duration_ - 0.050 : 1e18;
     double proposed;
     {
@@ -423,6 +455,41 @@ void VideoPlayer::stepFrame(double delta) {
     } else {
         base_time_ = proposed;
     }
+}
+
+void VideoPlayer::pushHistory_(AVFrame* frame, double pts) {
+    if (!frame) return;
+    AVFrame* clone = av_frame_clone(frame);
+    if (!clone) return;
+    std::lock_guard<std::mutex> lk(history_mutex_);
+    // Rough byte cost: for YUV420P at width*height plane sizes,
+    // total = w*h + 2*(w/2)*(h/2) = w*h*1.5. Works for other planar
+    // 4:2:0 formats too; for anything else this is a slight underestimate
+    // but the budget is generous.
+    uint64_t bytes = (uint64_t)std::max(1, clone->width)
+                   * (uint64_t)std::max(1, clone->height) * 3 / 2;
+    frame_history_.push_back({clone, pts});
+    history_bytes_ += bytes;
+    while (history_bytes_ > kHistoryBytesCap && frame_history_.size() > 1) {
+        AVFrame* front = frame_history_.front().frame;
+        int fw = std::max(1, front->width);
+        int fh = std::max(1, front->height);
+        uint64_t fb = (uint64_t)fw * (uint64_t)fh * 3 / 2;
+        av_frame_free(&front);
+        frame_history_.pop_front();
+        if (history_bytes_ > fb) history_bytes_ -= fb; else history_bytes_ = 0;
+    }
+}
+
+void VideoPlayer::clearHistory_() {
+    std::lock_guard<std::mutex> lk(history_mutex_);
+    while (!frame_history_.empty()) {
+        AVFrame* f = frame_history_.front().frame;
+        av_frame_free(&f);
+        frame_history_.pop_front();
+    }
+    history_bytes_ = 0;
+    history_offset_.store(0, std::memory_order_release);
 }
 
 double VideoPlayer::getCurrentTime() const {
@@ -838,10 +905,6 @@ void VideoPlayer::demuxDecodeThread() {
             avcodec_flush_buffers(video_dec_ctx_);
             if (audio_dec_ctx_) avcodec_flush_buffers(audio_dec_ctx_);
             flushQueues();
-            // Any stale-queue frames a step-back mask might have released
-            // by accident are now gone. Let updateTexture start considering
-            // step-back releases from the post-seek pipeline.
-            step_back_awaiting_flush_.store(false, std::memory_order_release);
             {
                 std::lock_guard<std::mutex> lk(clock_mutex_);
                 resetClockLocked(target);
@@ -1008,25 +1071,43 @@ void VideoPlayer::demuxDecodeThread() {
 
 bool VideoPlayer::updateTexture(SDL_Texture* texture) {
     if (!loaded_ || !texture) return false;
+
+    // Frame-history walk. If the user has stepped back with `,`, the
+    // offset is > 0 and we display the appropriate ring entry without
+    // touching the decode pipeline. If somehow the offset points past
+    // the ring (shouldn't happen since stepFrame gates on size), snap
+    // back to newest and fall through.
+    int hist_off = history_offset_.load(std::memory_order_acquire);
+    if (hist_off > 0) {
+        std::lock_guard<std::mutex> lk(history_mutex_);
+        int idx = (int)frame_history_.size() - 1 - hist_off;
+        if (idx >= 0) {
+            AVFrame* hf = frame_history_[(size_t)idx].frame;
+            if (hf) {
+                SDL_UpdateYUVTexture(texture, nullptr,
+                                     hf->data[0], hf->linesize[0],
+                                     hf->data[1], hf->linesize[1],
+                                     hf->data[2], hf->linesize[2]);
+                // No last_frame_ swap here - the "current" frame in the
+                // normal-path sense is still whatever we last released
+                // from the queue, and clone bookkeeping stays with the
+                // history ring. Also skip EOF detection: we're viewing
+                // an older frame, the pipeline is unchanged.
+                return true;
+            }
+        }
+        // Off the end of the ring - shouldn't happen, but snap back.
+        history_offset_.store(0, std::memory_order_release);
+    }
+
     // Video-side view of the clock. Subtracting av_sync_offset_ has the
     // effect of shifting the video: positive offset -> now_time appears
     // earlier -> video frames released later (video delayed).
     double now_time = getCurrentTime() - av_sync_offset_.load();
 
     AVFrame* best = nullptr;
-    bool video_empty = false;
-    double step_target = step_back_target_.load(std::memory_order_acquire);
-    bool   awaiting   = step_back_awaiting_flush_.load(std::memory_order_acquire);
-    // Backward-step is armed but the worker hasn't yet processed the seek
-    // (and therefore hasn't run flushQueues). If we release ANY frame now
-    // it will be a stale pre-seek frame that happens to land inside the
-    // target tolerance window - and the mask would then clear itself, so
-    // the post-seek pipeline's GOP replay lands back on the normal
-    // release path. Skip entirely until the flush lands; the last frame
-    // already on screen stays there for the ~10-30 ms round-trip.
-    if (step_target >= 0.0 && awaiting) {
-        return false;
-    }
+    double   best_pts = 0.0;
+    bool     video_empty = false;
     {
         std::lock_guard<std::mutex> lk(video_queue_mutex_);
         while (video_queue_.size() > 1 && video_queue_.front().pts < now_time - 0.2) {
@@ -1034,35 +1115,7 @@ bool VideoPlayer::updateTexture(SDL_Texture* texture) {
             av_frame_free(&f);
             video_queue_.pop_front();
         }
-        if (step_target >= 0.0) {
-            // Backward step in flight. The pipeline may hold TWO classes
-            // of frames the user must NOT see:
-            //  a) Stale post-target frames left over from before the seek
-            //     was processed by the worker (pts > target + tolerance).
-            //  b) Pre-target frames coming out of the current GOP decode
-            //     (pts < target - tolerance).
-            // Drop both; keep only frames landing in [target-10ms, target+40ms].
-            // Release at most one such frame per call, then clear the mask
-            // so normal rendering resumes. Do NOT fall into the time_ready
-            // branch below - the paused-and-just-seeked shortcut there
-            // would happily release any of the stale-post-target frames.
-            while (!video_queue_.empty()) {
-                double pts = video_queue_.front().pts;
-                if (pts < step_target - 0.010 || pts > step_target + 0.040) {
-                    AVFrame* f = video_queue_.front().frame;
-                    av_frame_free(&f);
-                    video_queue_.pop_front();
-                    continue;
-                }
-                // Frame is in the target window - release it.
-                best = video_queue_.front().frame;
-                video_queue_.pop_front();
-                video_queue_cv_.notify_one();
-                step_back_target_.store(-1.0, std::memory_order_release);
-                break;
-            }
-            video_empty = video_queue_.empty();
-        } else if (!video_queue_.empty()) {
+        if (!video_queue_.empty()) {
             double head_pts = video_queue_.front().pts;
             bool time_ready = head_pts <= now_time + 0.005;
             if (!playing_ && audio_pushed_bytes_ == 0 && head_pts <= now_time + 0.5) {
@@ -1070,13 +1123,12 @@ bool VideoPlayer::updateTexture(SDL_Texture* texture) {
             }
             if (time_ready) {
                 best = video_queue_.front().frame;
+                best_pts = head_pts;
                 video_queue_.pop_front();
                 video_queue_cv_.notify_one();
             }
-            video_empty = video_queue_.empty();
-        } else {
-            video_empty = true;
         }
+        video_empty = video_queue_.empty();
     }
 
     if (best) {
@@ -1084,6 +1136,11 @@ bool VideoPlayer::updateTexture(SDL_Texture* texture) {
                             best->data[0], best->linesize[0],
                             best->data[1], best->linesize[1],
                             best->data[2], best->linesize[2]);
+        // Push a clone into the history ring BEFORE handing `best` off to
+        // last_frame_ - this is our only opportunity to capture it while
+        // we still own the source data. pushHistory_ does the clone +
+        // byte-budget trim internally.
+        pushHistory_(best, best_pts);
         std::lock_guard<std::mutex> lk(last_frame_mutex_);
         if (last_frame_) av_frame_free(&last_frame_);
         last_frame_ = best;
