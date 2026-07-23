@@ -1304,8 +1304,8 @@ void UIController::drawInfoPanel(int W, int H) {
     bg->AddRectFilled(ImVec2(0, 0), ImVec2((float)W, (float)H),
                       IM_COL32(0, 0, 0, 160));
 
-    const float pw = std::min(720.0f, W - 60.0f);
-    const float ph = std::min(620.0f, H - 60.0f);
+    const float pw = std::min(760.0f, W - 40.0f);
+    const float ph = std::min(720.0f, H - 40.0f);
     ImVec2 tl((W - pw) * 0.5f, (H - ph) * 0.5f);
     ImVec2 br(tl.x + pw, tl.y + ph);
     // Matched treatment with the About panel: soft shadow + accent hairline.

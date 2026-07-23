@@ -372,27 +372,56 @@ void VideoPlayer::stepFrame(double delta) {
     if (delta < 0.0) {
         bool was_playing = playing_;
         if (was_playing) pause();
-        // Order matters: seek() clears step_back_target_ (so a plain user
-        // seek doesn't get stuck behind a stale mask). Set our target
-        // AFTER seek() so this step's mask survives. Any race is < 1 us
-        // between the two atomic writes vs a demux/decode round-trip.
         double target = getCurrentTime() + delta;
         seek(target);
+        // Order matters. seek() cleared step_back_target_ (so a plain
+        // user seek can't get stuck behind a stale mask). Set our mask
+        // AFTER seek() so this step's target survives. Also arm the
+        // "awaiting flush" gate: updateTexture must not release ANY
+        // frame while this is true - the queue may still hold pre-seek
+        // frames near the target that would fake-satisfy the release
+        // condition. The worker clears the flag after flushQueues()
+        // runs during seek processing.
         step_back_target_.store(target, std::memory_order_release);
+        step_back_awaiting_flush_.store(true, std::memory_order_release);
         return;
     }
-    // Forward step: cheap - just advance the master clock; updateTexture
-    // will pull the next frame from the queue on the next call. Cap the
-    // advance at duration - 0.05 so a long hold can't race the clock past
-    // the file's end (where updateTexture would freeze because no more
-    // frames would ever come). Empty-queue exhaustion during rapid holds
-    // is self-healing - the next queued frame gets released next call.
+    // Forward step: usually cheap - advance the master clock, updateTexture
+    // pulls the next frame from the queue. But long holds race the clock
+    // ahead of decoded content: eventually queue drains and the picture
+    // freezes because no more frames satisfy the (head_pts <= clock)
+    // condition. When we detect the clock would advance more than a few
+    // seconds past the latest decoded frame OR the queue is empty, fall
+    // back to a real seek so the decoder catches up. Slower per press but
+    // never freezes.
     double cap = (duration_ > 0.0) ? duration_ - 0.050 : 1e18;
+    double proposed;
+    {
+        std::lock_guard<std::mutex> lk(clock_mutex_);
+        double base = (audio_stream_idx_ >= 0 && audio_stream_)
+                    ? audio_seek_base_time_
+                    : base_time_;
+        proposed = std::min(base + delta, cap);
+    }
+    bool need_seek = false;
+    {
+        std::lock_guard<std::mutex> lk(video_queue_mutex_);
+        if (video_queue_.empty()) {
+            need_seek = true;
+        } else {
+            double tail = video_queue_.back().pts;
+            if (proposed > tail + 1.5) need_seek = true;
+        }
+    }
+    if (need_seek) {
+        seek(proposed);
+        return;
+    }
     std::lock_guard<std::mutex> lk(clock_mutex_);
     if (audio_stream_idx_ >= 0 && audio_stream_) {
-        audio_seek_base_time_ = std::min(audio_seek_base_time_ + delta, cap);
+        audio_seek_base_time_ = proposed;
     } else {
-        base_time_ = std::min(base_time_ + delta, cap);
+        base_time_ = proposed;
     }
 }
 
@@ -809,6 +838,10 @@ void VideoPlayer::demuxDecodeThread() {
             avcodec_flush_buffers(video_dec_ctx_);
             if (audio_dec_ctx_) avcodec_flush_buffers(audio_dec_ctx_);
             flushQueues();
+            // Any stale-queue frames a step-back mask might have released
+            // by accident are now gone. Let updateTexture start considering
+            // step-back releases from the post-seek pipeline.
+            step_back_awaiting_flush_.store(false, std::memory_order_release);
             {
                 std::lock_guard<std::mutex> lk(clock_mutex_);
                 resetClockLocked(target);
@@ -983,6 +1016,17 @@ bool VideoPlayer::updateTexture(SDL_Texture* texture) {
     AVFrame* best = nullptr;
     bool video_empty = false;
     double step_target = step_back_target_.load(std::memory_order_acquire);
+    bool   awaiting   = step_back_awaiting_flush_.load(std::memory_order_acquire);
+    // Backward-step is armed but the worker hasn't yet processed the seek
+    // (and therefore hasn't run flushQueues). If we release ANY frame now
+    // it will be a stale pre-seek frame that happens to land inside the
+    // target tolerance window - and the mask would then clear itself, so
+    // the post-seek pipeline's GOP replay lands back on the normal
+    // release path. Skip entirely until the flush lands; the last frame
+    // already on screen stays there for the ~10-30 ms round-trip.
+    if (step_target >= 0.0 && awaiting) {
+        return false;
+    }
     {
         std::lock_guard<std::mutex> lk(video_queue_mutex_);
         while (video_queue_.size() > 1 && video_queue_.front().pts < now_time - 0.2) {

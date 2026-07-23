@@ -193,6 +193,14 @@ private:
     // the video "play forward" from the keyframe up to the target,
     // which looks like a stutter. Sentinel < 0 = not stepping.
     std::atomic<double> step_back_target_{-1.0};
+    // Set true alongside step_back_target_ in stepFrame(-delta); worker
+    // clears it after flushQueues() runs during seek processing. Until
+    // that transition, updateTexture must NOT release any frame - the
+    // queue may still hold pre-seek frames near the target that would
+    // fake-satisfy the mask and cause a premature clear. Once cleared,
+    // the queue is guaranteed empty and any subsequent frames belong
+    // to the post-seek GOP decode.
+    std::atomic<bool> step_back_awaiting_flush_{false};
     std::atomic<bool> eof_{false};
     std::atomic<bool> ended_signaled_{false};
     // Set true at end of loadFile, cleared after the "un-stick audio"
