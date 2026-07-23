@@ -3697,8 +3697,29 @@ void UIController::handleEvent(const SDL_Event& event) {
         }
         if (key == SDLK_PAGEUP)   { if (player_->isLoaded()) { player_->seekRelative( 30.0); SEEK_OSD("+ 30s"); } return; }
         if (key == SDLK_PAGEDOWN) { if (player_->isLoaded()) { player_->seekRelative(-30.0); SEEK_OSD("- 30s"); } return; }
-        if (key == SDLK_COMMA)    { if (player_->isLoaded()) { double fps = player_->getVideoFrameRate(); double step = (fps > 0.0) ? 1.0 / fps : 1.0 / 30.0; player_->stepFrame(-step); SEEK_OSD("< step"); } return; }
-        if (key == SDLK_PERIOD)   { if (player_->isLoaded()) { double fps = player_->getVideoFrameRate(); double step = (fps > 0.0) ? 1.0 / fps : 1.0 / 30.0; player_->stepFrame( step); SEEK_OSD("step >"); } return; }
+        // Frame step. OSD is shown unconditionally (not gated behind
+        // NDEBUG like the ±5s / ±30s toasts) because a single-frame move
+        // is often too small to spot visually - the user needs some
+        // acknowledgement that the key press landed. Uses real fps with
+        // a 30 fps fallback.
+        if (key == SDLK_COMMA) {
+            if (player_->isLoaded()) {
+                double fps = player_->getVideoFrameRate();
+                double step = (fps > 0.0) ? 1.0 / fps : 1.0 / 30.0;
+                player_->stepFrame(-step);
+                showOsd("< Frame back", 0.9f);
+            }
+            return;
+        }
+        if (key == SDLK_PERIOD) {
+            if (player_->isLoaded()) {
+                double fps = player_->getVideoFrameRate();
+                double step = (fps > 0.0) ? 1.0 / fps : 1.0 / 30.0;
+                player_->stepFrame( step);
+                showOsd("Frame forward >", 0.9f);
+            }
+            return;
+        }
         // Playlist next/prev. Ctrl+N/Ctrl+B kept for muscle memory; plain N
         // is the shorter standard-player binding when no letter conflicts.
         if (key == SDLK_N && (mod & SDL_KMOD_CTRL))         { playNextInPlaylist(); return; }
