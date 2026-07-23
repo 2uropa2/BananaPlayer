@@ -47,6 +47,10 @@ Version: **1.0.0** (`Version.hpp` / `VELA_VERSION`).
 | Next chapter | `Alt+Right` | Same requirement. Shows the chapter title in the OSD when present, otherwise "Chapter N / M". |
 | Chapter tick marks | Automatic on seek bar | Sky-blue vertical posts per chapter start. Hovering within +/- 6 px of a tick shows a floating title tooltip above the bar. |
 | A-B segment loop | `A` cycles through: set A, set B (must be after A), clear | Green post = A, orange post = B; the A-B span is shaded on the seek bar. The player automatically jumps back to A whenever playback crosses B. Cleared on file change. |
+| Add bookmark | `Ctrl+M` | Inserts a bookmark at the current playhead. Deduped: `Ctrl+M` within 1 s of an existing mark is a no-op. Hard cap 50 marks per file. |
+| Bookmark markers | Automatic on seek bar | Small amber diamonds below the track (chapters live ON the track as sky-blue posts, A-B markers extend above / below the track as green / orange posts) so all three marker classes stay distinct at a glance. Hover the diamond area for a `Bookmark  MM:SS` tooltip. |
+| Bookmark picker | Settings menu > **Bookmarks** | Lists every mark for the currently-playing file; click a row to seek, `x` to remove that one, `Clear all` to wipe. `Add bookmark at current time` at the top is a duplicate of the `Ctrl+M` handler. |
+| Bookmark persistence | Automatic | `vela.bookmarks` sidecar next to the exe. Format: `t1,t2,...\tpath` per line. MRU cap 200 files. Flushed to disk on file switch, close, and quit. |
 | Seek OSD toasts | Debug builds only | `+ 5s`, `- 5s`, `+ 30s`, `- 30s`, `< step`, `step >` are suppressed in Release via the `SEEK_OSD` macro. |
 
 ## Audio
