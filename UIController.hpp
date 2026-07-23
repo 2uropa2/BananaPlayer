@@ -345,7 +345,13 @@ private:
     bool show_shortcuts_ = false;
     bool show_about_    = false;
     bool show_info_     = false;
+    // Playback history modal (Ctrl+H): scrollable list of previously-watched
+    // files from resume_index_ and recent_files_, with progress bars and
+    // click-to-continue. Deferred mutations avoid modifying resume_index_
+    // during the ImGui loop.
+    bool show_history_  = false;
     void drawShortcutsPanel(int W, int H);
     void drawAboutPanel(int W, int H);
     void drawInfoPanel(int W, int H);
+    void drawHistoryPanel(int W, int H);
 };

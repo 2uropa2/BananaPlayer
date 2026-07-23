@@ -1109,6 +1109,7 @@ void UIController::drawShortcutsPanel(int W, int H) {
             { "Middle click",    "Toggle fullscreen" },
             { "T",               "Always on top" },
             { "I",               "Media info" },
+            { "Ctrl + H",        "Playback history" },
         }},
         { "Seek", {
             { "Left  /  Right",  "Back / forward 5 s" },
@@ -1436,6 +1437,144 @@ void UIController::drawInfoPanel(int W, int H) {
     ImGui::PopStyleVar();
 }
 
+void UIController::drawHistoryPanel(int W, int H) {
+    if (!show_history_) return;
+
+    ImDrawList* bg = ImGui::GetForegroundDrawList();
+    bg->AddRectFilled(ImVec2(0, 0), ImVec2((float)W, (float)H),
+                      IM_COL32(0, 0, 0, 160));
+
+    const float pw = std::min(680.0f, W - 60.0f);
+    const float ph = std::min(560.0f, H - 80.0f);
+    ImVec2 tl((W - pw) * 0.5f, (H - ph) * 0.5f);
+    ImVec2 br(tl.x + pw, tl.y + ph);
+    bg->AddRectFilled(ImVec2(tl.x - 3, tl.y - 3), ImVec2(br.x + 3, br.y + 6),
+                      IM_COL32(0, 0, 0, 90), 16.0f);
+    bg->AddRectFilled(tl, br, IM_COL32(14, 18, 30, 246), 14.0f);
+    bg->AddRect(tl, br, IM_COL32(96, 176, 246, 130), 14.0f, 0, 1.0f);
+
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize
+                             | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar
+                             | ImGuiWindowFlags_NoBackground
+                             | ImGuiWindowFlags_NoBringToFrontOnFocus
+                             | ImGuiWindowFlags_NoSavedSettings;
+    ImGui::SetNextWindowPos(tl);
+    ImGui::SetNextWindowSize(ImVec2(pw, ph));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24, 20));
+    ImGui::Begin("##HistoryModal", nullptr, flags);
+
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.95f, 1.0f, 1.0f));
+    ImGui::TextUnformatted("Playback history");
+    ImGui::PopStyleColor();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // Build a merged MRU list: resume_index_ first (files with a known
+    // progress mark), then any recent_files_ that aren't already covered.
+    // The resume entries already carry pos + duration; recent-only entries
+    // get a bare basename row with no progress bar.
+    struct Row {
+        std::string path;
+        double      pos      = -1.0;
+        double      duration = -1.0;
+    };
+    std::vector<Row> rows;
+    rows.reserve(resume_index_.size() + recent_files_.size());
+    for (const auto& e : resume_index_) {
+        Row r; r.path = e.path; r.pos = e.pos; r.duration = e.duration;
+        rows.push_back(std::move(r));
+    }
+    for (const auto& rf : recent_files_) {
+        bool covered = false;
+        for (const auto& r : rows) {
+            if (r.path == rf) { covered = true; break; }
+        }
+        if (!covered) { Row r; r.path = rf; rows.push_back(std::move(r)); }
+    }
+
+    if (rows.empty()) {
+        ImGui::TextDisabled("No history yet - open a file to start.");
+    } else {
+        ImGui::TextDisabled("%d files - click a row to resume  .  x removes",
+                            (int)rows.size());
+        ImGui::Spacing();
+
+        // Deferred actions - apply after the loop so mutations don't shift
+        // ImGui IDs mid-frame.
+        std::string open_path;
+        std::string remove_path;
+        bool        clear_all = false;
+
+        ImGui::BeginChild("##hist_scroll",
+                          ImVec2(0.0f, ph - 130.0f),
+                          false,
+                          ImGuiWindowFlags_HorizontalScrollbar);
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const auto& r = rows[i];
+            ImGui::PushID((int)i);
+            // Basename row (click = resume).
+            std::string label = baseName(r.path.c_str());
+            if (label.empty()) label = r.path;
+            if (ImGui::Selectable(label.c_str(), false,
+                                  ImGuiSelectableFlags_None,
+                                  ImVec2(pw - 100.0f, 0.0f))) {
+                open_path = r.path;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", r.path.c_str());
+            ImGui::SameLine(pw - 90.0f);
+            if (ImGui::SmallButton("x")) remove_path = r.path;
+
+            // Progress bar row (only when we have a meaningful duration).
+            if (r.duration > 0.0 && r.pos >= 0.0) {
+                float frac = (float)std::clamp(r.pos / r.duration, 0.0, 1.0);
+                char pbuf[64];
+                std::snprintf(pbuf, sizeof(pbuf), "%s  /  %s",
+                              formatTime(r.pos).c_str(),
+                              formatTime(r.duration).c_str());
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 8.0f);
+                ImGui::ProgressBar(frac, ImVec2(pw - 130.0f, 8.0f), pbuf);
+            }
+            ImGui::Spacing();
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+
+        ImGui::Spacing();
+        if (ImGui::Button("Clear all history")) clear_all = true;
+
+        // Apply deferred actions.
+        if (!open_path.empty()) {
+            show_history_ = false;
+            loadPath(open_path);
+        }
+        if (!remove_path.empty()) {
+            clearResume(remove_path);
+            auto it = std::find(recent_files_.begin(),
+                                recent_files_.end(), remove_path);
+            if (it != recent_files_.end()) recent_files_.erase(it);
+            markConfigDirty();
+        }
+        if (clear_all) {
+            if (!resume_index_.empty()) {
+                resume_index_.clear();
+                resume_dirty_ = true;
+            }
+            if (!recent_files_.empty()) {
+                recent_files_.clear();
+                markConfigDirty();
+            }
+        }
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::TextDisabled("Press Esc or Ctrl+H to close");
+
+    ImGui::End();
+    ImGui::PopStyleVar();
+}
+
 void UIController::drawSubtitles(int W, int H) {
     if (!subtitles_enabled_ || subtitles_.empty()) return;
     if (!player_->isLoaded()) return;
@@ -1756,6 +1895,7 @@ void UIController::render(int W, int H) {
     drawShortcutsPanel(W, H);
     drawAboutPanel(W, H);
     drawInfoPanel(W, H);
+    drawHistoryPanel(W, H);
 
     // Right-click context menu: open on request, position at cursor,
     // reuse the Settings menu contents so both surfaces stay in sync.
@@ -2976,16 +3116,23 @@ void UIController::drawMainMenuContents() {
 
     if (ImGui::MenuItem("Media Info", "I", false, player_->isLoaded())) {
         show_info_ = true; show_shortcuts_ = false; show_about_ = false;
+        show_history_ = false;
+    }
+    if (ImGui::MenuItem("Playback History", "Ctrl+H")) {
+        show_history_ = true;
+        show_shortcuts_ = false; show_about_ = false; show_info_ = false;
     }
     if (ImGui::MenuItem("Keyboard Shortcuts", "?  /  F1")) {
         show_shortcuts_ = true;
         show_about_ = false;
         show_info_ = false;
+        show_history_ = false;
     }
     if (ImGui::MenuItem("About Vela")) {
         show_about_ = true;
         show_shortcuts_ = false;
         show_info_ = false;
+        show_history_ = false;
     }
 
     ImGui::Separator();
@@ -3272,6 +3419,7 @@ void UIController::handleEvent(const SDL_Event& event) {
             if (show_shortcuts_) { show_shortcuts_ = false; return; }
             if (show_about_)     { show_about_    = false; return; }
             if (show_info_)      { show_info_     = false; return; }
+            if (show_history_)   { show_history_  = false; return; }
             if (show_playlist_)  { show_playlist_ = false; return; }
             if (fullscreen_)     { setFullscreen(false);   return; }
             return;
@@ -3279,14 +3427,29 @@ void UIController::handleEvent(const SDL_Event& event) {
         // File info modal (I, no modifiers).
         if (sc == SDL_SCANCODE_I && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT))) {
             show_info_ = !show_info_;
-            if (show_info_) { show_shortcuts_ = false; show_about_ = false; }
+            if (show_info_) {
+                show_shortcuts_ = false; show_about_ = false;
+                show_history_ = false;
+            }
+            return;
+        }
+        // Playback history modal (Ctrl+H). Ctrl gates the branch so plain H
+        // (shuffle) stays intact.
+        if (sc == SDL_SCANCODE_H && (mod & SDL_KMOD_CTRL)) {
+            show_history_ = !show_history_;
+            if (show_history_) {
+                show_shortcuts_ = false; show_about_ = false;
+                show_info_ = false;
+            }
             return;
         }
         // Shortcuts help: '?' (Shift+/) or F1.
         if (key == SDLK_F1
             || (key == SDLK_SLASH && (mod & SDL_KMOD_SHIFT))) {
             show_shortcuts_ = !show_shortcuts_;
-            if (show_shortcuts_) show_about_ = false;
+            if (show_shortcuts_) {
+                show_about_ = false; show_info_ = false; show_history_ = false;
+            }
             return;
         }
         // Ctrl+Shift+Arrow = subtitle sync nudge (100 ms steps, clamp +/-10s).

@@ -121,6 +121,17 @@ Version: **1.0.0** (`Version.hpp` / `VELA_VERSION`).
 | Resolve cancellation | Automatic on new request | A new resolve calls `TerminateProcess` on any in-flight yt-dlp child so only the newest result reaches the drain. |
 | Resolve status OSDs | Automatic | `Resolving YouTube...`, `YouTube resolve failed: <message>`, or `YouTube resolver unavailable`. |
 
+## Playback history
+
+| Feature | Invocation | Notes |
+|---|---|---|
+| Open history modal | `Ctrl+H` or Settings menu > **Playback History** | Modal panel over the video; press `Esc` or `Ctrl+H` again to close. |
+| List format | Automatic | Merged MRU of resume-marked files (with progress bar showing `pos / duration`) and recent-opened files without progress. Hover a row for the full path. |
+| Continue watching | Click a row | Closes the modal and loads the file, restoring the resume position via the existing resume-index mechanism. |
+| Remove one entry | `x` button on a row | Deletes both the resume mark and any Recent-list entry for that path. |
+| Clear all | `Clear all history` button | Wipes `resume_index_` and `recent_files_` in one step. |
+| Persistence | Automatic | Driven by the existing `vela.resume` and `vela.recent` sidecars - no new file. |
+
 ## Files & Playlist
 
 | Feature | Invocation | Notes |
