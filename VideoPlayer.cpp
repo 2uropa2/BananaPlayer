@@ -96,6 +96,7 @@ void VideoPlayer::unload() {
         if (last_frame_) av_frame_free(&last_frame_);
     }
     clearHistory_();
+    deferred_display_pts_.store(-1.0, std::memory_order_release);
 
     if (swr_ctx_) swr_free(&swr_ctx_);
     if (sws_ctx_) { sws_freeContext(sws_ctx_); sws_ctx_ = nullptr; }
@@ -367,13 +368,17 @@ void VideoPlayer::togglePause() {
     if (playing_) pause(); else play();
 }
 
-void VideoPlayer::seek(double seconds) {
+void VideoPlayer::seekInternal_(double seconds, bool preserve_deferred) {
     if (!loaded_) return;
     double d = duration_ > 0.0 ? duration_ : 0.0;
     seconds = std::clamp(seconds, 0.0, d);
-    // Any user-initiated seek invalidates the frame history - the frames
-    // it holds are no longer contiguous with the new playback position.
+    // Any seek invalidates the frame history - the frames it holds are
+    // no longer contiguous with the new playback position.
     clearHistory_();
+    // Only a step-back seek should preserve its deferred-display target.
+    if (!preserve_deferred) {
+        deferred_display_pts_.store(-1.0, std::memory_order_release);
+    }
     seek_target_ = seconds;
     seek_requested_ = true;
     eof_ = false;
@@ -394,6 +399,8 @@ void VideoPlayer::stepFrame(double delta) {
         // Walk the frame history if we have a prior frame in it.
         // updateTexture picks up the new offset next tick and re-uploads
         // the target frame from the ring - no seek, no GOP replay.
+        double seek_base = 0.0;
+        bool   have_base = false;
         {
             std::lock_guard<std::mutex> lk(history_mutex_);
             int off = history_offset_.load(std::memory_order_relaxed);
@@ -402,11 +409,33 @@ void VideoPlayer::stepFrame(double delta) {
                 history_offset_.store(off + 1, std::memory_order_release);
                 return;
             }
+            // Ring exhausted. Seek target must be measured from the frame
+            // we're CURRENTLY VIEWING (the oldest in the ring, index 0),
+            // NOT from the master clock. The clock froze at whatever pts
+            // was live when the user paused, which is `size` frames after
+            // the oldest ring entry - seeking from there would repeatedly
+            // land on a scene the user has already walked past, and the
+            // subsequent GOP decode would look like the scene "repeats".
+            if (size > 0) {
+                seek_base = frame_history_[0].pts;
+                have_base = true;
+            }
         }
-        // Ring exhausted -> real seek. clearHistory_ has been called by
-        // seek() implicitly.
-        double target = getCurrentTime() + delta;
-        seek(target);
+        double base = have_base ? seek_base : getCurrentTime();
+        // Desired target: exactly one frame back from where we're viewing.
+        // Approximate frame duration via getVideoFrameRate; fall back to
+        // 33.3 ms if unknown.
+        double fps    = getVideoFrameRate();
+        double one_dt = (fps > 0.0) ? 1.0 / fps : 1.0 / 30.0;
+        double target = std::max(0.0, base - one_dt);
+        // Seek to ~500 ms EARLIER so the decoder produces a batch of
+        // frames spanning the intended target. deferred_display_pts_
+        // tells updateTexture to silently drain the queue into the
+        // ring until it sees the target frame, so the user never sees
+        // the pre-target GOP replay.
+        double seek_to = std::max(0.0, target - 0.500);
+        deferred_display_pts_.store(target, std::memory_order_release);
+        seekInternal_(seek_to, /*preserve_deferred=*/true);
         return;
     }
     // Forward step. If we're currently walked back inside the history
@@ -461,14 +490,19 @@ void VideoPlayer::pushHistory_(AVFrame* frame, double pts) {
     if (!frame) return;
     AVFrame* clone = av_frame_clone(frame);
     if (!clone) return;
+    pushHistoryTakingOwnership_(clone, pts);
+}
+
+void VideoPlayer::pushHistoryTakingOwnership_(AVFrame* frame, double pts) {
+    if (!frame) return;
     std::lock_guard<std::mutex> lk(history_mutex_);
     // Rough byte cost: for YUV420P at width*height plane sizes,
     // total = w*h + 2*(w/2)*(h/2) = w*h*1.5. Works for other planar
     // 4:2:0 formats too; for anything else this is a slight underestimate
     // but the budget is generous.
-    uint64_t bytes = (uint64_t)std::max(1, clone->width)
-                   * (uint64_t)std::max(1, clone->height) * 3 / 2;
-    frame_history_.push_back({clone, pts});
+    uint64_t bytes = (uint64_t)std::max(1, frame->width)
+                   * (uint64_t)std::max(1, frame->height) * 3 / 2;
+    frame_history_.push_back({frame, pts});
     history_bytes_ += bytes;
     while (history_bytes_ > kHistoryBytesCap && frame_history_.size() > 1) {
         AVFrame* front = frame_history_.front().frame;
@@ -1105,6 +1139,14 @@ bool VideoPlayer::updateTexture(SDL_Texture* texture) {
     // earlier -> video frames released later (video delayed).
     double now_time = getCurrentTime() - av_sync_offset_.load();
 
+    // Deferred-display drain (used by the step-back seek fallback). We
+    // silently burn through the queue into the history ring; the FIRST
+    // frame we find at or after the target pts becomes the frame the
+    // user actually sees. This eliminates the "GOP replay from the
+    // keyframe" artifact that would otherwise be visible whenever the
+    // ring was exhausted.
+    double deferred = deferred_display_pts_.load(std::memory_order_acquire);
+
     AVFrame* best = nullptr;
     double   best_pts = 0.0;
     bool     video_empty = false;
@@ -1115,7 +1157,33 @@ bool VideoPlayer::updateTexture(SDL_Texture* texture) {
             av_frame_free(&f);
             video_queue_.pop_front();
         }
-        if (!video_queue_.empty()) {
+        if (deferred >= 0.0) {
+            // Drain pre-target frames into the ring; stop when we reach
+            // the target or the queue empties.
+            while (!video_queue_.empty()) {
+                AVFrame* f = video_queue_.front().frame;
+                double   p = video_queue_.front().pts;
+                if (p >= deferred - 0.005) {
+                    // At/past target - display this frame as the new
+                    // current view, and it goes into the ring via the
+                    // normal pushHistory below.
+                    best = f;
+                    best_pts = p;
+                    video_queue_.pop_front();
+                    video_queue_cv_.notify_one();
+                    deferred_display_pts_.store(-1.0, std::memory_order_release);
+                    break;
+                }
+                // Pre-target - move into ring silently (transfer
+                // ownership; no display, no texture upload).
+                video_queue_.pop_front();
+                video_queue_cv_.notify_one();
+                pushHistoryTakingOwnership_(f, p);
+            }
+            // If we didn't reach the target this call (queue empty),
+            // wait for more frames next tick. Previous frame stays on
+            // screen. Don't fall into normal-path release.
+        } else if (!video_queue_.empty()) {
             double head_pts = video_queue_.front().pts;
             bool time_ready = head_pts <= now_time + 0.005;
             if (!playing_ && audio_pushed_bytes_ == 0 && head_pts <= now_time + 0.5) {

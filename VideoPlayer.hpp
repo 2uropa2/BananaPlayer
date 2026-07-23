@@ -36,7 +36,9 @@ public:
     void play();
     void pause();
     void togglePause();
-    void seek(double seconds);
+    // Regular seek. Any deferred step-back display target is cleared -
+    // a user-initiated seek makes an old target meaningless.
+    void seek(double seconds) { seekInternal_(seconds, /*preserve_deferred=*/false); }
     void seekRelative(double delta);
 
     // Advance the display clock without triggering a seek (cheap forward frame step).
@@ -200,6 +202,14 @@ private:
     };
     std::mutex             history_mutex_;
     std::deque<HistoryFrame> frame_history_;
+    // Set by stepFrame(-delta) when the ring is exhausted and we've
+    // fallen back to a seek. updateTexture then silently drains queue
+    // frames into the ring instead of displaying them, until it reaches
+    // a frame at or beyond this pts - which becomes the newly-viewed
+    // frame. Without this, the GOP decode after the seek would flash
+    // playback from the keyframe forward before landing on target -
+    // exactly the "same scene repeats" artifact the user reported.
+    std::atomic<double>    deferred_display_pts_{-1.0};
     // Offset from the newest history entry we're viewing.
     //  0 = at newest, playback and normal stepping run untouched
     //  N > 0 = viewing history_[size-1-N], i.e. N frames older
@@ -209,10 +219,20 @@ private:
     uint64_t               history_bytes_       = 0;
     static constexpr uint64_t kHistoryBytesCap  = 128ULL * 1024 * 1024;
 
+    // Internal seek with control over the deferred-display target -
+    // stepFrame's own step-back seek needs to survive the reset that
+    // a user drag or arrow-key seek should trigger.
+    void seekInternal_(double seconds, bool preserve_deferred);
+
     // Push a deep clone of frame into frame_history_ and trim from the
     // front until the byte budget is met. Called from updateTexture on
     // every normal-path frame release.
     void   pushHistory_(AVFrame* frame, double pts);
+    // Take ownership of an already-decoded frame (no clone) and put it
+    // into frame_history_, trimming the front by byte budget. Used by
+    // the deferred-display drain in updateTexture where we're burning
+    // through the queue into the ring without a texture upload.
+    void   pushHistoryTakingOwnership_(AVFrame* frame, double pts);
     // Free every AVFrame in the history and reset the offset. Called on
     // any external seek, on unload, and when play() resumes from a
     // walked-back position.
