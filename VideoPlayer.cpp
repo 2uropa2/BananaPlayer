@@ -381,13 +381,18 @@ void VideoPlayer::stepFrame(double delta) {
         step_back_target_.store(target, std::memory_order_release);
         return;
     }
-    // Forward step: cheap - just advance the master clock; updateTexture will pull
-    // the next frame from the queue on the next call.
+    // Forward step: cheap - just advance the master clock; updateTexture
+    // will pull the next frame from the queue on the next call. Cap the
+    // advance at duration - 0.05 so a long hold can't race the clock past
+    // the file's end (where updateTexture would freeze because no more
+    // frames would ever come). Empty-queue exhaustion during rapid holds
+    // is self-healing - the next queued frame gets released next call.
+    double cap = (duration_ > 0.0) ? duration_ - 0.050 : 1e18;
     std::lock_guard<std::mutex> lk(clock_mutex_);
     if (audio_stream_idx_ >= 0 && audio_stream_) {
-        audio_seek_base_time_ += delta;
+        audio_seek_base_time_ = std::min(audio_seek_base_time_ + delta, cap);
     } else {
-        base_time_ += delta;
+        base_time_ = std::min(base_time_ + delta, cap);
     }
 }
 
@@ -977,13 +982,6 @@ bool VideoPlayer::updateTexture(SDL_Texture* texture) {
 
     AVFrame* best = nullptr;
     bool video_empty = false;
-    // Backward-step mask: drop every decoded frame whose pts is more than
-    // half a frame BEHIND the target. Once we reach a frame within +/- one
-    // frame of the target, clear the mask and release that frame normally.
-    // Half-a-frame tolerance for common framerates:
-    //   30 fps -> 0.0167 s per frame -> half = 0.0083 s
-    //   60 fps -> 0.0083 s per frame -> half = 0.0042 s
-    // A single 20 ms tolerance covers both without measuring fps here.
     double step_target = step_back_target_.load(std::memory_order_acquire);
     {
         std::lock_guard<std::mutex> lk(video_queue_mutex_);
@@ -992,18 +990,35 @@ bool VideoPlayer::updateTexture(SDL_Texture* texture) {
             av_frame_free(&f);
             video_queue_.pop_front();
         }
-        // Extra pass while step-back is active: drop frames strictly before
-        // the target so the user only ever sees the final frame, never the
-        // GOP-replay leading up to it.
         if (step_target >= 0.0) {
-            while (!video_queue_.empty()
-                   && video_queue_.front().pts < step_target - 0.020) {
-                AVFrame* f = video_queue_.front().frame;
-                av_frame_free(&f);
+            // Backward step in flight. The pipeline may hold TWO classes
+            // of frames the user must NOT see:
+            //  a) Stale post-target frames left over from before the seek
+            //     was processed by the worker (pts > target + tolerance).
+            //  b) Pre-target frames coming out of the current GOP decode
+            //     (pts < target - tolerance).
+            // Drop both; keep only frames landing in [target-10ms, target+40ms].
+            // Release at most one such frame per call, then clear the mask
+            // so normal rendering resumes. Do NOT fall into the time_ready
+            // branch below - the paused-and-just-seeked shortcut there
+            // would happily release any of the stale-post-target frames.
+            while (!video_queue_.empty()) {
+                double pts = video_queue_.front().pts;
+                if (pts < step_target - 0.010 || pts > step_target + 0.040) {
+                    AVFrame* f = video_queue_.front().frame;
+                    av_frame_free(&f);
+                    video_queue_.pop_front();
+                    continue;
+                }
+                // Frame is in the target window - release it.
+                best = video_queue_.front().frame;
                 video_queue_.pop_front();
+                video_queue_cv_.notify_one();
+                step_back_target_.store(-1.0, std::memory_order_release);
+                break;
             }
-        }
-        if (!video_queue_.empty()) {
+            video_empty = video_queue_.empty();
+        } else if (!video_queue_.empty()) {
             double head_pts = video_queue_.front().pts;
             bool time_ready = head_pts <= now_time + 0.005;
             if (!playing_ && audio_pushed_bytes_ == 0 && head_pts <= now_time + 0.5) {
@@ -1013,14 +1028,11 @@ bool VideoPlayer::updateTexture(SDL_Texture* texture) {
                 best = video_queue_.front().frame;
                 video_queue_.pop_front();
                 video_queue_cv_.notify_one();
-                // Frame we're about to display satisfies the backward-step
-                // request; drop the mask so subsequent frames render again.
-                if (step_target >= 0.0) {
-                    step_back_target_.store(-1.0, std::memory_order_release);
-                }
             }
+            video_empty = video_queue_.empty();
+        } else {
+            video_empty = true;
         }
-        video_empty = video_queue_.empty();
     }
 
     if (best) {

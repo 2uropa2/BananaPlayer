@@ -220,12 +220,15 @@ private:
     bool  request_context_menu_ = false;
     ImVec2 context_menu_pos_{0, 0};
 
-    // Toggle-and-undo pattern for click play/pause: the first left-click
-    // toggles immediately so it feels responsive. If a second click arrives
-    // (double-click-to-fullscreen), we undo the toggle so the net effect is
-    // just fullscreen. This flag records that the first click's toggle is
-    // still standing and can be reverted.
-    bool  click_toggle_undoable_ = false;
+    // Defer single-click play/pause until we know a follow-up second click
+    // isn't coming (a real double-click = fullscreen). The wait uses the
+    // Windows-configured GetDoubleClickTime() BUT capped at 220 ms so users
+    // stuck with the default 500 ms setting don't feel a beat of lag on
+    // every click. Empirically 200 - 250 ms catches almost every real
+    // double-click; browsers use similar caps. Timer counts down in
+    // render(); a clicks>=2 event cancels it before it fires.
+    bool  pending_video_click_ = false;
+    float pending_video_click_timer_ = 0.0f;
 
     // A-B segment loop. -1 = unset. Press A to advance the state machine:
     // both unset -> set A; A set -> set B (must be > A); both set -> clear.

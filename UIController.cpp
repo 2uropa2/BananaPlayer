@@ -1304,8 +1304,8 @@ void UIController::drawInfoPanel(int W, int H) {
     bg->AddRectFilled(ImVec2(0, 0), ImVec2((float)W, (float)H),
                       IM_COL32(0, 0, 0, 160));
 
-    const float pw = std::min(560.0f, W - 80.0f);
-    const float ph = std::min(440.0f, H - 80.0f);
+    const float pw = std::min(720.0f, W - 60.0f);
+    const float ph = std::min(620.0f, H - 60.0f);
     ImVec2 tl((W - pw) * 0.5f, (H - ph) * 0.5f);
     ImVec2 br(tl.x + pw, tl.y + ph);
     // Matched treatment with the About panel: soft shadow + accent hairline.
@@ -1321,117 +1321,272 @@ void UIController::drawInfoPanel(int W, int H) {
                              | ImGuiWindowFlags_NoSavedSettings;
     ImGui::SetNextWindowPos(tl);
     ImGui::SetNextWindowSize(ImVec2(pw, ph));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24, 20));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(28, 22));
     ImGui::Begin("##InfoModal", nullptr, flags);
 
+    // Header
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.95f, 1.0f, 1.0f));
-    ImGui::TextUnformatted("Media info");
+    float base_font_sz = ImGui::GetFontSize();
+    ImGui::SetWindowFontScale(22.0f / base_font_sz);
+    ImGui::TextUnformatted("Media Info");
+    ImGui::SetWindowFontScale(1.0f);
     ImGui::PopStyleColor();
+    ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
 
     if (!player_->isLoaded()) {
         ImGui::TextDisabled("No file loaded.");
     } else {
-        auto row = [](const char* k, const std::string& v) {
-            ImGui::SetCursorPosX(20.0f);
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.68f, 0.78f, 0.96f, 1.0f));
+        // Column layout: 130 px label column, remainder for values. Long
+        // strings (filename, path) wrap inside the value column instead
+        // of being clipped at the panel edge.
+        const float label_col = 130.0f;
+        const float value_x   = label_col + 12.0f;
+        const float value_w   = pw - value_x - 44.0f;   // leave right margin
+
+        auto section = [&](const char* title) {
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.82f, 1.0f, 1.0f));
+            ImGui::SetWindowFontScale(15.0f / base_font_sz);
+            ImGui::TextUnformatted(title);
+            ImGui::SetWindowFontScale(1.0f);
+            ImGui::PopStyleColor();
+            // Subtle underline separator
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            ImGui::GetWindowDrawList()->AddLine(
+                ImVec2(p.x, p.y + 2), ImVec2(p.x + pw - 56, p.y + 2),
+                IM_COL32(96, 176, 246, 60), 1.0f);
+            ImGui::Dummy(ImVec2(0, 6));
+        };
+        auto row = [&](const char* k, const std::string& v, bool wrap = false) {
+            float y0 = ImGui::GetCursorPosY();
+            ImGui::SetCursorPosX(4.0f);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.72f, 0.82f, 0.96f, 0.9f));
             ImGui::TextUnformatted(k);
             ImGui::PopStyleColor();
-            ImGui::SameLine(200.0f);
-            ImGui::TextUnformatted(v.c_str());
+            ImGui::SetCursorPos(ImVec2(value_x, y0));
+            ImGui::PushTextWrapPos(value_x + value_w);
+            if (wrap) {
+                ImGui::TextUnformatted(v.c_str());
+            } else {
+                ImGui::TextUnformatted(v.c_str());
+            }
+            ImGui::PopTextWrapPos();
+            ImGui::Spacing();
+        };
+        auto row_disabled = [&](const char* k, const std::string& v) {
+            float y0 = ImGui::GetCursorPosY();
+            ImGui::SetCursorPosX(4.0f);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.72f, 0.82f, 0.96f, 0.9f));
+            ImGui::TextUnformatted(k);
+            ImGui::PopStyleColor();
+            ImGui::SetCursorPos(ImVec2(value_x, y0));
+            ImGui::TextDisabled("%s", v.c_str());
+            ImGui::Spacing();
         };
 
+        // Scroll region so overflow doesn't clip silently.
+        ImGui::BeginChild("##info_scroll",
+                          ImVec2(0.0f, ph - 120.0f),
+                          false,
+                          ImGuiWindowFlags_HorizontalScrollbar);
+
         const std::string& path = player_->getFilename();
-        row("File",         baseName(path.c_str()));
-        row("Path",         path);
 
-        char buf[128];
-        std::snprintf(buf, sizeof(buf), "%d x %d",
-                      player_->getVideoWidth(), player_->getVideoHeight());
-        row("Resolution",   buf);
+        // ---- FILE ----
+        section("FILE");
+        row("Name", baseName(path.c_str()), true);
+        row("Path", path, true);
 
-        const char* vc = player_->getVideoCodecName();
-        row("Video codec",  (vc && *vc) ? vc : "-");
+        // File size via GetFileAttributesExA - returns "" for URLs which is
+        // fine, the row just shows "-".
+        std::string size_str = "-";
+        WIN32_FILE_ATTRIBUTE_DATA fad{};
+        if (GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fad)) {
+            uint64_t bytes = ((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+            char sbuf[64];
+            if (bytes >= (1ULL << 30))
+                std::snprintf(sbuf, sizeof(sbuf), "%.2f GB  (%llu bytes)",
+                              bytes / (double)(1ULL << 30),
+                              (unsigned long long)bytes);
+            else if (bytes >= (1ULL << 20))
+                std::snprintf(sbuf, sizeof(sbuf), "%.1f MB  (%llu bytes)",
+                              bytes / (double)(1ULL << 20),
+                              (unsigned long long)bytes);
+            else if (bytes >= 1024)
+                std::snprintf(sbuf, sizeof(sbuf), "%.1f KB  (%llu bytes)",
+                              bytes / 1024.0,
+                              (unsigned long long)bytes);
+            else
+                std::snprintf(sbuf, sizeof(sbuf), "%llu bytes",
+                              (unsigned long long)bytes);
+            size_str = sbuf;
+        }
+        row("Size", size_str);
 
-        double fps = player_->getVideoFrameRate();
-        if (fps > 0.0) std::snprintf(buf, sizeof(buf), "%.3f fps", fps);
-        else           std::snprintf(buf, sizeof(buf), "-");
-        row("Frame rate",   buf);
-
-        row("Decoder",      player_->isHardwareDecoding()
-                              ? (std::string("HW  ") + player_->getHardwareDecoderName())
-                              : std::string("Software"));
-
-        int rot_intrinsic = player_->getIntrinsicRotation();
-        std::snprintf(buf, sizeof(buf), "%d deg  (from container)", rot_intrinsic);
-        row("Rotation",     buf);
-
-        if (player_->hasAudio()) {
-            const char* ac = player_->getAudioCodecName();
-            row("Audio codec", (ac && *ac) ? ac : "-");
-            std::snprintf(buf, sizeof(buf), "%d Hz  .  %d ch",
-                          player_->getAudioSampleRate(),
-                          player_->getAudioChannels());
-            row("Audio",       buf);
+        // Duration formatted as H:MM:SS with optional fractional seconds.
+        double dur = player_->getDuration();
+        char dbuf[64];
+        if (dur > 0.0) {
+            int h = (int)dur / 3600;
+            int m = ((int)dur % 3600) / 60;
+            double s = dur - (h * 3600 + m * 60);
+            if (h > 0)
+                std::snprintf(dbuf, sizeof(dbuf), "%d:%02d:%06.3f  (%.3f s)",
+                              h, m, s, dur);
+            else
+                std::snprintf(dbuf, sizeof(dbuf), "%02d:%06.3f  (%.3f s)",
+                              m, s, dur);
+            row("Duration", dbuf);
         } else {
-            row("Audio",       "-");
+            row("Duration", "-");
         }
 
         int64_t br_bits = player_->getFileBitrate();
-        if (br_bits > 0) std::snprintf(buf, sizeof(buf), "%.0f kbps", br_bits / 1000.0);
-        else             std::snprintf(buf, sizeof(buf), "-");
-        row("Bit rate",     buf);
+        char bbuf[64];
+        if (br_bits >= 1000000)
+            std::snprintf(bbuf, sizeof(bbuf), "%.2f Mbps", br_bits / 1000000.0);
+        else if (br_bits > 0)
+            std::snprintf(bbuf, sizeof(bbuf), "%.0f kbps", br_bits / 1000.0);
+        else
+            std::snprintf(bbuf, sizeof(bbuf), "-");
+        row("Bit rate", bbuf);
 
-        double dur = player_->getDuration();
-        int h = (int)dur / 3600;
-        int m = ((int)dur % 3600) / 60;
-        int s = (int)dur % 60;
-        std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d", h, m, s);
-        row("Duration",     buf);
-    }
+        // ---- VIDEO ----
+        section("VIDEO");
+        const char* vc = player_->getVideoCodecName();
+        row("Codec", (vc && *vc) ? std::string(vc) : std::string("-"));
 
-    // yt-dlp status - lets first-time users discover that Vela can play
-    // YouTube URLs by pasting one, and shows install guidance when the
-    // binary isn't on PATH (or dropped next to Vela.exe).
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
-    ImGui::SetCursorPosX(20.0f);
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.68f, 0.78f, 0.96f, 1.0f));
-    ImGui::TextUnformatted("YouTube");
-    ImGui::PopStyleColor();
-    ImGui::SameLine(200.0f);
-    YtDlpProbeState yt_pst = yt_resolver_ ? yt_resolver_->probeState()
-                                          : YtDlpProbeState::Missing;
-    if (yt_pst == YtDlpProbeState::Probing) {
-        ImGui::TextUnformatted("detecting...");
-    } else if (yt_pst == YtDlpProbeState::Available) {
-        std::string ver  = yt_resolver_->ytDlpVersion();
-        std::string ppth = yt_resolver_->ytDlpPath();
-        int         age  = yt_resolver_->ytDlpAgeDays();
-        char line[256];
-        if (!ver.empty() && age >= 0) {
-            std::snprintf(line, sizeof(line), "yt-dlp %s  (%d days old)",
-                          ver.c_str(), age);
-        } else if (!ver.empty()) {
-            std::snprintf(line, sizeof(line), "yt-dlp %s", ver.c_str());
+        char resbuf[96];
+        int vw = player_->getVideoWidth();
+        int vh = player_->getVideoHeight();
+        if (vw > 0 && vh > 0) {
+            // Simple aspect: reduce vw:vh by gcd.
+            auto gcd = [](int a, int b){ while (b){ a %= b; std::swap(a, b); } return a; };
+            int g = gcd(vw, vh);
+            std::snprintf(resbuf, sizeof(resbuf), "%d x %d  (%d:%d)",
+                          vw, vh, vw / g, vh / g);
         } else {
-            std::snprintf(line, sizeof(line), "yt-dlp detected");
+            std::snprintf(resbuf, sizeof(resbuf), "-");
         }
-        ImGui::TextUnformatted(line);
-        if (age > 30) {
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 200.0f);
-            ImGui::TextDisabled("Update: winget upgrade yt-dlp");
+        row("Resolution", resbuf);
+
+        double fps = player_->getVideoFrameRate();
+        char fbuf[48];
+        if (fps > 0.0) std::snprintf(fbuf, sizeof(fbuf), "%.3f fps", fps);
+        else           std::snprintf(fbuf, sizeof(fbuf), "-");
+        row("Frame rate", fbuf);
+
+        std::string dec = player_->isHardwareDecoding()
+                            ? (std::string("Hardware  (") + player_->getHardwareDecoderName() + ")")
+                            : std::string("Software");
+        row("Decoder", dec);
+
+        int rot_intrinsic = player_->getIntrinsicRotation();
+        char rbuf[48];
+        std::snprintf(rbuf, sizeof(rbuf),
+                      "%d deg  (container %d + user %d, mod 360)",
+                      (rot_intrinsic + ((int)rotation_) * 90) % 360,
+                      rot_intrinsic,
+                      ((int)rotation_) * 90);
+        row("Rotation", rbuf);
+
+        // ---- AUDIO ----
+        section("AUDIO");
+        if (player_->hasAudio()) {
+            const char* ac = player_->getAudioCodecName();
+            row("Codec", (ac && *ac) ? std::string(ac) : std::string("-"));
+            char sbuf[48];
+            std::snprintf(sbuf, sizeof(sbuf), "%d Hz",
+                          player_->getAudioSampleRate());
+            row("Sample rate", sbuf);
+            int ch = player_->getAudioChannels();
+            const char* ch_name = (ch == 1) ? " (Mono)"
+                                : (ch == 2) ? " (Stereo)"
+                                : (ch == 6) ? " (5.1)"
+                                : (ch == 8) ? " (7.1)"
+                                :             "";
+            char cbuf[48];
+            std::snprintf(cbuf, sizeof(cbuf), "%d%s", ch, ch_name);
+            row("Channels", cbuf);
+            int atc = player_->getAudioTrackCount();
+            if (atc > 1) {
+                char abuf[48];
+                std::snprintf(abuf, sizeof(abuf), "%d / %d",
+                              player_->getCurrentAudioTrackIndex() + 1, atc);
+                row("Track", abuf);
+            }
+        } else {
+            row_disabled("Status", "no audio stream");
         }
-        if (!ppth.empty()) {
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 200.0f);
-            ImGui::TextDisabled("%s", ppth.c_str());
+
+        // ---- SUBTITLES ----
+        section("SUBTITLES");
+        if (subtitles_.empty() && subtitle_tracks_.empty()) {
+            row_disabled("Status", "none loaded");
+        } else {
+            char tbuf[128];
+            if (!subtitles_.empty()) {
+                std::snprintf(tbuf, sizeof(tbuf), "%d cues  (%s)",
+                              (int)subtitles_.size(),
+                              subtitles_enabled_ ? "shown" : "hidden");
+            } else {
+                std::snprintf(tbuf, sizeof(tbuf), "-");
+            }
+            row("Active", tbuf);
+            if (!subtitle_tracks_.empty()) {
+                std::snprintf(tbuf, sizeof(tbuf), "%d sidecar file(s)",
+                              (int)subtitle_tracks_.size());
+                row("Sidecars", tbuf);
+            }
         }
-    } else {
-        ImGui::TextUnformatted("not installed");
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 200.0f);
-        ImGui::TextDisabled("Install: winget install yt-dlp");
+
+        // ---- CHAPTERS ----
+        if (!chapters_.empty()) {
+            section("CHAPTERS");
+            char cbuf[48];
+            std::snprintf(cbuf, sizeof(cbuf), "%d", (int)chapters_.size());
+            row("Count", cbuf);
+        }
+
+        // ---- BOOKMARKS ----
+        if (!bookmarks_current_.empty()) {
+            section("BOOKMARKS");
+            char bbuf2[48];
+            std::snprintf(bbuf2, sizeof(bbuf2), "%d", (int)bookmarks_current_.size());
+            row("Count", bbuf2);
+        }
+
+        // ---- YOUTUBE ----
+        section("YOUTUBE");
+        YtDlpProbeState yt_pst = yt_resolver_ ? yt_resolver_->probeState()
+                                              : YtDlpProbeState::Missing;
+        if (yt_pst == YtDlpProbeState::Probing) {
+            row_disabled("yt-dlp", "detecting...");
+        } else if (yt_pst == YtDlpProbeState::Available) {
+            std::string ver  = yt_resolver_->ytDlpVersion();
+            std::string ppth = yt_resolver_->ytDlpPath();
+            int         age  = yt_resolver_->ytDlpAgeDays();
+            char line[256];
+            if (!ver.empty() && age >= 0)
+                std::snprintf(line, sizeof(line), "%s  (%d days old)",
+                              ver.c_str(), age);
+            else if (!ver.empty())
+                std::snprintf(line, sizeof(line), "%s", ver.c_str());
+            else
+                std::snprintf(line, sizeof(line), "installed");
+            row("Version", line);
+            if (!ppth.empty()) row_disabled("Path", ppth);
+            if (age > 30) {
+                row_disabled("Update", "winget upgrade yt-dlp");
+            }
+        } else {
+            row("yt-dlp", "not installed");
+            row_disabled("Install", "winget install yt-dlp");
+        }
+
+        ImGui::EndChild();
     }
 
     ImGui::Spacing();
@@ -1875,8 +2030,20 @@ void UIController::render(int W, int H) {
         if (snapshot_flash_ < 0.0f) snapshot_flash_ = 0.0f;
     }
 
-    // (Click play/pause now fires immediately in handleEvent; a follow-up
-    // double-click undoes it. No deferred timer required.)
+    // Deferred single-click play/pause: fires once the short (~220 ms)
+    // double-click window has passed without a second click arriving.
+    if (pending_video_click_) {
+        pending_video_click_timer_ -= dt;
+        if (pending_video_click_timer_ <= 0.0f) {
+            pending_video_click_ = false;
+            pending_video_click_timer_ = 0.0f;
+            if (player_->isLoaded()) {
+                bool was_playing = player_->isPlaying();
+                player_->togglePause();
+                showOsd(was_playing ? "Pause" : "Play");
+            }
+        }
+    }
 
     // ---- Draw ----
     if (!loaded) {
@@ -3904,7 +4071,8 @@ void UIController::handleEvent(const SDL_Event& event) {
         // window. Middle click never participates in the left-click
         // double-click sequence, so no undo bookkeeping needed here.
         if (event.button.button == SDL_BUTTON_MIDDLE) {
-            click_toggle_undoable_ = false;
+            pending_video_click_ = false;
+            pending_video_click_timer_ = 0.0f;
             setFullscreen(!fullscreen_);
             nudgeVisible();
             return;
@@ -3920,26 +4088,25 @@ void UIController::handleEvent(const SDL_Event& event) {
         if (io.WantCaptureMouse) return;
         if (event.button.button == SDL_BUTTON_LEFT) {
             if (event.button.clicks >= 2) {
-                // Double-click -> fullscreen. The first click of this pair
-                // already toggled play/pause a moment ago; undo it here so
-                // the net effect is JUST fullscreen. This "immediate + undo"
-                // pattern is what makes single clicks feel snappy - waiting
-                // out the full ~500 ms Windows double-click window before
-                // toggling (the old behavior) felt laggy compared to Space.
-                if (click_toggle_undoable_ && player_->isLoaded()) {
-                    player_->togglePause();
-                    if (!osd_.empty()) osd_.pop_back();  // drop the phantom "Pause"/"Play"
-                }
-                click_toggle_undoable_ = false;
+                // Double-click -> fullscreen. Cancel any pending single-click
+                // toggle so a real double-click ends up as JUST fullscreen.
+                pending_video_click_ = false;
+                pending_video_click_timer_ = 0.0f;
                 setFullscreen(!fullscreen_);
             } else if (player_->isLoaded()) {
-                // Single click: toggle immediately. If this turns out to be
-                // the first half of a double-click, the clicks>=2 branch
-                // above will revert this before switching fullscreen.
-                bool was_playing = player_->isPlaying();
-                player_->togglePause();
-                showOsd(was_playing ? "Pause" : "Play");
-                click_toggle_undoable_ = true;
+                // Single click: defer the toggle so a follow-up second click
+                // can convert this into a "just fullscreen" event without a
+                // visible pause/play blip in between. The wait uses Windows'
+                // configured double-click threshold BUT capped at 220 ms so
+                // users with the default 500 ms setting still feel a snappy
+                // click - not the beat-late lag the previous long window
+                // produced. Empirically 200 - 250 ms catches virtually all
+                // real double-clicks; browsers use similar caps.
+                UINT dct_ms = GetDoubleClickTime();
+                if (dct_ms < 100) dct_ms = 100;
+                if (dct_ms > 220) dct_ms = 220;
+                pending_video_click_ = true;
+                pending_video_click_timer_ = (float)(dct_ms + 20) / 1000.0f;
             }
         }
     }
