@@ -9,20 +9,20 @@ namespace Style {
 static constexpr float kPI = 3.14159265358979323846f;
 
 // -----------------------------------------------------------------------------
-// Palette. Two accents only: a cool sky-blue primary (reads clean on dark
-// surfaces at all sizes and passes WCAG AA against #0E1116 base) and a warm
-// amber secondary reserved for "off-nominal" states - AMP badge, warnings,
-// B-marker on the loop bar. Kept as ImU32 so draw-list primitives can grab
-// them without an ImVec4 round-trip.
+// Palette. Two accents only: a warm banana-yellow primary (the Banana Player
+// brand accent, reads clean on warm-dark surfaces and clears WCAG AA against
+// the #12100C base) and an amber-orange secondary reserved for "off-nominal"
+// states - AMP badge, warnings, B-marker on the loop bar. Kept as ImU32 so
+// draw-list primitives can grab them without an ImVec4 round-trip.
 // -----------------------------------------------------------------------------
 namespace {
-constexpr ImU32 kAccent      = IM_COL32( 96, 176, 246, 255); // sky blue
-constexpr ImU32 kAccentLight = IM_COL32(148, 202, 255, 255); // hover / thumb glow
-constexpr ImU32 kAccentDeep  = IM_COL32( 64, 132, 216, 255); // pressed / gradient toe
-constexpr ImU32 kWarn        = IM_COL32(255, 168,  74, 255); // AMP + B marker
-constexpr ImU32 kOK          = IM_COL32(128, 220, 148, 255); // A marker
-constexpr ImU32 kTextHi      = IM_COL32(240, 244, 252, 255);
-constexpr ImU32 kTextLo      = IM_COL32(170, 182, 205, 255);
+constexpr ImU32 kAccent      = IM_COL32(255, 201,  58, 255); // banana yellow
+constexpr ImU32 kAccentLight = IM_COL32(255, 222, 122, 255); // hover / thumb glow
+constexpr ImU32 kAccentDeep  = IM_COL32(227, 154,  28, 255); // pressed / peel-toe gradient
+constexpr ImU32 kWarn        = IM_COL32(255, 136,  74, 255); // AMP + B marker (peel-orange)
+constexpr ImU32 kOK          = IM_COL32(122, 220, 122, 255); // A marker (unripe-green)
+constexpr ImU32 kTextHi      = IM_COL32(244, 241, 233, 255);
+constexpr ImU32 kTextLo      = IM_COL32(181, 174, 155, 255);
 } // namespace
 
 void SetupDarkTheme() {
@@ -49,54 +49,65 @@ void SetupDarkTheme() {
     s.GrabMinSize       = 12.0f;
 
     ImVec4* c = s.Colors;
-    // Base neutrals shifted slightly cooler + a touch darker so the accent
-    // pops harder. Text stays near-white for AA compliance.
-    c[ImGuiCol_Text]                  = ImVec4(0.94f, 0.96f, 0.99f, 1.00f);
-    c[ImGuiCol_TextDisabled]          = ImVec4(0.50f, 0.54f, 0.62f, 1.00f);
-    c[ImGuiCol_WindowBg]              = ImVec4(0.05f, 0.06f, 0.08f, 0.96f);
-    c[ImGuiCol_ChildBg]               = ImVec4(0.04f, 0.05f, 0.07f, 0.90f);
-    c[ImGuiCol_PopupBg]               = ImVec4(0.07f, 0.08f, 0.11f, 0.98f);
-    c[ImGuiCol_Border]                = ImVec4(0.22f, 0.26f, 0.34f, 0.55f);
+    // Base neutrals warmed vs the old cool-blue theme so the banana-yellow
+    // accent lives in a matching color family instead of clashing. The base
+    // #12100C is warm near-black; interactive states step up in warm greys
+    // with a hint of amber on the "active" beat. Text stays near-white
+    // (with a whisper of cream) for AA compliance against every level.
+    c[ImGuiCol_Text]                  = ImVec4(0.96f, 0.94f, 0.91f, 1.00f);
+    c[ImGuiCol_TextDisabled]          = ImVec4(0.60f, 0.56f, 0.48f, 1.00f);
+    c[ImGuiCol_WindowBg]              = ImVec4(0.07f, 0.06f, 0.05f, 0.96f);
+    c[ImGuiCol_ChildBg]               = ImVec4(0.06f, 0.05f, 0.04f, 0.90f);
+    c[ImGuiCol_PopupBg]               = ImVec4(0.09f, 0.08f, 0.06f, 0.98f);
+    c[ImGuiCol_Border]                = ImVec4(0.30f, 0.26f, 0.19f, 0.55f);
     c[ImGuiCol_BorderShadow]          = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    c[ImGuiCol_FrameBg]               = ImVec4(0.11f, 0.13f, 0.18f, 0.88f);
-    c[ImGuiCol_FrameBgHovered]        = ImVec4(0.17f, 0.21f, 0.30f, 0.92f);
-    c[ImGuiCol_FrameBgActive]         = ImVec4(0.23f, 0.30f, 0.44f, 0.96f);
-    c[ImGuiCol_TitleBg]               = ImVec4(0.05f, 0.06f, 0.08f, 1.00f);
-    c[ImGuiCol_TitleBgActive]         = ImVec4(0.09f, 0.11f, 0.15f, 1.00f);
-    c[ImGuiCol_TitleBgCollapsed]      = ImVec4(0.05f, 0.06f, 0.08f, 0.75f);
-    c[ImGuiCol_MenuBarBg]             = ImVec4(0.07f, 0.08f, 0.11f, 0.98f);
-    c[ImGuiCol_ScrollbarBg]           = ImVec4(0.02f, 0.03f, 0.05f, 0.45f);
-    c[ImGuiCol_ScrollbarGrab]         = ImVec4(0.28f, 0.34f, 0.46f, 0.75f);
-    c[ImGuiCol_ScrollbarGrabHovered]  = ImVec4(0.40f, 0.50f, 0.72f, 0.90f);
-    c[ImGuiCol_ScrollbarGrabActive]   = ImVec4(0.55f, 0.72f, 0.95f, 1.00f);
-    c[ImGuiCol_CheckMark]             = ImVec4(0.55f, 0.75f, 1.00f, 1.00f);
-    c[ImGuiCol_SliderGrab]            = ImVec4(0.55f, 0.75f, 1.00f, 1.00f);
-    c[ImGuiCol_SliderGrabActive]      = ImVec4(0.75f, 0.90f, 1.00f, 1.00f);
-    c[ImGuiCol_Button]                = ImVec4(0.13f, 0.16f, 0.22f, 0.90f);
-    c[ImGuiCol_ButtonHovered]         = ImVec4(0.23f, 0.32f, 0.50f, 0.95f);
-    c[ImGuiCol_ButtonActive]          = ImVec4(0.34f, 0.50f, 0.78f, 1.00f);
-    c[ImGuiCol_Header]                = ImVec4(0.16f, 0.22f, 0.34f, 0.80f);
-    c[ImGuiCol_HeaderHovered]         = ImVec4(0.24f, 0.34f, 0.54f, 0.90f);
-    c[ImGuiCol_HeaderActive]          = ImVec4(0.34f, 0.50f, 0.78f, 1.00f);
-    c[ImGuiCol_Separator]             = ImVec4(0.22f, 0.26f, 0.34f, 0.55f);
-    c[ImGuiCol_SeparatorHovered]      = ImVec4(0.34f, 0.50f, 0.78f, 0.78f);
-    c[ImGuiCol_SeparatorActive]       = ImVec4(0.55f, 0.72f, 0.95f, 1.00f);
-    c[ImGuiCol_ResizeGrip]            = ImVec4(0.22f, 0.28f, 0.40f, 0.30f);
-    c[ImGuiCol_ResizeGripHovered]     = ImVec4(0.34f, 0.50f, 0.78f, 0.78f);
-    c[ImGuiCol_ResizeGripActive]      = ImVec4(0.55f, 0.72f, 0.95f, 1.00f);
-    c[ImGuiCol_Tab]                   = ImVec4(0.11f, 0.14f, 0.20f, 0.86f);
-    c[ImGuiCol_TabHovered]            = ImVec4(0.28f, 0.40f, 0.60f, 0.86f);
-    c[ImGuiCol_PlotLines]             = ImVec4(0.65f, 0.78f, 1.00f, 1.00f);
-    c[ImGuiCol_PlotLinesHovered]      = ImVec4(0.86f, 0.92f, 1.00f, 1.00f);
-    c[ImGuiCol_PlotHistogram]         = ImVec4(0.55f, 0.75f, 1.00f, 1.00f);
-    c[ImGuiCol_PlotHistogramHovered]  = ImVec4(0.75f, 0.90f, 1.00f, 1.00f);
-    c[ImGuiCol_TextSelectedBg]        = ImVec4(0.30f, 0.48f, 0.80f, 0.55f);
-    c[ImGuiCol_DragDropTarget]        = ImVec4(0.75f, 0.90f, 1.00f, 0.90f);
-    c[ImGuiCol_NavCursor]             = ImVec4(0.55f, 0.75f, 1.00f, 1.00f);
+    c[ImGuiCol_FrameBg]               = ImVec4(0.14f, 0.12f, 0.09f, 0.88f);
+    c[ImGuiCol_FrameBgHovered]        = ImVec4(0.22f, 0.18f, 0.11f, 0.92f);
+    c[ImGuiCol_FrameBgActive]         = ImVec4(0.34f, 0.26f, 0.12f, 0.96f);
+    c[ImGuiCol_TitleBg]               = ImVec4(0.07f, 0.06f, 0.05f, 1.00f);
+    c[ImGuiCol_TitleBgActive]         = ImVec4(0.11f, 0.10f, 0.07f, 1.00f);
+    c[ImGuiCol_TitleBgCollapsed]      = ImVec4(0.07f, 0.06f, 0.05f, 0.75f);
+    c[ImGuiCol_MenuBarBg]             = ImVec4(0.09f, 0.08f, 0.06f, 0.98f);
+    c[ImGuiCol_ScrollbarBg]           = ImVec4(0.04f, 0.03f, 0.02f, 0.45f);
+    c[ImGuiCol_ScrollbarGrab]         = ImVec4(0.36f, 0.31f, 0.22f, 0.75f);
+    c[ImGuiCol_ScrollbarGrabHovered]  = ImVec4(0.55f, 0.46f, 0.24f, 0.90f);
+    c[ImGuiCol_ScrollbarGrabActive]   = ImVec4(0.85f, 0.68f, 0.28f, 1.00f);
+    c[ImGuiCol_CheckMark]             = ImVec4(1.00f, 0.79f, 0.23f, 1.00f);
+    c[ImGuiCol_SliderGrab]            = ImVec4(1.00f, 0.79f, 0.23f, 1.00f);
+    c[ImGuiCol_SliderGrabActive]      = ImVec4(1.00f, 0.87f, 0.48f, 1.00f);
+    c[ImGuiCol_Button]                = ImVec4(0.15f, 0.13f, 0.10f, 0.90f);
+    c[ImGuiCol_ButtonHovered]         = ImVec4(0.34f, 0.27f, 0.13f, 0.95f);
+    c[ImGuiCol_ButtonActive]          = ImVec4(0.60f, 0.45f, 0.16f, 1.00f);
+    c[ImGuiCol_Header]                = ImVec4(0.22f, 0.18f, 0.11f, 0.80f);
+    c[ImGuiCol_HeaderHovered]         = ImVec4(0.36f, 0.28f, 0.14f, 0.90f);
+    c[ImGuiCol_HeaderActive]          = ImVec4(0.60f, 0.45f, 0.16f, 1.00f);
+    c[ImGuiCol_Separator]             = ImVec4(0.30f, 0.26f, 0.19f, 0.55f);
+    c[ImGuiCol_SeparatorHovered]      = ImVec4(0.60f, 0.45f, 0.16f, 0.78f);
+    c[ImGuiCol_SeparatorActive]       = ImVec4(1.00f, 0.79f, 0.23f, 1.00f);
+    c[ImGuiCol_ResizeGrip]            = ImVec4(0.30f, 0.24f, 0.14f, 0.30f);
+    c[ImGuiCol_ResizeGripHovered]     = ImVec4(0.60f, 0.45f, 0.16f, 0.78f);
+    c[ImGuiCol_ResizeGripActive]      = ImVec4(1.00f, 0.79f, 0.23f, 1.00f);
+    c[ImGuiCol_Tab]                   = ImVec4(0.13f, 0.11f, 0.08f, 0.86f);
+    c[ImGuiCol_TabHovered]            = ImVec4(0.40f, 0.31f, 0.15f, 0.86f);
+    c[ImGuiCol_PlotLines]             = ImVec4(1.00f, 0.83f, 0.38f, 1.00f);
+    c[ImGuiCol_PlotLinesHovered]      = ImVec4(1.00f, 0.92f, 0.62f, 1.00f);
+    c[ImGuiCol_PlotHistogram]         = ImVec4(1.00f, 0.79f, 0.23f, 1.00f);
+    c[ImGuiCol_PlotHistogramHovered]  = ImVec4(1.00f, 0.87f, 0.48f, 1.00f);
+    c[ImGuiCol_TextSelectedBg]        = ImVec4(0.80f, 0.60f, 0.20f, 0.55f);
+    c[ImGuiCol_DragDropTarget]        = ImVec4(1.00f, 0.87f, 0.48f, 0.90f);
+    c[ImGuiCol_NavCursor]             = ImVec4(1.00f, 0.79f, 0.23f, 1.00f);
     c[ImGuiCol_NavWindowingHighlight] = ImVec4(1.00f, 1.00f, 1.00f, 0.75f);
     c[ImGuiCol_NavWindowingDimBg]     = ImVec4(0.80f, 0.80f, 0.80f, 0.24f);
-    c[ImGuiCol_ModalWindowDimBg]      = ImVec4(0.02f, 0.03f, 0.05f, 0.60f);
+    c[ImGuiCol_ModalWindowDimBg]      = ImVec4(0.03f, 0.02f, 0.01f, 0.60f);
 }
+
+// File-scope handles so GetSubtitleFont can return them after LoadFonts.
+// Kept nullptr when the corresponding TTF isn't installed - callers
+// treat nullptr as "use default".
+static ImFont* g_sub_default_    = nullptr;
+static ImFont* g_sub_malgun_bd_  = nullptr;
+static ImFont* g_sub_gulim_      = nullptr;
+static ImFont* g_sub_batang_     = nullptr;
 
 void LoadFonts(float ui_scale) {
     ImGuiIO& io = ImGui::GetIO();
@@ -108,19 +119,22 @@ void LoadFonts(float ui_scale) {
     cfg.PixelSnapH  = false;
 
     const float base = 16.0f * ui_scale;
-    const char* segoe = "C:\\Windows\\Fonts\\segoeui.ttf";
+    const char* segoe   = "C:\\Windows\\Fonts\\segoeui.ttf";
     // Malgun Gothic ships with every modern Windows install and covers
     // Korean glyphs used in .srt / .smi subtitles.
-    const char* malgun = "C:\\Windows\\Fonts\\malgun.ttf";
+    const char* malgun    = "C:\\Windows\\Fonts\\malgun.ttf";
+    const char* malgun_bd = "C:\\Windows\\Fonts\\malgunbd.ttf";
+    const char* gulim     = "C:\\Windows\\Fonts\\gulim.ttc";
+    const char* batang    = "C:\\Windows\\Fonts\\batang.ttc";
 
     ImFont* main_font = io.Fonts->AddFontFromFileTTF(segoe, base, &cfg,
                                                      io.Fonts->GetGlyphRangesDefault());
     if (!main_font) {
-        io.Fonts->AddFontDefault();
+        main_font = io.Fonts->AddFontDefault();
     }
 
-    // Merge Korean glyphs on top of the main font so any text renderer picks
-    // up hangul without swapping fonts explicitly.
+    // Merge Korean glyphs on top of the main font so any text renderer
+    // picks up hangul without swapping fonts explicitly.
     ImFontConfig merge;
     merge.MergeMode = true;
     merge.OversampleH = 2;
@@ -128,6 +142,36 @@ void LoadFonts(float ui_scale) {
     merge.PixelSnapH  = false;
     io.Fonts->AddFontFromFileTTF(malgun, base, &merge,
                                  io.Fonts->GetGlyphRangesKorean());
+    g_sub_default_ = main_font;
+
+    // Alternate subtitle fonts. Each is a standalone atlas font (not
+    // merged into main_font) so drawSubtitles can PushFont/PopFont.
+    // Loaded at 2x base so upscaled renders (60-80 px subs at fullscreen)
+    // stay crisp; ImFont::CalcTextSizeA rescales anyway.
+    // 1x oversampling here (was 2x): the source pixel size is already
+    // 2x base, and subs get further upscaled by ImGui's rescaler at
+    // render time, so extra atlas oversampling is invisible on subs
+    // while it doubles the Korean-glyph rasterization cost - one of
+    // the biggest cold-start line items at ~50-80 ms combined.
+    const float sub_base = base * 2.0f;
+    const ImWchar* kr_ranges = io.Fonts->GetGlyphRangesKorean();
+    ImFontConfig alt;
+    alt.OversampleH = 1;
+    alt.OversampleV = 1;
+    alt.PixelSnapH  = false;
+    g_sub_malgun_bd_ = io.Fonts->AddFontFromFileTTF(malgun_bd, sub_base, &alt, kr_ranges);
+    g_sub_gulim_     = io.Fonts->AddFontFromFileTTF(gulim,     sub_base, &alt, kr_ranges);
+    g_sub_batang_    = io.Fonts->AddFontFromFileTTF(batang,    sub_base, &alt, kr_ranges);
+}
+
+ImFont* GetSubtitleFont(SubtitleFont f) {
+    switch (f) {
+        case SubtitleFont::MalgunBold: return g_sub_malgun_bd_;
+        case SubtitleFont::Gulim:      return g_sub_gulim_;
+        case SubtitleFont::Batang:     return g_sub_batang_;
+        case SubtitleFont::Default:
+        default:                       return g_sub_default_;
+    }
 }
 
 void GradientRect(ImDrawList* dl, ImVec2 tl, ImVec2 br, ImU32 top_col, ImU32 bot_col) {
@@ -155,8 +199,8 @@ static void drawGear(ImDrawList* dl, ImVec2 c, float s, ImU32 col) {
     // Hub: an accent-coloured dot in the middle so the settings icon has a
     // recognisable focal point instead of just being "circle in a circle."
     // We can't subtract to make a real hole, so pick a colour that reads on
-    // most surfaces: the accent's darker toe.
-    dl->AddCircleFilled(c, hub, IM_COL32(45, 78, 130, 255), 28);
+    // most surfaces: the accent's darker toe (peel-toe amber).
+    dl->AddCircleFilled(c, hub, IM_COL32(120, 82, 20, 255), 28);
     dl->AddCircle(c, hub, col, 28, std::max(1.5f, s * 0.14f));
 }
 
@@ -443,8 +487,8 @@ bool IconButton(const char* id, Icon icon, const ImVec2& size,
     //  - held:   accent-deep, slightly translucent (finger-on-glass)
     //  - hover:  desaturated neutral so hover feels informational, not "on"
     ImU32 bg = IM_COL32(0, 0, 0, 0);
-    if (active)       bg = IM_COL32( 96, 176, 246, 225);
-    else if (held)    bg = IM_COL32( 64, 132, 216, 210);
+    if (active)       bg = IM_COL32(255, 201,  58, 225);
+    else if (held)    bg = IM_COL32(227, 154,  28, 210);
     else if (hovered) bg = IM_COL32(255, 255, 255,  30);
     bg = Fade(bg, alpha);
     if ((bg >> IM_COL32_A_SHIFT) != 0) {
@@ -464,10 +508,13 @@ bool IconButton(const char* id, Icon icon, const ImVec2& size,
     // Foreground: near-white when active or hovered so the icon reads clean
     // against the accent fill; slightly muted when at rest so the row of
     // icons doesn't visually shout.
+    // Foreground: on active state (yellow pill fill) the glyph flips to a
+    // near-black so it reads with strong contrast on the bright banana
+    // accent; at rest / hover it stays near-white on the dark chrome.
     ImU32 fg;
-    if (active)      fg = IM_COL32(255, 255, 255, 255);
-    else if (hovered || held) fg = IM_COL32(242, 246, 252, 255);
-    else             fg = IM_COL32(216, 222, 236, 255);
+    if (active)      fg = IM_COL32( 24,  20,  14, 255);
+    else if (hovered || held) fg = IM_COL32(250, 246, 236, 255);
+    else             fg = IM_COL32(228, 220, 200, 255);
     DrawIcon(dl, center, icon_size, icon, Fade(fg, alpha));
 
     ImGui::PopID();
@@ -479,13 +526,15 @@ bool IconButton(const char* id, Icon icon, const ImVec2& size,
 
 bool TextButton(const char* label, const ImVec2& size, bool active) {
     if (active) {
-        // Solid accent for the primary CTA (splash "Open File...", playlist
-        // "Clear" when armed). Uses the same sky-blue accent as SeekBar +
-        // active IconButtons for palette coherence.
-        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.30f, 0.55f, 0.86f, 1.00f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.40f, 0.66f, 0.96f, 1.00f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.24f, 0.44f, 0.72f, 1.00f));
-        ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(1.00f, 1.00f, 1.00f, 1.00f));
+        // Solid banana-yellow accent for the primary CTA (splash "Open
+        // File...", playlist "Clear" when armed). Uses the same accent as
+        // SeekBar + active IconButtons for palette coherence. Label text
+        // flips to a warm near-black for contrast against the yellow fill
+        // (clears WCAG AAA with room to spare).
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(1.00f, 0.79f, 0.23f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.00f, 0.87f, 0.48f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.89f, 0.60f, 0.11f, 1.00f));
+        ImGui::PushStyleColor(ImGuiCol_Text,          ImVec4(0.10f, 0.08f, 0.05f, 1.00f));
     }
     bool r = ImGui::Button(label, size);
     if (active) ImGui::PopStyleColor(4);
@@ -543,10 +592,12 @@ bool SeekBar(const char* id, float& value, float min, float max,
     if (hovered || held) {
         float r = held ? 8.5f : 7.5f;
         // Soft outer glow (two blurred-looking circles at reducing alpha).
+        // Colours tint toward the banana-yellow accent so the thumb feels
+        // part of the same brand palette as the filled track underneath.
         dl->AddCircleFilled(ImVec2(fill_x, track_y), r + 6.0f,
-                            IM_COL32(96, 176, 246, 55), 32);
+                            IM_COL32(255, 201, 58, 55), 32);
         dl->AddCircleFilled(ImVec2(fill_x, track_y), r + 3.5f,
-                            IM_COL32(96, 176, 246, 105), 32);
+                            IM_COL32(255, 201, 58, 105), 32);
         // Contact shadow so the thumb feels physically lifted off the track.
         dl->AddCircleFilled(ImVec2(fill_x, track_y + 1.0f), r + 1.5f,
                             IM_COL32(0, 0, 0, 130), 32);

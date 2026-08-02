@@ -20,7 +20,7 @@ if(MSVC)
     set(CMAKE_CXX_COMPILER "cl" CACHE STRING "MSVC C++ compiler" FORCE)
 endif()
 
-project(Vela VERSION 1.0.0 LANGUAGES CXX)
+project(Vela VERSION 1.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -38,6 +38,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
     libavcodec
     libavformat
+    libavfilter
     libavutil
     libswscale
     libswresample
@@ -51,6 +52,7 @@ set(VELA_SOURCES
     Subtitles.cpp
     Thumbnail.cpp
     Youtube.cpp
+    SingleInstance.cpp
 )
 
 # On Windows, compile the .rc so Explorer/taskbar pick up icon + version info.
@@ -77,7 +79,7 @@ target_link_libraries(Vela PRIVATE
 
 if(WIN32)
     # File open dialog (GetOpenFileName) lives here.
-    target_link_libraries(Vela PRIVATE comdlg32)
+    target_link_libraries(Vela PRIVATE comdlg32 shell32 ole32)
 endif()
 
 # Copy SDL3 runtime DLL next to the built executable so it launches out-of-tree.
@@ -138,6 +140,10 @@ if(WIN32)
     install(PROGRAMS ${CMAKE_INSTALLED_SYSTEM_RUNTIME_LIBS} DESTINATION bin)
 endif()
 install(FILES resources/icon.ico DESTINATION share/icons)
+# Ship the licenses alongside the exe so redistributors and end users
+# both find them in one place. Location inside share/ keeps the install
+# root uncluttered but the files stay next to Vela's own share/ icons.
+install(FILES LICENSE LICENSE-3RDPARTY DESTINATION share)
 # yt-dlp bundle - shipped as a PROGRAM so NSIS gives it +x on install and
 # strips it on uninstall. Only installed if the download succeeded at
 # configure time.
@@ -146,23 +152,27 @@ if(WIN32 AND EXISTS "${YT_DLP_EXE}")
 endif()
 
 # -------- CPack: installer + zip --------
-set(CPACK_PACKAGE_NAME              "Vela")
-set(CPACK_PACKAGE_VENDOR            "Vela")
+set(CPACK_PACKAGE_NAME              "Banana Player")
+set(CPACK_PACKAGE_VENDOR            "Banana Player")
 set(CPACK_PACKAGE_VERSION_MAJOR     ${PROJECT_VERSION_MAJOR})
 set(CPACK_PACKAGE_VERSION_MINOR     ${PROJECT_VERSION_MINOR})
 set(CPACK_PACKAGE_VERSION_PATCH     ${PROJECT_VERSION_PATCH})
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
-    "Vela - minimal, keyboard-first video player (SDL3 + FFmpeg + Dear ImGui).")
+    "Banana Player - peel and play. Lightweight, keyboard-first video player (SDL3 + FFmpeg + Dear ImGui).")
+# Install directory keeps the historical "Vela" name so upgrade-in-place from
+# older installs (which wrote sidecar files under C:\Program Files\Vela\)
+# lands on the same tree instead of leaving a stale legacy install behind.
 set(CPACK_PACKAGE_INSTALL_DIRECTORY "Vela")
-# Shows in Start Menu after install: "Vela".
-set(CPACK_PACKAGE_EXECUTABLES       "Vela;Vela")
+# Shortcut source (Vela.exe - internal name preserved) -> display label the
+# user sees in Start Menu / Desktop ("Banana Player").
+set(CPACK_PACKAGE_EXECUTABLES       "Vela;Banana Player")
 set(CPACK_CREATE_DESKTOP_LINKS      "Vela")
 
 if(WIN32)
     # NSIS (needs makensis on PATH; ZIP always works as a portable fallback).
     set(CPACK_GENERATOR                       "ZIP;NSIS")
-    set(CPACK_NSIS_DISPLAY_NAME               "Vela")
-    set(CPACK_NSIS_PACKAGE_NAME               "Vela")
+    set(CPACK_NSIS_DISPLAY_NAME               "Banana Player")
+    set(CPACK_NSIS_PACKAGE_NAME               "Banana Player")
     set(CPACK_NSIS_MUI_ICON                   "${CMAKE_CURRENT_SOURCE_DIR}/resources/icon.ico")
     set(CPACK_NSIS_MUI_UNIICON                "${CMAKE_CURRENT_SOURCE_DIR}/resources/icon.ico")
     set(CPACK_NSIS_INSTALLED_ICON_NAME        "bin\\\\Vela.exe")

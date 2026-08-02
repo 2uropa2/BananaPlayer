@@ -12,13 +12,13 @@
 ; single-quote wrapping.
 ; -----------------------------------------------------------------------------
 
-WriteRegStr HKCR "Applications\Vela.exe" "FriendlyAppName" "Vela"
-WriteRegStr HKCR "Applications\Vela.exe" "ApplicationName" "Vela"
-WriteRegStr HKCR "Applications\Vela.exe" "ApplicationCompany" "Vela"
-WriteRegStr HKCR "Applications\Vela.exe" "ApplicationDescription" "Focused, keyboard-first video playback"
+WriteRegStr HKCR "Applications\Vela.exe" "FriendlyAppName" "Banana Player"
+WriteRegStr HKCR "Applications\Vela.exe" "ApplicationName" "Banana Player"
+WriteRegStr HKCR "Applications\Vela.exe" "ApplicationCompany" "Banana Player"
+WriteRegStr HKCR "Applications\Vela.exe" "ApplicationDescription" "Peel and play - lightweight, keyboard-first video playback"
 WriteRegStr HKCR "Applications\Vela.exe\DefaultIcon" "" '"$INSTDIR\bin\Vela.exe",0'
 WriteRegStr HKCR "Applications\Vela.exe\shell\open\command" "" '"$INSTDIR\bin\Vela.exe" "%1"'
-WriteRegStr HKCR "Applications\Vela.exe\shell\open\FriendlyAppName" "" "Vela"
+WriteRegStr HKCR "Applications\Vela.exe\shell\open\FriendlyAppName" "" "Banana Player"
 WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\Vela.exe" "" "$INSTDIR\bin\Vela.exe"
 WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\Vela.exe" "Path" "$INSTDIR\bin"
 

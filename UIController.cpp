@@ -1,4 +1,5 @@
 #include "UIController.hpp"
+#include "SingleInstance.hpp"
 #include "Thumbnail.hpp"
 #include "Version.hpp"
 #include "Youtube.hpp"
@@ -11,11 +12,15 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <functional>
+#include <initializer_list>
+#include <utility>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <shlobj_core.h>
 
 // Seek nudges (+/-5s, +/-30s, frame step) fire while the user is watching and
 // the seek bar already reflects the change - the OSD popup on top of it feels
@@ -29,6 +34,36 @@
 // -------------- Local helpers --------------
 
 namespace {
+
+// Atomic sidecar write: write to `path`.tmp, flush + fclose, then
+// MoveFileEx to the real path. On Windows same-volume MoveFileEx is
+// atomic, so a crash / power loss during the write leaves the ORIGINAL
+// file intact instead of a half-truncated one. Used for every sidecar
+// (vela.resume / .bookmarks / .stats / .config / .recent / .session.m3u
+// / .hdrlut). Small files (<50 KB) but truncate-then-write was leaving
+// users without their last watched position after a crash.
+template <class Writer>
+bool writeSidecarAtomic(const std::string& path, Writer writer) {
+    std::string tmp = path + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+    writer(f);
+    std::fflush(f);
+    std::fclose(f);
+#ifdef _WIN32
+    if (!MoveFileExA(tmp.c_str(), path.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileA(tmp.c_str());
+        return false;
+    }
+#else
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+#endif
+    return true;
+}
 
 const char* baseName(const char* s) {
     const char* p1 = std::strrchr(s, '\\');
@@ -58,36 +93,79 @@ std::string appDir() {
     return (p == std::string::npos) ? "." : s.substr(0, p);
 }
 
+// Writable-for-sure sidecar location. When Vela is installed under
+// C:\Program Files\..., appDir() is admin-only and fopen("wb") on
+// vela.config there silently drops the file (no VirtualStore either
+// on modern Windows for unmanifested exes) - the symptom is "settings
+// don't persist across launches". Route sidecars through
+// %APPDATA%\Vela\ instead. SDL_GetPrefPath creates the directory as a
+// side effect and returns a trailing-slash path.
+//
+// A one-time migration in `migrateSidecarsToDataDir` copies files
+// found in appDir() to dataDir() on first read, so users who ran an
+// old build from the source tree don't lose their state.
+std::string dataDir() {
+    static std::string cached;
+    if (!cached.empty()) return cached;
+    // SDL_GetPrefPath("Vela", "Vela") -> "%APPDATA%\Vela\Vela\" which
+    // is nested one too deep. Pass empty org so the layout is
+    // "%APPDATA%\Vela\" - matches most well-behaved Windows apps.
+    // Falls back to appDir() only if SDL failed (never seen in prod).
+    const char* p = SDL_GetPrefPath("", "Vela");
+    if (p && *p) {
+        cached = p;
+        // SDL_GetPrefPath returns a pointer we don't free (SDL3 owns).
+    } else {
+        cached = appDir() + "\\";
+    }
+    return cached;
+}
+
+// Migration: for each named sidecar, if it exists in appDir() but NOT
+// in dataDir(), copy it over. Preserves state for users who launched
+// old builds from the source tree before dataDir was introduced.
+// Called once from UIController's ctor before any sidecar reads.
+static void migrateSidecarsToDataDir() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    const char* names[] = {
+        "vela.config", "vela.resume", "vela.bookmarks",
+        "vela.recent", "vela.session.m3u",
+        "vela.stats",  "vela.hdrlut"
+    };
+    std::string src_base = appDir() + "\\";
+    std::string dst_base = dataDir();
+    for (const char* nm : names) {
+        std::string src = src_base + nm;
+        std::string dst = dst_base + nm;
+        DWORD dst_attr = GetFileAttributesA(dst.c_str());
+        if (dst_attr != INVALID_FILE_ATTRIBUTES) continue;   // dst exists
+        DWORD src_attr = GetFileAttributesA(src.c_str());
+        if (src_attr == INVALID_FILE_ATTRIBUTES) continue;   // src missing
+        CopyFileA(src.c_str(), dst.c_str(), TRUE);
+    }
+}
+
 std::string timestampString() {
-    std::time_t t = std::time(nullptr);
-    std::tm lt{};
-    localtime_s(&lt, &t);
+    // Millisecond-precision so burst-mode shots at short intervals
+    // (0.5 s / 1.0 s presets) don't collide inside the same wall-clock
+    // second. Two snapshots in the same second used to overwrite each
+    // other silently - a 10-shot burst at 0.5 s could end up as 5 files.
+    SYSTEMTIME lt;
+    GetLocalTime(&lt);
     char buf[64];
-    std::snprintf(buf, sizeof(buf), "%04d%02d%02d_%02d%02d%02d",
-                  lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday,
-                  lt.tm_hour, lt.tm_min, lt.tm_sec);
+    std::snprintf(buf, sizeof(buf), "%04d%02d%02d_%02d%02d%02d_%03d",
+                  lt.wYear, lt.wMonth, lt.wDay,
+                  lt.wHour, lt.wMinute, lt.wSecond, lt.wMilliseconds);
     return buf;
 }
 
-std::string resumeIndexPath() {
-    // Sits next to the exe, same convention as snapshots.
-    char buf[MAX_PATH];
-    DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return "vela.resume";
-    std::string s(buf, n);
-    size_t p = s.find_last_of("\\/");
-    return (p == std::string::npos) ? "vela.resume" : (s.substr(0, p) + "\\vela.resume");
-}
-
-std::string bookmarkIndexPath() {
-    char buf[MAX_PATH];
-    DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return "vela.bookmarks";
-    std::string s(buf, n);
-    size_t p = s.find_last_of("\\/");
-    return (p == std::string::npos) ? "vela.bookmarks"
-                                    : (s.substr(0, p) + "\\vela.bookmarks");
-}
+// Sidecar files all sit under dataDir() (usually %APPDATA%\Vela\).
+// See dataDir() for the "why not exe-adjacent" rationale.
+std::string resumeIndexPath()   { return dataDir() + "vela.resume"; }
+std::string bookmarkIndexPath() { return dataDir() + "vela.bookmarks"; }
+std::string statsIndexPath()    { return dataDir() + "vela.stats"; }
 
 std::string openFileDialogWin() {
     OPENFILENAMEA ofn = {};
@@ -117,8 +195,15 @@ UIController::UIController(VideoPlayer* player, SDL_Window* window, SDL_Renderer
     player_->onEnded = [this]() { handleNaturalEnd(); };
     thumb_provider_ = std::make_unique<ThumbnailProvider>(renderer_);
     yt_resolver_    = std::make_unique<YoutubeResolver>();
+    // One-time migration: pre-1.3.1 builds wrote sidecars next to the
+    // exe. That silently failed when the exe lived under Program
+    // Files (no admin write access, no UAC virtualization for exes
+    // shipped with modern build toolchains). Copy any old sidecars
+    // over to dataDir() so existing state survives the switch.
+    migrateSidecarsToDataDir();
     loadResumeIndex();
     loadBookmarkIndex();
+    loadStatsIndex();
     loadConfig();
     loadRecents();
     loadLastPlaylist();
@@ -133,6 +218,8 @@ UIController::~UIController() {
     snapshotCurrentResume();
     if (resume_dirty_) writeResumeIndex();
     if (bookmark_dirty_) writeBookmarkIndex();
+    commitCurrentStats();
+    if (stats_dirty_) writeStatsIndex();
     saveConfig();
     saveRecents();
     saveLastPlaylist();
@@ -151,6 +238,7 @@ void UIController::shutdownBeforeSdl() {
     // calls hit a live renderer. Called from main.cpp just before
     // ImGui/SDL shutdown.
     thumb_provider_.reset();
+    freeBitmapSubtitleTexture();
 }
 
 void UIController::loadResumeIndex() {
@@ -176,14 +264,13 @@ void UIController::loadResumeIndex() {
 }
 
 void UIController::writeResumeIndex() {
-    std::FILE* f = std::fopen(resumeIndexPath().c_str(), "wb");
-    if (!f) return;
-    size_t n = std::min<size_t>(resume_index_.size(), 200);
-    for (size_t i = 0; i < n; ++i) {
-        const auto& e = resume_index_[i];
-        std::fprintf(f, "%.3f\t%.3f\t%s\n", e.pos, e.duration, e.path.c_str());
-    }
-    std::fclose(f);
+    writeSidecarAtomic(resumeIndexPath(), [&](std::FILE* f) {
+        size_t n = std::min<size_t>(resume_index_.size(), 200);
+        for (size_t i = 0; i < n; ++i) {
+            const auto& e = resume_index_[i];
+            std::fprintf(f, "%.3f\t%.3f\t%s\n", e.pos, e.duration, e.path.c_str());
+        }
+    });
     resume_dirty_ = false;
 }
 
@@ -251,18 +338,17 @@ void UIController::loadBookmarkIndex() {
 }
 
 void UIController::writeBookmarkIndex() {
-    std::FILE* f = std::fopen(bookmarkIndexPath().c_str(), "wb");
-    if (!f) return;
-    size_t n = std::min<size_t>(bookmark_index_.size(), 200);
-    for (size_t i = 0; i < n; ++i) {
-        const auto& e = bookmark_index_[i];
-        if (e.times.empty()) continue;
-        for (size_t j = 0; j < e.times.size(); ++j) {
-            std::fprintf(f, "%s%.3f", j ? "," : "", e.times[j]);
+    writeSidecarAtomic(bookmarkIndexPath(), [&](std::FILE* f) {
+        size_t n = std::min<size_t>(bookmark_index_.size(), 200);
+        for (size_t i = 0; i < n; ++i) {
+            const auto& e = bookmark_index_[i];
+            if (e.times.empty()) continue;
+            for (size_t j = 0; j < e.times.size(); ++j) {
+                std::fprintf(f, "%s%.3f", j ? "," : "", e.times[j]);
+            }
+            std::fprintf(f, "\t%s\n", e.path.c_str());
         }
-        std::fprintf(f, "\t%s\n", e.path.c_str());
-    }
-    std::fclose(f);
+    });
     bookmark_dirty_ = false;
 }
 
@@ -335,6 +421,73 @@ void UIController::clearBookmarks() {
     showOsd("Bookmarks cleared", 1.4f);
 }
 
+// ---------- Playback statistics ----------
+//
+// vela.stats sidecar layout: one line per file.
+//   <seconds><TAB><sessions><TAB><path>
+// Newest-first (MRU) so trimming to 500 drops the oldest.
+
+void UIController::loadStatsIndex() {
+    stats_.clear();
+    std::FILE* f = std::fopen(statsIndexPath().c_str(), "rb");
+    if (!f) return;
+    char buf[8192];
+    while (std::fgets(buf, sizeof(buf), f)) {
+        std::string line(buf);
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+        if (line.empty()) continue;
+        size_t t1 = line.find('\t');
+        if (t1 == std::string::npos) continue;
+        size_t t2 = line.find('\t', t1 + 1);
+        if (t2 == std::string::npos) continue;
+        double sec  = std::atof(line.substr(0, t1).c_str());
+        int    sess = std::atoi(line.substr(t1 + 1, t2 - t1 - 1).c_str());
+        std::string p = line.substr(t2 + 1);
+        if (p.empty()) continue;
+        if (sec < 0.0) sec = 0.0;
+        if (sess < 0) sess = 0;
+        stats_[p] = PlaybackStats{sec, sess};
+    }
+    std::fclose(f);
+}
+
+void UIController::writeStatsIndex() {
+    writeSidecarAtomic(statsIndexPath(), [&](std::FILE* f) {
+        // Cap at 500 entries. Snapshot to a vector, sort by session
+        // count desc as a rough MRU proxy.
+        std::vector<std::pair<std::string, PlaybackStats>> flat(
+            stats_.begin(), stats_.end());
+        std::sort(flat.begin(), flat.end(),
+                  [](const auto& a, const auto& b) {
+                      return a.second.sessions > b.second.sessions;
+                  });
+        size_t n = std::min<size_t>(flat.size(), 500);
+        for (size_t i = 0; i < n; ++i) {
+            const auto& e = flat[i];
+            if (e.second.sessions <= 0 && e.second.seconds <= 0.0) continue;
+            std::fprintf(f, "%.3f\t%d\t%s\n",
+                         e.second.seconds, e.second.sessions, e.first.c_str());
+        }
+    });
+    stats_dirty_ = false;
+}
+
+void UIController::commitCurrentStats() {
+    if (!player_ || !player_->isLoaded()) { stats_accum_this_session_ = 0.0; return; }
+    const std::string& p = player_->getFilename();
+    if (p.empty()) { stats_accum_this_session_ = 0.0; return; }
+    if (stats_accum_this_session_ > 0.5) {   // ignore trivial flickers
+        stats_[p].seconds += stats_accum_this_session_;
+        stats_dirty_ = true;
+    }
+    stats_accum_this_session_ = 0.0;
+}
+
+UIController::PlaybackStats UIController::getStatsFor(const std::string& path) const {
+    auto it = stats_.find(path);
+    return (it == stats_.end()) ? PlaybackStats{} : it->second;
+}
+
 void UIController::snapshotCurrentResume() {
     if (!player_->isLoaded()) return;
     const std::string& p = player_->getFilename();
@@ -381,6 +534,14 @@ bool UIController::loadPath(const std::string& path) {
     snapshotCurrentResume();
     if (resume_dirty_) writeResumeIndex();
     if (bookmark_dirty_) writeBookmarkIndex();
+    // Bank the outgoing file's playing time before it's forgotten. Also
+    // flush the stats index so a crash on the next load doesn't lose
+    // hours of watch history.
+    commitCurrentStats();
+    if (stats_dirty_) writeStatsIndex();
+    // Loading anything cancels an in-flight auto-next countdown - it
+    // was set up for the OLD file's natural end and would double-fire.
+    cancelAutoNext();
     bookmarks_current_.clear();
 
     // Loading a non-YouTube file (direct file/URL): the current YouTube
@@ -402,6 +563,31 @@ bool UIController::loadPath(const std::string& path) {
     // sync mismatch on some other file must not silently follow the user
     // into every subsequent load.
     player_->setAVSyncOffset(0.0);
+    // Video zoom / pan are per-file transients too - a user framing one
+    // clip must not carry into the next.
+    resetVideoZoomPan();
+    // Per-file transient UI state that would otherwise leak into the
+    // next clip. In particular subtitles_secondary_ has its own cue
+    // times and would render bogus text against a new file's timeline.
+    subtitles_secondary_.clear();
+    subtitle_secondary_cache_idx_    = 0;
+    subtitle_secondary_track_active_ = -1;
+    // Embedded subtitle activation is a per-file transient too - a
+    // track selected on the previous file's stream indices makes no
+    // sense on the new file's, and getEmbeddedSubtitleAt would return
+    // stale cues until the decoder is re-opened. VideoPlayer::unload
+    // clears its own copy; the UI just doesn't need to preserve a
+    // dangling choice.
+    // The subtitle-search "last hit" index points into an old cue set;
+    // reset so the next Enter starts from the top of the new file.
+    subtitle_search_last_hit_ = -1;
+    // Abort any in-flight burst so it doesn't keep firing snapshots
+    // into the new file. Left-drag pan state is transient input and
+    // gets released by the next MOUSE_BUTTON_UP - clear here defensively
+    // in case a file switch beat the release event.
+    burst_remaining_ = 0;
+    burst_next_at_   = 0.0f;
+    video_panning_   = false;
     // Attempt to auto-load companion .srt / .smi.
     loadCompanionSubs(path);
 
@@ -411,7 +597,7 @@ bool UIController::loadPath(const std::string& path) {
         char buf[512]; std::snprintf(buf, sizeof(buf),
                                      "Cannot open  %s", baseName(path.c_str()));
         showOsd(buf, 3.0f);
-        SDL_SetWindowTitle(window_, "Vela");
+        SDL_SetWindowTitle(window_, "Banana Player");
         return false;
     }
     {
@@ -422,6 +608,10 @@ bool UIController::loadPath(const std::string& path) {
         // Pull any prior bookmarks for this file into bookmarks_current_.
         loadBookmarksForCurrent();
         addRecent(path);
+        // Bump session count for this file, reset accum.
+        stats_[path].sessions += 1;
+        stats_accum_this_session_ = 0.0;
+        stats_dirty_ = true;
         // Update playlist current selection to match (or append)
         bool found = false;
         for (size_t i = 0; i < playlist_.size(); ++i) {
@@ -430,6 +620,69 @@ bool UIController::loadPath(const std::string& path) {
         if (!found) {
             playlist_.add(path);
             playlist_.setCurrent(playlist_.size() - 1);
+        }
+
+        // Auto-activate an embedded (container) subtitle track when no
+        // external sidecar was loaded. Priority:
+        //   1. Korean text track (SRT / ASS / mov_text / ...)
+        //   2. Korean bitmap track (PGS / DVB / DVD)
+        // If the current audio track is NOT Korean, extend to:
+        //   3. Any text track
+        //   4. Any selectable bitmap track
+        // The audio-language guard exists because Korean users watching
+        // Korean-audio content typically don't want the container's
+        // English subs auto-loaded on top - the previous unconditional
+        // "pick any text" fallback made Korean movies feel over-eager.
+        if (subtitles_.empty()) {
+            auto etracks = player_->getEmbeddedSubtitleTracks();
+            auto isTextCodec = [](const std::string& cn) {
+                return cn == "subrip" || cn == "ass" || cn == "ssa"
+                    || cn == "text"   || cn == "mov_text" || cn == "webvtt";
+            };
+            auto isKoreanLang = [](const std::string& lg) {
+                return lg == "kor" || lg == "ko";
+            };
+            int pick = -1;
+            auto pickIf = [&](bool wantText, bool wantKorean) {
+                for (size_t i = 0; i < etracks.size(); ++i) {
+                    const auto& t = etracks[i];
+                    if (!t.selectable) continue;
+                    bool isText = isTextCodec(t.codec_name);
+                    if (wantText != isText) continue;
+                    if (wantKorean && !isKoreanLang(t.language)) continue;
+                    pick = (int)i;
+                    return true;
+                }
+                return false;
+            };
+            std::string audio_lang = player_->getCurrentAudioLanguage();
+            bool audio_is_korean   = isKoreanLang(audio_lang);
+            if (!pickIf(true,  true))                       // Korean text
+                if (!pickIf(false, true))                   // Korean bitmap
+                    if (!audio_is_korean) {
+                        if (!pickIf(true,  false))          // any text
+                            pickIf(false, false);           // any bitmap
+                    }
+            if (pick >= 0) {
+                if (player_->setActiveEmbeddedSubtitle(pick)) {
+                    // Subtle OSD so the user knows subs were auto-picked.
+                    // Otherwise a first-time MKV viewer sees text appear
+                    // out of nowhere with no explanation.
+                    const auto& t = etracks[pick];
+                    char m[192];
+                    if (!t.language.empty()) {
+                        std::snprintf(m, sizeof(m),
+                                      "Embedded subs: %s (%s)",
+                                      t.codec_name.c_str(),
+                                      t.language.c_str());
+                    } else {
+                        std::snprintf(m, sizeof(m),
+                                      "Embedded subs: %s",
+                                      t.codec_name.c_str());
+                    }
+                    showOsd(m, 1.6f);
+                }
+            }
         }
 
         // Restore resume position if we have one AND it's still meaningful for
@@ -445,7 +698,7 @@ bool UIController::loadPath(const std::string& path) {
         player_->play();
 
         char title[512];
-        std::snprintf(title, sizeof(title), "%s  -  Vela",
+        std::snprintf(title, sizeof(title), "%s  -  Banana Player",
                       baseName(path.c_str()));
         SDL_SetWindowTitle(window_, title);
 
@@ -454,6 +707,19 @@ bool UIController::loadPath(const std::string& path) {
             char buf[64]; std::snprintf(buf, sizeof(buf), "HW decode  %s",
                                         player_->getHardwareDecoderName());
             showOsd(buf, 1.4f);
+        }
+        // Announce HDR - show whether tone mapping is engaged or the
+        // user has turned it off for native passthrough.
+        {
+            auto kind = player_->getHdrKind();
+            const bool on = player_->isHdrToneMapEnabled();
+            if (kind == VideoPlayer::HdrKind::PQ) {
+                showOsd(on ? "HDR tone map  PQ -> SDR"
+                           : "HDR (PQ)  native passthrough", 1.8f);
+            } else if (kind == VideoPlayer::HdrKind::HLG) {
+                showOsd(on ? "HDR tone map  HLG -> SDR"
+                           : "HDR (HLG)  native passthrough", 1.8f);
+            }
         }
 
         // Prime the thumbnail provider on the newly-loaded file so hover
@@ -671,12 +937,61 @@ void UIController::nudgeVisible() {
 
 void UIController::takeSnapshot() {
     if (!player_->isLoaded()) return;
-    std::string dir  = appDir();
+    // Default location: dataDir() (usually %APPDATA%\Vela\). Was
+    // appDir() historically but that's Program Files under a normal
+    // install and non-admin writes get dropped. Users who preferred
+    // the old exe-adjacent path can point snapshot_dir_ back at it.
+    std::string dir  = snapshot_dir_.empty() ? dataDir() : snapshot_dir_;
+    // Trim trailing separator so we always join with exactly one '\'.
+    while (!dir.empty() && (dir.back() == '\\' || dir.back() == '/')) {
+        dir.pop_back();
+    }
     std::string name = std::string("snapshot_") + timestampString() + ".png";
     std::string full = dir + "\\" + name;
-    if (player_->snapshot(full)) {
+    bool ok = false;
+    if (snapshot_include_overlays_ && renderer_) {
+        // Screen capture route: reads the composited SDL back buffer so
+        // subtitles + OSD + any visible HUD ride along. Wait for HUD to
+        // fade (3 s idle) before triggering if a "video + subs only"
+        // capture is what you're after.
+        SDL_Surface* surf = SDL_RenderReadPixels(renderer_, nullptr);
+        if (surf) {
+            // SDL3 usually returns RGBA/BGRA at 32 bpp with pitch aligned;
+            // hand the bytes off to the FFmpeg encoder verbatim - it does
+            // its own sws conversion to RGB24 for PNG.
+            int avfmt = AV_PIX_FMT_RGBA;
+            const SDL_PixelFormatDetails* d = SDL_GetPixelFormatDetails(surf->format);
+            if (d) {
+                switch (surf->format) {
+                    case SDL_PIXELFORMAT_RGBA32:  avfmt = AV_PIX_FMT_RGBA; break;
+                    case SDL_PIXELFORMAT_BGRA32:  avfmt = AV_PIX_FMT_BGRA; break;
+                    case SDL_PIXELFORMAT_ARGB32:  avfmt = AV_PIX_FMT_ARGB; break;
+                    case SDL_PIXELFORMAT_ABGR32:  avfmt = AV_PIX_FMT_ABGR; break;
+                    case SDL_PIXELFORMAT_XRGB8888:avfmt = AV_PIX_FMT_0RGB; break;
+                    case SDL_PIXELFORMAT_XBGR8888:avfmt = AV_PIX_FMT_0BGR; break;
+                    case SDL_PIXELFORMAT_RGBX8888:avfmt = AV_PIX_FMT_RGB0; break;
+                    case SDL_PIXELFORMAT_BGRX8888:avfmt = AV_PIX_FMT_BGR0; break;
+                    case SDL_PIXELFORMAT_RGB24:   avfmt = AV_PIX_FMT_RGB24; break;
+                    case SDL_PIXELFORMAT_BGR24:   avfmt = AV_PIX_FMT_BGR24; break;
+                    default:                      avfmt = AV_PIX_FMT_RGBA; break;
+                }
+            }
+            ok = VideoPlayer::snapshotFromBytes(full, surf->w, surf->h,
+                                                avfmt, surf->pitch,
+                                                (const uint8_t*)surf->pixels);
+            SDL_DestroySurface(surf);
+        }
+    } else {
+        ok = player_->snapshot(full);
+    }
+    if (ok) {
         snapshot_flash_ = 1.0f;
-        showOsd(std::string("Saved  ") + name);
+        // Suppress the per-file "Saved <path>" OSD while a burst is in
+        // progress - the burst tick shows a "Burst N/M" progress toast
+        // instead so the OSD stack doesn't balloon.
+        if (burst_remaining_ == 0) {
+            showOsd(std::string("Saved  ") + name);
+        }
     } else {
         showOsd("Snapshot failed");
     }
@@ -854,6 +1169,9 @@ void UIController::closeCurrent() {
     subtitle_cache_idx_     = 0;
     subtitle_tracks_.clear();
     subtitle_track_active_  = -1;
+    subtitles_secondary_.clear();
+    subtitle_secondary_cache_idx_ = 0;
+    subtitle_secondary_track_active_ = -1;
     loop_a_ = -1.0;
     loop_b_ = -1.0;
     chapters_.clear();
@@ -862,7 +1180,7 @@ void UIController::closeCurrent() {
     // so the top-overlay quality pill disappears.
     current_yt_source_url_.clear();
     if (thumb_provider_) thumb_provider_->close();
-    SDL_SetWindowTitle(window_, "Vela");
+    SDL_SetWindowTitle(window_, "Banana Player");
     showOsd("Closed");
     nudgeVisible();
 }
@@ -976,6 +1294,56 @@ bool UIController::loadSubtitleSidecar(const std::string& path) {
     return true;
 }
 
+bool UIController::loadSubtitleSidecarSecondary(const std::string& path) {
+    // Same parser plumbing as loadSubtitleSidecar - it just lands in
+    // subtitles_secondary_ instead. Used by the dual-subtitle workflow
+    // (learn-a-language: primary in native tongue, secondary in target).
+    if (path.empty()) return false;
+    std::string utf8 = decodeSubtitleFileToUtf8(path);
+    std::string ext = path.size() >= 4 ? path.substr(path.size() - 4) : "";
+    for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
+    std::vector<SubtitleCue> cues;
+    if (ext == ".srt") cues = parseSRT(utf8);
+    else               cues = parseSMI(utf8);
+    if (cues.empty()) return false;
+    subtitles_secondary_ = std::move(cues);
+    subtitle_secondary_cache_idx_ = 0;
+    return true;
+}
+
+const SubtitleCue* UIController::currentSubtitleSecondary(double t) {
+    // Mirror of currentSubtitle() operating on subtitles_secondary_.
+    // Keeps its own cache index so a mid-scan of one track doesn't
+    // invalidate the linear-skip optimization on the other.
+    if (subtitles_secondary_.empty()) return nullptr;
+    t -= subtitle_offset_;
+    auto in = [](const SubtitleCue& c, double t) {
+        return t >= c.start && t <= c.end;
+    };
+    if (subtitle_secondary_cache_idx_ >= 0
+        && subtitle_secondary_cache_idx_ < (int)subtitles_secondary_.size()
+        && in(subtitles_secondary_[subtitle_secondary_cache_idx_], t)) {
+        return &subtitles_secondary_[subtitle_secondary_cache_idx_];
+    }
+    int idx = subtitle_secondary_cache_idx_;
+    if (idx < 0) idx = 0;
+    for (int i = idx; i < (int)subtitles_secondary_.size(); ++i) {
+        if (in(subtitles_secondary_[i], t)) {
+            subtitle_secondary_cache_idx_ = i;
+            return &subtitles_secondary_[i];
+        }
+        if (subtitles_secondary_[i].start > t + 0.1) break;
+    }
+    // Fallback: full scan (backward jump / seek).
+    for (int i = 0; i < (int)subtitles_secondary_.size(); ++i) {
+        if (in(subtitles_secondary_[i], t)) {
+            subtitle_secondary_cache_idx_ = i;
+            return &subtitles_secondary_[i];
+        }
+    }
+    return nullptr;
+}
+
 void UIController::openSubtitleDialog() {
     if (!player_->isLoaded()) {
         showOsd("No video loaded");
@@ -1063,6 +1431,655 @@ void UIController::cycleSubtitleSize() {
     markConfigDirty();
 }
 
+void UIController::resetVideoZoomPan() {
+    video_zoom_  = 1.0f;
+    video_pan_x_ = 0.0f;
+    video_pan_y_ = 0.0f;
+    video_panning_ = false;
+}
+
+// Local helper: pick the currently-visible subtitle text (primary preferred,
+// fall back to secondary). Returns an empty string when nothing is on screen.
+static std::string pickVisibleSubtitleText(UIController* ui,
+                                           VideoPlayer* player,
+                                           const std::vector<SubtitleCue>* pri,
+                                           const std::vector<SubtitleCue>* sec) {
+    (void)ui;
+    if (!player || !player->isLoaded()) return {};
+    double t = player->getCurrentTime();
+    auto scan = [&](const std::vector<SubtitleCue>* cues) -> const SubtitleCue* {
+        if (!cues || cues->empty()) return nullptr;
+        for (const auto& c : *cues) {
+            if (t >= c.start && t < c.end) return &c;
+        }
+        return nullptr;
+    };
+    if (const SubtitleCue* c = scan(pri)) return c->text;
+    if (const SubtitleCue* c = scan(sec)) return c->text;
+    return {};
+}
+
+// URL-encode a UTF-8 string for use in a query parameter. Only reserved
+// characters get percent-encoded; everything else passes through.
+static std::string urlEncode(const std::string& s) {
+    static const char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size() * 3);
+    for (unsigned char c : s) {
+        bool safe = (c >= '0' && c <= '9')
+                 || (c >= 'A' && c <= 'Z')
+                 || (c >= 'a' && c <= 'z')
+                 || c == '-' || c == '_' || c == '.' || c == '~';
+        if (safe) out.push_back((char)c);
+        else {
+            out.push_back('%');
+            out.push_back(kHex[(c >> 4) & 0xF]);
+            out.push_back(kHex[c & 0xF]);
+        }
+    }
+    return out;
+}
+
+void UIController::copyCurrentSubtitleToClipboard() {
+    std::string text = pickVisibleSubtitleText(this, player_,
+                            &subtitles_, &subtitles_secondary_);
+    if (text.empty()) { showOsd("No subtitle on screen", 1.4f); return; }
+    // Convert UTF-8 to UTF-16 for CF_UNICODETEXT.
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
+    if (wlen <= 0) { showOsd("Clipboard copy failed", 1.6f); return; }
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (SIZE_T)wlen * sizeof(wchar_t));
+    if (!h) { showOsd("Clipboard copy failed", 1.6f); return; }
+    wchar_t* p = (wchar_t*)GlobalLock(h);
+    if (!p) { GlobalFree(h); showOsd("Clipboard copy failed", 1.6f); return; }
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, p, wlen);
+    GlobalUnlock(h);
+    if (!OpenClipboard(nullptr)) { GlobalFree(h); showOsd("Clipboard busy", 1.6f); return; }
+    EmptyClipboard();
+    if (!SetClipboardData(CF_UNICODETEXT, h)) {
+        GlobalFree(h);
+    }
+    // On success, clipboard owns h - do NOT free.
+    CloseClipboard();
+    showOsd("Subtitle copied to clipboard", 1.4f);
+}
+
+void UIController::lookupCurrentSubtitleInBrowser() {
+    std::string text = pickVisibleSubtitleText(this, player_,
+                            &subtitles_, &subtitles_secondary_);
+    if (text.empty()) { showOsd("No subtitle on screen", 1.4f); return; }
+    // Collapse embedded newlines / carriage returns to spaces so the
+    // URL doesn't break on multi-line cues.
+    for (char& c : text) if (c == '\n' || c == '\r') c = ' ';
+    std::string url = "https://www.google.com/search?q=" + urlEncode(text);
+    ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    showOsd("Opening browser lookup", 1.4f);
+}
+
+// Compute the OpenSubtitles 64-bit movie hash for a local file. Returns
+// 0 on any I/O failure. The algorithm: hash = file_size + sum of the
+// first 64 KB (as uint64le) + sum of the last 64 KB (as uint64le).
+// Files smaller than 128 KB return 0 (the algorithm requires 64 KB at
+// each end).
+static uint64_t openSubtitlesHash(const std::string& path) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return 0;
+    if (std::fseek(f, 0, SEEK_END) != 0) { std::fclose(f); return 0; }
+    long size_l = std::ftell(f);
+    if (size_l < 131072) { std::fclose(f); return 0; }
+    uint64_t size = (uint64_t)size_l;
+    uint64_t h = size;
+    auto sumChunk = [&](long offset) -> bool {
+        if (std::fseek(f, offset, SEEK_SET) != 0) return false;
+        uint64_t buf[8192];   // 64 KB
+        if (std::fread(buf, 1, sizeof(buf), f) != sizeof(buf)) return false;
+        for (int i = 0; i < 8192; ++i) h += buf[i];   // LE machine assumed
+        return true;
+    };
+    if (!sumChunk(0) || !sumChunk(size_l - 65536)) {
+        std::fclose(f); return 0;
+    }
+    std::fclose(f);
+    return h;
+}
+
+void UIController::searchSubtitlesOnline() {
+    if (!player_->isLoaded()) { showOsd("No video loaded"); return; }
+    const std::string& src = player_->getFilename();
+    if (src.empty()) { showOsd("No source path"); return; }
+    // For remote / stream sources we can't compute a hash - just fall
+    // back to name-only search.
+    std::string base = baseName(src.c_str());
+    size_t dot = base.find_last_of('.');
+    std::string stem = (dot != std::string::npos) ? base.substr(0, dot) : base;
+
+    uint64_t hash = openSubtitlesHash(src);
+    char hash_hex[32];
+    hash_hex[0] = '\0';
+    if (hash != 0) {
+        std::snprintf(hash_hex, sizeof(hash_hex), "%016llx",
+                      (unsigned long long)hash);
+    }
+
+    // The public search page accepts both the query text and the
+    // moviehash parameter. Users pick their language + download the
+    // .srt; dragging it onto Vela loads it via the existing drop
+    // handler. No API key, no rate limits, no bundled HTTP client.
+    std::string url = "https://www.opensubtitles.com/en/search-all?q="
+                    + urlEncode(stem);
+    if (hash_hex[0]) {
+        url += "&MovieHash=";
+        url += hash_hex;
+    }
+    ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    if (hash_hex[0]) {
+        showOsd("Opened OpenSubtitles (hash matched)", 2.0f);
+    } else {
+        showOsd("Opened OpenSubtitles (name search)", 2.0f);
+    }
+}
+
+void UIController::exportABSegmentAsGif() {
+    if (!player_->isLoaded()) { showOsd("No video loaded"); return; }
+    if (loop_a_ < 0.0 || loop_b_ < 0.0) {
+        showOsd("Set A and B first (press A twice)", 2.0f); return;
+    }
+    // GIF encoding via palettegen holds every scaled frame in memory
+    // for palette-full stats. Cap at 20 s so a mis-set A-B doesn't
+    // pin gigabytes of RAM. Users who want longer GIFs can chain a few.
+    double dur = loop_b_ - loop_a_;
+    if (dur > 20.0) {
+        showOsd("Cap GIF export at 20s (trim A-B)", 2.4f); return;
+    }
+    if (dur < 0.10) {
+        showOsd("A-B segment too short", 1.6f); return;
+    }
+    const std::string& src = player_->getFilename();
+    if (src.empty()) { showOsd("No source path"); return; }
+    std::string base = baseName(src.c_str());
+    size_t dot = base.find_last_of('.');
+    std::string stem = (dot != std::string::npos) ? base.substr(0, dot) : base;
+    char suggest[MAX_PATH];
+    std::snprintf(suggest, sizeof(suggest), "%s_clip_%d-%d.gif",
+                  stem.c_str(),
+                  (int)std::lround(loop_a_),
+                  (int)std::lround(loop_b_));
+
+    OPENFILENAMEA ofn = {};
+    char out_path[MAX_PATH];
+    std::strncpy(out_path, suggest, sizeof(out_path) - 1);
+    out_path[sizeof(out_path) - 1] = '\0';
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFile   = out_path;
+    ofn.nMaxFile    = sizeof(out_path);
+    ofn.lpstrFilter = "Animated GIF (*.gif)\0*.gif\0All Files (*.*)\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.lpstrDefExt = "gif";
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT
+              | OFN_NOCHANGEDIR | OFN_EXPLORER;
+    ofn.lpstrTitle = "Save A-B segment as GIF...";
+    if (!GetSaveFileNameA(&ofn)) return;
+
+    showOsd("Exporting GIF...", 3.0f);
+    // Palettegen + paletteuse is slow enough that a UI freeze is
+    // noticeable; the OSD above at least warns the user. 15 fps and
+    // 480 px width are the standard reddit-clip defaults - readable,
+    // reasonable file size, doesn't scare the browser upload dialog.
+    bool ok = VideoPlayer::exportSegmentAsGif(src, out_path,
+                                              loop_a_, loop_b_,
+                                              /*fps=*/15, /*width=*/480);
+    if (ok) {
+        char msg[MAX_PATH + 32];
+        std::snprintf(msg, sizeof(msg), "GIF saved  %s", baseName(out_path));
+        showOsd(msg, 2.6f);
+    } else {
+        showOsd("GIF export failed", 2.4f);
+    }
+}
+
+void UIController::exportABSegmentToFile() {
+    if (!player_->isLoaded()) { showOsd("No video loaded"); return; }
+    if (loop_a_ < 0.0 || loop_b_ < 0.0) {
+        showOsd("Set A and B first (press A twice)", 2.0f);
+        return;
+    }
+    if (loop_b_ - loop_a_ < 0.10) {
+        showOsd("A-B segment too short", 1.6f);
+        return;
+    }
+
+    // Suggest a filename based on the source basename + timestamps.
+    const std::string& src = player_->getFilename();
+    if (src.empty()) { showOsd("No source path"); return; }
+    std::string base = baseName(src.c_str());
+    // Strip extension for the default name suggestion.
+    size_t dot = base.find_last_of('.');
+    std::string stem = (dot != std::string::npos) ? base.substr(0, dot) : base;
+    // Preserve source extension so the muxer keeps the same container.
+    std::string ext = (dot != std::string::npos) ? base.substr(dot) : ".mp4";
+    char suggest[MAX_PATH];
+    std::snprintf(suggest, sizeof(suggest), "%s_clip_%d-%d%s",
+                  stem.c_str(),
+                  (int)std::lround(loop_a_),
+                  (int)std::lround(loop_b_),
+                  ext.c_str());
+
+    OPENFILENAMEA ofn = {};
+    char out_path[MAX_PATH];
+    std::strncpy(out_path, suggest, sizeof(out_path) - 1);
+    out_path[sizeof(out_path) - 1] = '\0';
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFile   = out_path;
+    ofn.nMaxFile    = sizeof(out_path);
+    ofn.lpstrFilter =
+        "Video (*.mp4;*.mkv;*.mov)\0*.mp4;*.mkv;*.mov\0"
+        "All Files (*.*)\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT
+              | OFN_NOCHANGEDIR | OFN_EXPLORER;
+    ofn.lpstrTitle = "Save A-B segment as...";
+    if (!GetSaveFileNameA(&ofn)) return;   // user cancelled
+
+    showOsd("Exporting A-B segment...", 3.0f);
+    // Synchronous - typical stream copy is fast (100 MB/s+ on SSD) so
+    // this stalls the UI for a second or two on ordinary clips. Users
+    // see the "Exporting..." OSD until the OK/fail toast replaces it.
+    bool ok = VideoPlayer::exportSegment(src, out_path, loop_a_, loop_b_);
+    if (ok) {
+        char msg[MAX_PATH + 32];
+        std::snprintf(msg, sizeof(msg), "Saved  %s", baseName(out_path));
+        showOsd(msg, 2.6f);
+    } else {
+        showOsd("Export failed", 2.4f);
+    }
+}
+
+void UIController::openSnapshotFolderDialog() {
+    // Classic SHBrowseForFolder - modern IFileOpenDialog is nicer but
+    // needs full COM plumbing. This dialog is used once in a blue moon,
+    // so keep it lean.
+    BROWSEINFOA bi{};
+    bi.hwndOwner = nullptr;
+    bi.lpszTitle = "Choose the folder Banana Player snapshots should land in";
+    bi.ulFlags   = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
+    if (!pidl) return;   // user cancelled
+    char picked[MAX_PATH]{};
+    if (SHGetPathFromIDListA(pidl, picked)) {
+        DWORD attrs = GetFileAttributesA(picked);
+        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            snapshot_dir_ = picked;
+            char msg[MAX_PATH + 32];
+            std::snprintf(msg, sizeof(msg), "Snapshots -> %s", picked);
+            showOsd(msg, 2.4f);
+            markConfigDirty();
+        } else {
+            showOsd("Selected path is not a directory", 2.0f);
+        }
+    }
+    CoTaskMemFree(pidl);
+}
+
+void UIController::openSubtitleSearch() {
+    if (subtitles_.empty() && subtitles_secondary_.empty()) {
+        showOsd("No subtitles to search", 1.4f);
+        return;
+    }
+    show_subtitle_search_ = true;
+    subtitle_search_focus_next_ = true;
+}
+
+void UIController::runSubtitleSearchStep(int direction) {
+    // Case-insensitive substring search across subtitles_ AND
+    // subtitles_secondary_, in cue-start order. direction: +1 forward,
+    // -1 backward. Wraps at ends. Seeks to the found cue's start.
+    if (subtitle_search_query_[0] == '\0') return;
+    // Merge cues from both tracks tagged with (kind, index) so we can
+    // step forward/backward through combined timeline order.
+    struct H { double start; std::string text; };
+    std::vector<H> all;
+    all.reserve(subtitles_.size() + subtitles_secondary_.size());
+    for (const auto& c : subtitles_)           all.push_back({c.start, c.text});
+    for (const auto& c : subtitles_secondary_) all.push_back({c.start, c.text});
+    if (all.empty()) return;
+    std::sort(all.begin(), all.end(),
+              [](const H& a, const H& b){ return a.start < b.start; });
+
+    std::string q(subtitle_search_query_);
+    for (auto& c : q) c = (char)std::tolower((unsigned char)c);
+
+    auto lc = [](std::string s) {
+        for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+        return s;
+    };
+
+    int n = (int)all.size();
+    int start = subtitle_search_last_hit_;
+    if (start < 0 || start >= n) start = -1;
+    for (int step = 1; step <= n; ++step) {
+        int i = (start + step * direction + n) % n;
+        if (lc(all[i].text).find(q) != std::string::npos) {
+            subtitle_search_last_hit_ = i;
+            player_->seek(all[i].start);
+            char buf[64]; std::snprintf(buf, sizeof(buf),
+                                        "Sub match at %s",
+                                        formatTime(all[i].start).c_str());
+            showOsd(buf, 1.4f);
+            return;
+        }
+    }
+    showOsd("No match", 1.2f);
+}
+
+void UIController::drawSubtitleSearchPanel(int W, int H) {
+    if (!show_subtitle_search_) return;
+    // Small centered floating panel: text input + Prev/Next buttons +
+    // hint line. Sits above the video, below the top overlay so it
+    // doesn't hide the seek bar.
+    const float panel_w = 380.0f;
+    const float panel_h = 90.0f;
+    ImGui::SetNextWindowPos(ImVec2((W - panel_w) * 0.5f,
+                                    H * 0.20f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(panel_w, panel_h), ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.0f);
+    if (ImGui::Begin("##subsearch", nullptr,
+                     ImGuiWindowFlags_NoTitleBar
+                     | ImGuiWindowFlags_NoResize
+                     | ImGuiWindowFlags_NoCollapse
+                     | ImGuiWindowFlags_NoScrollbar)) {
+        if (subtitle_search_focus_next_) {
+            ImGui::SetKeyboardFocusHere();
+            subtitle_search_focus_next_ = false;
+        }
+        ImGui::SetNextItemWidth(-1.0f);
+        bool submitted = ImGui::InputTextWithHint(
+                            "##sq", "Search subtitle text (Enter = next)",
+                            subtitle_search_query_,
+                            sizeof(subtitle_search_query_),
+                            ImGuiInputTextFlags_EnterReturnsTrue);
+        if (submitted) runSubtitleSearchStep(+1);
+        if (ImGui::Button("< Prev", ImVec2(80, 26))) runSubtitleSearchStep(-1);
+        ImGui::SameLine();
+        if (ImGui::Button("Next >", ImVec2(80, 26))) runSubtitleSearchStep(+1);
+        ImGui::SameLine();
+        if (ImGui::Button("Close", ImVec2(80, 26))) show_subtitle_search_ = false;
+        ImGui::TextDisabled("Ctrl+F to open  .  Esc to close");
+    }
+    ImGui::End();
+    ImGui::PopStyleVar();
+}
+
+void UIController::triggerBurstSnapshot() {
+    if (!player_->isLoaded()) { showOsd("No video loaded"); return; }
+    if (burst_remaining_ > 0) {
+        // A second press mid-burst cancels the remaining shots. Nice
+        // escape hatch if the user realizes they mistimed the trigger.
+        burst_remaining_ = 0;
+        burst_next_at_   = 0.0f;
+        showOsd("Burst cancelled", 1.2f);
+        return;
+    }
+    burst_remaining_ = burst_count_;
+    burst_next_at_   = 0.0f;   // first shot on the next tick
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "Burst %d x %.1fs",
+                  burst_count_, burst_interval_);
+    showOsd(buf, 1.6f);
+}
+
+void UIController::cycleSubtitleTrack() {
+    int n = (int)subtitle_tracks_.size();
+    if (n == 0) { showOsd("No subtitle files found", 1.4f); return; }
+    if (n == 1) { showOsd("Only one subtitle track", 1.4f); return; }
+    int next = (subtitle_track_active_ + 1) % n;
+    if (loadSubtitleSidecar(subtitle_tracks_[next].path)) {
+        subtitle_track_active_ = next;
+        subtitles_enabled_ = true;
+        char buf[192];
+        std::snprintf(buf, sizeof(buf), "Subs: %s",
+                      subtitle_tracks_[next].label.c_str());
+        showOsd(buf, 1.6f);
+    } else {
+        showOsd("Subtitle load failed", 2.0f);
+    }
+}
+
+void UIController::cycleAudioTrack() {
+    if (!player_ || !player_->isLoaded()) return;
+    int n = player_->getAudioTrackCount();
+    if (n <= 1) {
+        showOsd(n == 0 ? "No audio track" : "Only one audio track", 1.4f);
+        return;
+    }
+    int cur  = player_->getCurrentAudioTrackIndex();
+    int next = (cur < 0) ? 0 : ((cur + 1) % n);
+    if (!player_->setAudioTrack(next)) {
+        showOsd("Failed to switch audio track", 1.6f);
+        return;
+    }
+    std::string name = player_->getAudioTrackName(next);
+    if (name.empty()) {
+        char buf[64]; std::snprintf(buf, sizeof(buf), "Audio track %d / %d", next + 1, n);
+        showOsd(buf, 1.8f);
+    } else {
+        // Trim any trailing extra info to keep the OSD short.
+        showOsd(name.c_str(), 1.8f);
+    }
+}
+
+void UIController::togglePipMode() {
+    if (!window_) return;
+    if (fullscreen_
+        || (SDL_GetWindowFlags(window_) & SDL_WINDOW_FULLSCREEN) != 0) {
+        showOsd("Not while fullscreen");
+        return;
+    }
+    if (pip_active_) {
+        // Exit PiP: restore geometry, always-on-top state, and the
+        // 640x400 minimum size gate. Un-maximized state restored only
+        // if we found the window maximized on entry (kept the mode).
+        SDL_SetWindowMinimumSize(window_, 640, 400);
+        SDL_SetWindowSize(window_, pip_saved_w_, pip_saved_h_);
+        SDL_SetWindowPosition(window_, pip_saved_x_, pip_saved_y_);
+        SDL_SetWindowAlwaysOnTop(window_, pip_saved_always_on_top_);
+        always_on_top_ = pip_saved_always_on_top_;
+        if (pip_was_maximized_) SDL_MaximizeWindow(window_);
+        pip_active_ = false;
+        showOsd("Picture in picture off");
+        return;
+    }
+    // Enter PiP: remember current window state, then shrink + pin.
+    SDL_WindowFlags flags = SDL_GetWindowFlags(window_);
+    pip_was_maximized_ = (flags & SDL_WINDOW_MAXIMIZED) != 0;
+    if (pip_was_maximized_) SDL_RestoreWindow(window_);
+    SDL_GetWindowPosition(window_, &pip_saved_x_, &pip_saved_y_);
+    SDL_GetWindowSize(window_, &pip_saved_w_, &pip_saved_h_);
+    pip_saved_always_on_top_ = always_on_top_;
+
+    // Compact size honoring the current video aspect (post-rotation).
+    // Falls back to 480x270 if no video is loaded.
+    int target_w = 480, target_h = 270;
+    if (player_ && player_->isLoaded()) {
+        int vw = player_->getVideoWidth();
+        int vh = player_->getVideoHeight();
+        if (vw > 0 && vh > 0) {
+            int total = ((player_->getIntrinsicRotation()
+                          + ((int)rotation_ * 90)) % 360 + 360) % 360;
+            bool rot90 = (total == 90 || total == 270);
+            int ew = rot90 ? vh : vw;
+            int eh = rot90 ? vw : vh;
+            const int kPipTargetLong = 480;
+            if (ew >= eh) {
+                target_w = kPipTargetLong;
+                target_h = std::max(180, (int)((double)eh * kPipTargetLong / ew));
+            } else {
+                target_h = kPipTargetLong;
+                target_w = std::max(180, (int)((double)ew * kPipTargetLong / eh));
+            }
+        }
+    }
+    // Lower the minimum-size gate so 480px width actually applies -
+    // the ctor-installed 640x400 clamp would otherwise reject the resize.
+    SDL_SetWindowMinimumSize(window_, 240, 160);
+    SDL_SetWindowSize(window_, target_w, target_h);
+
+    // Place in the bottom-right of the display's usable bounds with a
+    // small margin so it doesn't sit under the taskbar.
+    SDL_DisplayID disp = SDL_GetDisplayForWindow(window_);
+    if (disp == 0) disp = SDL_GetPrimaryDisplay();
+    SDL_Rect bounds{};
+    if (SDL_GetDisplayUsableBounds(disp, &bounds)) {
+        const int margin = 24;
+        SDL_SetWindowPosition(window_,
+            bounds.x + bounds.w - target_w - margin,
+            bounds.y + bounds.h - target_h - margin);
+    }
+
+    SDL_SetWindowAlwaysOnTop(window_, true);
+    always_on_top_ = true;
+    pip_active_ = true;
+    showOsd("Picture in picture", 1.6f);
+}
+
+void UIController::toggleHdrToneMap() {
+    hdr_tonemap_enabled_ = !hdr_tonemap_enabled_;
+    if (player_) {
+        player_->setHdrToneMapEnabled(hdr_tonemap_enabled_);
+        // Flush already-decoded frames so the toggle is visible right
+        // away instead of after the ~8-frame video queue drains.
+        if (player_->isLoaded()
+            && player_->getHdrKind() != VideoPlayer::HdrKind::None) {
+            player_->seekRelative(0.0);
+        }
+    }
+    if (player_ && player_->getHdrKind() != VideoPlayer::HdrKind::None) {
+        showOsd(hdr_tonemap_enabled_
+                    ? "HDR tone map on"
+                    : "HDR tone map off (native passthrough)", 1.6f);
+    } else {
+        showOsd(hdr_tonemap_enabled_
+                    ? "HDR tone map on (no HDR file loaded)"
+                    : "HDR tone map off (no HDR file loaded)", 1.6f);
+    }
+    markConfigDirty();
+}
+
+void UIController::drawAutoNextOverlay(int W, int H) {
+    if (!auto_next_active_) return;
+    // Sit a compact panel in the top-right corner (out of the way of
+    // the video's central content and the bottom overlay). Sized so
+    // the two buttons fit at min-window (640 wide).
+    const float pad_x = 12.0f;
+    const float pad_y = 10.0f;
+    const float panel_w = 320.0f;
+    const float panel_h = 100.0f;
+    float x = (float)W - panel_w - 16.0f;
+    float y = 16.0f;
+    if (x < 8.0f) x = 8.0f;
+
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    dl->AddRectFilled(ImVec2(x + 2, y + 5),
+                      ImVec2(x + panel_w + 2, y + panel_h + 5),
+                      IM_COL32(0, 0, 0, 120), 8.0f);
+    dl->AddRectFilled(ImVec2(x, y),
+                      ImVec2(x + panel_w, y + panel_h),
+                      IM_COL32(18, 24, 34, 235), 8.0f);
+    dl->AddRect(ImVec2(x, y),
+                ImVec2(x + panel_w, y + panel_h),
+                IM_COL32(96, 176, 246, 180), 8.0f, 0, 1.5f);
+
+    ImFont* font = ImGui::GetFont();
+    int secs_left = (int)std::ceil(auto_next_secs_);
+    if (secs_left < 1) secs_left = 1;
+    char head[64];
+    std::snprintf(head, sizeof(head), "Next in %d ...", secs_left);
+    dl->AddText(font, 16.0f, ImVec2(x + pad_x, y + pad_y),
+                IM_COL32(220, 230, 250, 255), head);
+    dl->AddText(font, 12.0f, ImVec2(x + pad_x, y + pad_y + 22.0f),
+                IM_COL32(170, 182, 205, 220),
+                "Playlist finished this item.");
+
+    // Buttons row at bottom.
+    float bw = 88.0f, bh = 26.0f;
+    float row_y = y + panel_h - pad_y - bh + 4.0f;
+    ImGui::SetCursorScreenPos(ImVec2(x + pad_x, row_y));
+    ImGui::PushID("##autonext_skip");
+    if (Style::TextButton("Play now", ImVec2(bw, bh), true)) {
+        auto_next_active_ = false;
+        auto_next_secs_   = 0.0f;
+        handleNaturalEndImmediate();
+    }
+    ImGui::PopID();
+    ImGui::SetCursorScreenPos(ImVec2(x + pad_x + bw + 8.0f, row_y));
+    ImGui::PushID("##autonext_cancel");
+    if (Style::TextButton("Cancel", ImVec2(bw, bh), false)) {
+        cancelAutoNext();
+    }
+    ImGui::PopID();
+}
+
+void UIController::drawFirstRunHint(int W, int H) {
+    if (!first_run_hint_pending_) return;
+    // Suppress once a file loads - the user is on their way, no need
+    // for the banner. `saveConfig` on quit still writes first_run_done=1
+    // so the banner never comes back on the next launch.
+    if (player_ && player_->isLoaded()) return;
+
+    // Sit a modest floating panel at the bottom center of the splash,
+    // above the version footer, wide enough for the four tip lines but
+    // clamped to the window so 640x400 layouts don't clip.
+    const float pad = 14.0f;
+    float panel_w = std::min((float)W * 0.90f, 560.0f);
+    float panel_h = 152.0f;
+    float x = ((float)W - panel_w) * 0.5f;
+    float y = (float)H * 0.72f;
+    // Never overlap the splash version footer at the very bottom.
+    if (y + panel_h > (float)H - 40.0f) y = (float)H - 40.0f - panel_h;
+    if (y < 20.0f) y = 20.0f;
+
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    // Drop shadow.
+    dl->AddRectFilled(ImVec2(x + 2, y + 6),
+                      ImVec2(x + panel_w + 2, y + panel_h + 6),
+                      IM_COL32(0, 0, 0, 120), 10.0f);
+    // Panel body - slightly warm-dark so it reads as "helpful" not
+    // "error"; banana-yellow hairline border keeps it on-brand.
+    dl->AddRectFilled(ImVec2(x, y),
+                      ImVec2(x + panel_w, y + panel_h),
+                      IM_COL32(26, 22, 16, 245), 10.0f);
+    dl->AddRect(ImVec2(x, y),
+                ImVec2(x + panel_w, y + panel_h),
+                IM_COL32(255, 201, 58, 200), 10.0f, 0, 1.5f);
+
+    ImFont* font = ImGui::GetFont();
+    float hy = y + pad;
+    dl->AddText(font, 17.0f, ImVec2(x + pad, hy),
+                IM_COL32(255, 222, 122, 255), "Welcome to Banana Player");
+    hy += 22.0f;
+    const char* tips[] = {
+        "Drop any video / image onto the window to play it",
+        "Right-click on the picture for the full menu",
+        "Click the gear icon (or Ctrl+,) to open Settings",
+        "F1 or ?  to see every keyboard shortcut",
+    };
+    for (const char* t : tips) {
+        dl->AddText(font, 13.5f, ImVec2(x + pad, hy),
+                    IM_COL32(220, 230, 250, 240), t);
+        hy += 18.0f;
+    }
+
+    // "Got it" dismiss button at bottom-right of the panel.
+    float bw = 90.0f, bh = 26.0f;
+    float bx = x + panel_w - pad - bw;
+    float by = y + panel_h - pad - bh + 4.0f;
+    ImGui::SetCursorScreenPos(ImVec2(bx, by));
+    ImGui::PushID("##firstrun_dismiss");
+    if (Style::TextButton("Got it", ImVec2(bw, bh), true)) {
+        first_run_hint_pending_ = false;
+        markConfigDirty();
+    }
+    ImGui::PopID();
+}
+
 void UIController::drawShortcutsPanel(int W, int H) {
     if (!show_shortcuts_) return;
 
@@ -1132,6 +2149,8 @@ void UIController::drawShortcutsPanel(int W, int H) {
             { "Ctrl + Shift + 0",          "Reset subtitle sync" },
         }},
         { "Audio", {
+            { "Ctrl + A",        "Cycle audio track" },
+            { "Media keys",      "Play/Pause  Stop  Next  Prev  (window focused)" },
             { "Up  /  Down",     "Volume +/- 5 %  (up to 200 %)" },
             { "Mouse wheel",     "Volume (over video)" },
             { "M",               "Mute" },
@@ -1146,7 +2165,7 @@ void UIController::drawShortcutsPanel(int W, int H) {
             { "Ctrl + Shift + O","Open folder..." },
             { "Ctrl + V",        "Paste URL or path from clipboard and play" },
             { "Ctrl + W",        "Close current file" },
-            { "Ctrl + S",        "Snapshot (PNG next to Vela.exe)" },
+            { "Ctrl + S",        "Snapshot (PNG next to the app)" },
             { "Ctrl + Shift + S","Snapshot to clipboard" },
             { "0 - 9",           "Jump to 0 - 90 % of the file" },
             { "Delete",          "Remove item from playlist (panel open)" },
@@ -1158,13 +2177,23 @@ void UIController::drawShortcutsPanel(int W, int H) {
             { "P",               "Toggle playlist panel" },
             { "L",               "Cycle repeat: Off / One / All" },
             { "H",               "Shuffle" },
-            { "S  /  G",         "Toggle subs  /  cycle sub size" },
+            { "S  /  G  /  J",   "Toggle subs  /  cycle size  /  cycle track" },
+            { "Ctrl + F",        "Search subtitle text" },
+            { "Ctrl + Shift + G","Burst screenshot (N shots)" },
             { "B",               "Toggle subtitle background box" },
             { "Alt + Up/Down/0", "Raise / lower / reset subtitle position" },
             { "Drop a file",     "Play immediately" },
         }},
         { "View", {
             { "Ctrl + R",        "Rotate 90 deg CW" },
+            { "Ctrl + Wheel",    "Video zoom in / out" },
+            { "Alt + Drag",      "Pan video (when zoomed)" },
+            { "Alt + 0",         "Reset zoom / pan" },
+            { "Shift + H",       "HDR tone map on / off (HDR files only)" },
+            { "Shift + P",       "Picture-in-picture toggle" },
+            { "Ctrl + ,",        "Settings dialog" },
+            { "Ctrl + H",        "Playback history" },
+            { "I",               "Media info panel" },
             { "?  /  F1",        "Show this panel" },
         }},
     };
@@ -1211,38 +2240,54 @@ void UIController::drawAboutPanel(int W, int H) {
     ImVec2 br(tl.x + pw, tl.y + ph);
 
     // Soft shadow beneath the panel + subtle inner-glow border for lift.
+    // Warm-dark panel with banana-yellow hairline border for brand echo.
     bg->AddRectFilled(ImVec2(tl.x - 3, tl.y - 3), ImVec2(br.x + 3, br.y + 6),
                       IM_COL32(0, 0, 0, 90), 16.0f);
-    bg->AddRectFilled(tl, br, IM_COL32(14, 18, 30, 246), 14.0f);
-    bg->AddRect(tl, br, IM_COL32(96, 176, 246, 140), 14.0f, 0, 1.0f);
+    bg->AddRectFilled(tl, br, IM_COL32(24, 20, 14, 246), 14.0f);
+    bg->AddRect(tl, br, IM_COL32(255, 201, 58, 140), 14.0f, 0, 1.0f);
 
     ImFont* font = ImGui::GetFont();
     float cx = tl.x + pw * 0.5f;
 
-    // Wordmark with a matching accent underline so the About panel echoes
-    // the splash treatment (same brand, same rhythm).
+    // Wordmark with a matching yellow accent underline so the About panel
+    // echoes the splash treatment (same brand, same rhythm). The Banana
+    // Player name is longer than the old VELA so we shrink the display
+    // size accordingly - still clearly the hero on a 480 px panel.
     {
-        const char* wm = "VELA";
-        float sz = 56.0f;
+        const char* wm = "Banana Player";
+        float sz = 34.0f;
         ImVec2 d = font->CalcTextSizeA(sz, FLT_MAX, 0.0f, wm);
-        float wm_y = tl.y + 40.0f;
-        // Faint accent glow + crisp white
+        float wm_y = tl.y + 48.0f;
+        // Faint accent glow + crisp cream.
         bg->AddText(font, sz, ImVec2(cx - d.x * 0.5f + 0.5f, wm_y + 2.0f),
                     IM_COL32(0, 0, 0, 80), wm);
         bg->AddText(font, sz, ImVec2(cx - d.x * 0.5f, wm_y),
-                    IM_COL32(96, 176, 246, 40), wm);
+                    IM_COL32(255, 201, 58, 40), wm);
         bg->AddText(font, sz, ImVec2(cx - d.x * 0.5f, wm_y),
-                    IM_COL32(244, 248, 255, 255), wm);
-        // Accent underline
-        float bar_w = d.x * 0.65f;
+                    IM_COL32(248, 244, 232, 255), wm);
+        // Yellow accent underline.
+        float bar_w = d.x * 0.60f;
         float bar_y = wm_y + sz + 4.0f;
         bg->AddRectFilledMultiColor(
             ImVec2(cx - bar_w * 0.5f, bar_y),
             ImVec2(cx + bar_w * 0.5f, bar_y + 2.0f),
-            IM_COL32( 64, 132, 216,   0),
-            IM_COL32(148, 202, 255, 255),
-            IM_COL32(148, 202, 255, 255),
-            IM_COL32( 64, 132, 216,   0));
+            IM_COL32(227, 154,  28,   0),
+            IM_COL32(255, 222, 122, 255),
+            IM_COL32(255, 222, 122, 255),
+            IM_COL32(227, 154,  28,   0));
+    }
+    // Korean sub-mark: UTF-8 hex escapes for the "banana player" name in
+    // hangul (see docs/BRAND_BANANA.md for the Latinized reading). Source
+    // stays pure ASCII so MSVC doesn't emit C4819 on the Korean-codepage
+    // host; runtime decode happens through the Korean glyph range merged
+    // into the main font atlas in Style::LoadFonts.
+    {
+        const char* wmk = "\xEB\xB0\x94\xEB\x82\x98\xEB\x82\x98 "
+                          "\xED\x94\x8C\xEB\xA0\x88\xEC\x9D\xB4\xEC\x96\xB4";
+        float sz = 15.0f;
+        ImVec2 d = font->CalcTextSizeA(sz, FLT_MAX, 0.0f, wmk);
+        bg->AddText(font, sz, ImVec2(cx - d.x * 0.5f, tl.y + 96.0f),
+                    IM_COL32(210, 195, 160, 220), wmk);
     }
     // Version
     {
@@ -1250,32 +2295,32 @@ void UIController::drawAboutPanel(int W, int H) {
         std::snprintf(v, sizeof(v), "Version %s", VELA_VERSION);
         float sz = 14.0f;
         ImVec2 d = font->CalcTextSizeA(sz, FLT_MAX, 0.0f, v);
-        bg->AddText(font, sz, ImVec2(cx - d.x * 0.5f, tl.y + 110.0f),
-                    IM_COL32(160, 180, 220, 220), v);
+        bg->AddText(font, sz, ImVec2(cx - d.x * 0.5f, tl.y + 128.0f),
+                    IM_COL32(220, 200, 150, 220), v);
     }
     // Stack
     {
         const char* s = "SDL3  .  Dear ImGui  .  FFmpeg";
         float sz = 14.0f;
         ImVec2 d = font->CalcTextSizeA(sz, FLT_MAX, 0.0f, s);
-        bg->AddText(font, sz, ImVec2(cx - d.x * 0.5f, tl.y + 138.0f),
-                    IM_COL32(130, 150, 190, 200), s);
+        bg->AddText(font, sz, ImVec2(cx - d.x * 0.5f, tl.y + 154.0f),
+                    IM_COL32(180, 162, 122, 200), s);
     }
     // Credit / tagline
     {
-        const char* t = "Focused, keyboard-first video playback.";
-        float sz = 14.0f;
+        const char* t = "Peel and play.";
+        float sz = 15.0f;
         ImVec2 d = font->CalcTextSizeA(sz, FLT_MAX, 0.0f, t);
-        bg->AddText(font, sz, ImVec2(cx - d.x * 0.5f, tl.y + 180.0f),
-                    IM_COL32(200, 210, 235, 235), t);
+        bg->AddText(font, sz, ImVec2(cx - d.x * 0.5f, tl.y + 194.0f),
+                    IM_COL32(240, 220, 178, 240), t);
     }
     // Esc hint - matches the Shortcuts / Info modals.
     {
         const char* t = "Press Esc to close";
         float sz = 12.0f;
         ImVec2 d = font->CalcTextSizeA(sz, FLT_MAX, 0.0f, t);
-        bg->AddText(font, sz, ImVec2(cx - d.x * 0.5f, tl.y + 210.0f),
-                    IM_COL32(140, 150, 175, 180), t);
+        bg->AddText(font, sz, ImVec2(cx - d.x * 0.5f, tl.y + 224.0f),
+                    IM_COL32(160, 148, 118, 180), t);
     }
 
     // Close button via ImGui window overlaid at the bottom.
@@ -1425,6 +2470,34 @@ void UIController::drawInfoPanel(int W, int H) {
         }
         row("Size", size_str);
 
+        // Cumulative watch stats for this file. Live-inclusive - shows
+        // the current session's accum too so the number ticks up while
+        // you watch. `sessions` counts how many times the file has been
+        // opened; useful for "have I already seen this?" checks.
+        {
+            PlaybackStats st = getStatsFor(path);
+            double total_sec = st.seconds + stats_accum_this_session_;
+            int    sessions  = st.sessions > 0 ? st.sessions : 1;
+            char watch_buf[128];
+            int  hrs = (int)(total_sec / 3600.0);
+            int  mns = (int)((total_sec - hrs * 3600) / 60.0);
+            int  scs = (int)(total_sec - hrs * 3600 - mns * 60);
+            if (hrs > 0) {
+                std::snprintf(watch_buf, sizeof(watch_buf),
+                              "%dh %dm %ds  x %d sessions",
+                              hrs, mns, scs, sessions);
+            } else if (mns > 0) {
+                std::snprintf(watch_buf, sizeof(watch_buf),
+                              "%dm %ds  x %d sessions",
+                              mns, scs, sessions);
+            } else {
+                std::snprintf(watch_buf, sizeof(watch_buf),
+                              "%ds  x %d sessions",
+                              scs, sessions);
+            }
+            row("Watched", watch_buf);
+        }
+
         // Duration formatted as H:MM:SS with optional fractional seconds.
         double dur = player_->getDuration();
         char dbuf[64];
@@ -1483,6 +2556,26 @@ void UIController::drawInfoPanel(int W, int H) {
                             : std::string("Software");
         row("Decoder", dec);
 
+        {
+            auto k = player_->getHdrKind();
+            const bool on = player_->isHdrToneMapEnabled();
+            std::string hdr_label;
+            if (k == VideoPlayer::HdrKind::PQ) {
+                hdr_label = on ? "PQ (SMPTE ST 2084) - tone-mapped to SDR BT.709"
+                               : "PQ (SMPTE ST 2084) - native passthrough (Shift+H)";
+            } else if (k == VideoPlayer::HdrKind::HLG) {
+                hdr_label = on ? "HLG (ARIB STD-B67) - tone-mapped to SDR BT.709"
+                               : "HLG (ARIB STD-B67) - native passthrough (Shift+H)";
+            } else {
+                hdr_label = "SDR";
+            }
+            if (on && k != VideoPlayer::HdrKind::None
+                && player_->isHdrHalfResActive()) {
+                hdr_label += "  [half-res]";
+            }
+            row("Dynamic range", hdr_label);
+        }
+
         int rot_intrinsic = player_->getIntrinsicRotation();
         char rbuf[48];
         std::snprintf(rbuf, sizeof(rbuf),
@@ -1516,6 +2609,22 @@ void UIController::drawInfoPanel(int W, int H) {
                 std::snprintf(abuf, sizeof(abuf), "%d / %d",
                               player_->getCurrentAudioTrackIndex() + 1, atc);
                 row("Track", abuf);
+            }
+            {
+                auto nm = player_->getNormalizeMode();
+                float g = player_->getAutoGain();
+                char nbuf[64];
+                const char* label = (nm == VideoPlayer::NormalizeMode::Strong) ? "Strong"
+                                  : (nm == VideoPlayer::NormalizeMode::Soft)   ? "Soft"
+                                                                               : "Off";
+                if (nm != VideoPlayer::NormalizeMode::Off && g > 1.001f) {
+                    std::snprintf(nbuf, sizeof(nbuf), "%s  (+%.1f dB gain)",
+                                  label,
+                                  20.0f * std::log10(g));
+                } else {
+                    std::snprintf(nbuf, sizeof(nbuf), "%s", label);
+                }
+                row("Normalize", nbuf);
             }
         } else {
             row_disabled("Status", "no audio stream");
@@ -1635,16 +2744,26 @@ void UIController::drawHistoryPanel(int W, int H) {
     // Build a merged MRU list: resume_index_ first (files with a known
     // progress mark), then any recent_files_ that aren't already covered.
     // The resume entries already carry pos + duration; recent-only entries
-    // get a bare basename row with no progress bar.
+    // get a bare basename row with no progress bar. Stats (watched
+    // seconds + session count) are pulled per row from stats_ so the
+    // panel shows everything we know about the user's engagement with
+    // each file - not just resume position.
     struct Row {
         std::string path;
         double      pos      = -1.0;
         double      duration = -1.0;
+        double      watched  = 0.0;
+        int         sessions = 0;
     };
     std::vector<Row> rows;
     rows.reserve(resume_index_.size() + recent_files_.size());
     for (const auto& e : resume_index_) {
         Row r; r.path = e.path; r.pos = e.pos; r.duration = e.duration;
+        auto it = stats_.find(e.path);
+        if (it != stats_.end()) {
+            r.watched  = it->second.seconds;
+            r.sessions = it->second.sessions;
+        }
         rows.push_back(std::move(r));
     }
     for (const auto& rf : recent_files_) {
@@ -1652,14 +2771,53 @@ void UIController::drawHistoryPanel(int W, int H) {
         for (const auto& r : rows) {
             if (r.path == rf) { covered = true; break; }
         }
-        if (!covered) { Row r; r.path = rf; rows.push_back(std::move(r)); }
+        if (!covered) {
+            Row r; r.path = rf;
+            auto it = stats_.find(rf);
+            if (it != stats_.end()) {
+                r.watched  = it->second.seconds;
+                r.sessions = it->second.sessions;
+            }
+            rows.push_back(std::move(r));
+        }
     }
 
     if (rows.empty()) {
         ImGui::TextDisabled("No history yet - open a file to start.");
     } else {
-        ImGui::TextDisabled("%d files - click a row to resume  .  x removes",
-                            (int)rows.size());
+        // Aggregate stats banner - total watched, session count, and
+        // file count. Gives the panel a "you've engaged this much"
+        // feel at a glance instead of just listing files.
+        double total_watched = 0.0;
+        int    total_sessions = 0;
+        int    finished_files = 0;
+        for (const auto& r : rows) {
+            total_watched  += r.watched;
+            total_sessions += r.sessions;
+            if (r.duration > 0.0 && r.pos >= 0.0
+                && r.pos >= r.duration - 60.0) {
+                ++finished_files;
+            }
+        }
+        auto fmtHM = [](double sec) -> std::string {
+            if (sec <= 0.0) return "0m";
+            int total_min = (int)(sec / 60.0 + 0.5);
+            int hours = total_min / 60;
+            int mins  = total_min % 60;
+            char buf[64];
+            if (hours > 0) std::snprintf(buf, sizeof(buf), "%dh %dm", hours, mins);
+            else           std::snprintf(buf, sizeof(buf), "%dm", mins);
+            return buf;
+        };
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.72f, 0.90f, 1.0f, 0.95f));
+        char banner[192];
+        std::snprintf(banner, sizeof(banner),
+                      "Watched %s across %d sessions  .  %d files (%d finished)",
+                      fmtHM(total_watched).c_str(),
+                      total_sessions, (int)rows.size(), finished_files);
+        ImGui::TextUnformatted(banner);
+        ImGui::PopStyleColor();
+        ImGui::TextDisabled("Click a row to resume  .  x removes");
         ImGui::Spacing();
 
         // Deferred actions - apply after the loop so mutations don't shift
@@ -1696,6 +2854,30 @@ void UIController::drawHistoryPanel(int W, int H) {
                               formatTime(r.duration).c_str());
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 8.0f);
                 ImGui::ProgressBar(frac, ImVec2(pw - 130.0f, 8.0f), pbuf);
+            }
+            // Stats line: total watched time + session count. Only
+            // shown when there's real data - a new file with 0
+            // sessions gets a plain progress-only row.
+            if (r.sessions > 0 || r.watched > 0.5) {
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 8.0f);
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.72f, 0.90f, 0.85f));
+                int total_min = (int)(r.watched / 60.0 + 0.5);
+                int hours = total_min / 60;
+                int mins  = total_min % 60;
+                char sbuf[96];
+                if (hours > 0) {
+                    std::snprintf(sbuf, sizeof(sbuf),
+                                  "Watched %dh %dm  .  %d session%s",
+                                  hours, mins, r.sessions,
+                                  r.sessions == 1 ? "" : "s");
+                } else {
+                    std::snprintf(sbuf, sizeof(sbuf),
+                                  "Watched %dm  .  %d session%s",
+                                  mins, r.sessions,
+                                  r.sessions == 1 ? "" : "s");
+                }
+                ImGui::TextUnformatted(sbuf);
+                ImGui::PopStyleColor();
             }
             ImGui::Spacing();
             ImGui::PopID();
@@ -1738,76 +2920,500 @@ void UIController::drawHistoryPanel(int W, int H) {
     ImGui::PopStyleVar();
 }
 
-void UIController::drawSubtitles(int W, int H) {
-    if (!subtitles_enabled_ || subtitles_.empty()) return;
-    if (!player_->isLoaded()) return;
-    const SubtitleCue* cue = currentSubtitle(player_->getCurrentTime());
-    if (!cue) return;
+void UIController::drawSettingsDialog(int W, int H) {
+    if (!show_settings_) return;
 
-    // Use the merged font; size selected by the user (S/M/L/XL) with a
-    // narrow-window squeeze so it stays readable at 640 px.
-    ImFont* font = ImGui::GetFont();
+    ImDrawList* bg = ImGui::GetBackgroundDrawList();
+    bg->AddRectFilled(ImVec2(0, 0), ImVec2((float)W, (float)H),
+                      IM_COL32(0, 0, 0, 160));
+
+    const float pw = std::min(720.0f, W - 60.0f);
+    const float ph = std::min(560.0f, H - 60.0f);
+    ImVec2 tl((W - pw) * 0.5f, (H - ph) * 0.5f);
+    ImVec2 br(tl.x + pw, tl.y + ph);
+    bg->AddRectFilled(ImVec2(tl.x - 3, tl.y - 3), ImVec2(br.x + 3, br.y + 6),
+                      IM_COL32(0, 0, 0, 90), 16.0f);
+    bg->AddRectFilled(tl, br, IM_COL32(14, 18, 30, 246), 14.0f);
+    bg->AddRect(tl, br, IM_COL32(96, 176, 246, 130), 14.0f, 0, 1.0f);
+
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize
+                             | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar
+                             | ImGuiWindowFlags_NoBackground
+                             | ImGuiWindowFlags_NoBringToFrontOnFocus
+                             | ImGuiWindowFlags_NoSavedSettings;
+    ImGui::SetNextWindowPos(tl);
+    ImGui::SetNextWindowSize(ImVec2(pw, ph));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24, 20));
+    ImGui::Begin("##SettingsModal", nullptr, flags);
+
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.95f, 1.0f, 1.0f));
+    ImGui::TextUnformatted("Settings");
+    ImGui::PopStyleColor();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // Helper: a radio-style row that stores int into `slot`.
+    auto radio_group = [&](const char* header,
+                           int& slot,
+                           std::initializer_list<std::pair<const char*, int>> opts,
+                           std::function<void(int)> on_change) {
+        ImGui::TextUnformatted(header);
+        ImGui::Indent(16.0f);
+        for (auto& p : opts) {
+            bool sel = (slot == p.second);
+            if (ImGui::RadioButton(p.first, sel) && !sel) {
+                slot = p.second;
+                if (on_change) on_change(slot);
+                markConfigDirty();
+            }
+        }
+        ImGui::Unindent(16.0f);
+        ImGui::Spacing();
+    };
+
+    ImGui::BeginChild("##settings_scroll", ImVec2(0.0f, ph - 110.0f),
+                      false, ImGuiWindowFlags_None);
+
+    if (ImGui::BeginTabBar("##settings_tabs", ImGuiTabBarFlags_None)) {
+
+        // ---- Playback ----
+        if (ImGui::BeginTabItem("Playback")) {
+            ImGui::Spacing();
+            radio_group("Auto-play next when a file ends (countdown)",
+                        auto_next_countdown_,
+                        {{"Off",  0}, {"3 sec", 3}, {"5 sec", 5}, {"10 sec", 10}},
+                        nullptr);
+            if (ImGui::Checkbox("Pause when window loses focus",
+                                &pause_on_focus_loss_)) markConfigDirty();
+            ImGui::Spacing();
+            if (ImGui::Checkbox("Thumbnail preview when hovering seek bar",
+                                &thumbnail_preview_enabled_)) markConfigDirty();
+            ImGui::EndTabItem();
+        }
+
+        // ---- Video ----
+        if (ImGui::BeginTabItem("Video")) {
+            ImGui::Spacing();
+            if (player_) {
+                bool tm = player_->isHdrToneMapEnabled();
+                if (ImGui::Checkbox("HDR tone map for SDR display (Shift+H)", &tm)) {
+                    toggleHdrToneMap();
+                }
+                ImGui::Spacing();
+                radio_group("HDR half-resolution (perf lever for 4K HDR)",
+                            hdr_half_res_mode_,
+                            {{"Off  (full quality)", 0},
+                             {"Auto (on for 4K+ HDR)", 1},
+                             {"Force on", 2}},
+                            [this](int m) {
+                                if (player_) player_->setHdrHalfResMode(
+                                    (VideoPlayer::HdrHalfResMode)m);
+                            });
+                VideoPlayer::DeinterlaceMode dcur = player_->getDeinterlaceMode();
+                int di = (dcur == VideoPlayer::DeinterlaceMode::On) ? 2
+                       : (dcur == VideoPlayer::DeinterlaceMode::Auto) ? 1 : 0;
+                radio_group("Deinterlace (yadif)",
+                            di,
+                            {{"Off  (default)", 0},
+                             {"Auto (when tagged interlaced)", 1},
+                             {"On   (always)", 2}},
+                            [this](int m) {
+                                if (!player_) return;
+                                VideoPlayer::DeinterlaceMode dm =
+                                    (m == 2) ? VideoPlayer::DeinterlaceMode::On
+                                  : (m == 1) ? VideoPlayer::DeinterlaceMode::Auto
+                                             : VideoPlayer::DeinterlaceMode::Off;
+                                player_->setDeinterlaceMode(dm);
+                                // Self-seek so the queued ~8 frames get
+                                // dropped and the new mode is visible
+                                // on the next displayed frame instead of
+                                // ~250 ms later. Matches the main-menu
+                                // behavior before the Settings-dialog
+                                // migration.
+                                if (player_->isLoaded()) {
+                                    player_->seekRelative(0.0);
+                                }
+                            });
+            }
+            ImGui::EndTabItem();
+        }
+
+        // ---- Audio ----
+        if (ImGui::BeginTabItem("Audio")) {
+            ImGui::Spacing();
+            if (player_) {
+                VideoPlayer::NormalizeMode ncur = player_->getNormalizeMode();
+                int nm = (ncur == VideoPlayer::NormalizeMode::Strong) ? 2
+                       : (ncur == VideoPlayer::NormalizeMode::Soft)   ? 1 : 0;
+                radio_group("Volume normalize (peak-based static gain)",
+                            nm,
+                            {{"Off",    0},
+                             {"Soft   (peak 0.90)", 1},
+                             {"Strong (peak 0.98)", 2}},
+                            [this](int m) {
+                                if (!player_) return;
+                                VideoPlayer::NormalizeMode nn =
+                                    (m == 2) ? VideoPlayer::NormalizeMode::Strong
+                                  : (m == 1) ? VideoPlayer::NormalizeMode::Soft
+                                             : VideoPlayer::NormalizeMode::Off;
+                                player_->setNormalizeMode(nn);
+                            });
+                bool ln = player_->isLoudnessNormalize();
+                if (ImGui::Checkbox("Loudness normalize (dynamic, dynaudnorm)",
+                                    &ln)) {
+                    player_->setLoudnessNormalize(ln);
+                    loudness_normalize_ = ln;
+                    markConfigDirty();
+                }
+                ImGui::TextDisabled("Boost quiet dialogue without clipping loud action.");
+                ImGui::Spacing();
+                radio_group("Audio output latency (ms)  -  video shift to match ear",
+                            audio_out_latency_ms_,
+                            {{"0    (exclusive / pro)",       0},
+                             {"15   (low-latency headphones)", 15},
+                             {"30   (WASAPI shared default)",  30},
+                             {"60   (USB DAC)",                60},
+                             {"100", 100},
+                             {"150", 150},
+                             {"200  (Bluetooth typical)",     200}},
+                            [this](int v) {
+                                if (player_) player_->setAudioOutputLatencyMs(v);
+                            });
+            }
+            ImGui::EndTabItem();
+        }
+
+        // ---- Subtitles ----
+        if (ImGui::BeginTabItem("Subtitles")) {
+            ImGui::Spacing();
+            if (ImGui::Checkbox("Enabled (S)", &subtitles_enabled_)) markConfigDirty();
+            if (ImGui::Checkbox("Background box (B)", &subtitle_bg_)) markConfigDirty();
+            ImGui::Spacing();
+            int ss = (int)subtitle_size_;
+            radio_group("Size (G to cycle)",
+                        ss,
+                        {{"Small", 0}, {"Medium", 1}, {"Large", 2}, {"XL", 3}},
+                        [this](int v) {
+                            subtitle_size_ = (SubtitleSize)v;
+                        });
+            int sc = (int)subtitle_color_;
+            radio_group("Color",
+                        sc,
+                        {{"White", 0}, {"Yellow", 1}, {"Cyan", 2},
+                         {"Sky Blue", 3}, {"Pink", 4}},
+                        [this](int v) { subtitle_color_ = (SubColor)v; });
+            int so = (int)subtitle_outline_;
+            radio_group("Outline",
+                        so,
+                        {{"Thin", 0}, {"Normal", 1}, {"Thick", 2}},
+                        [this](int v) { subtitle_outline_ = (SubOutline)v; });
+            radio_group("Font",
+                        subtitle_font_,
+                        {{"Default (merged atlas)", 0},
+                         {"Malgun Gothic Bold",     1},
+                         {"Gulim",                  2},
+                         {"Batang",                 3}},
+                        nullptr);
+            ImGui::EndTabItem();
+        }
+
+        // ---- Snapshots ----
+        if (ImGui::BeginTabItem("Snapshots")) {
+            ImGui::Spacing();
+            ImGui::TextUnformatted("Folder");
+            ImGui::Indent(16.0f);
+            const std::string cur = snapshot_dir_.empty()
+                                      ? std::string("(next to the app)")
+                                      : snapshot_dir_;
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextDisabled("%s", cur.c_str());
+            ImGui::PopTextWrapPos();
+            if (ImGui::Button("Choose folder...")) openSnapshotFolderDialog();
+            ImGui::SameLine();
+            if (ImGui::Button("Reset to default")) {
+                snapshot_dir_.clear();
+                markConfigDirty();
+            }
+            ImGui::Unindent(16.0f);
+            ImGui::Spacing();
+            if (ImGui::Checkbox("Include subtitles / HUD in snapshot",
+                                &snapshot_include_overlays_)) markConfigDirty();
+            ImGui::Spacing();
+            radio_group("Burst count",
+                        burst_count_,
+                        {{"3", 3}, {"5", 5}, {"10", 10}, {"20", 20}},
+                        nullptr);
+            ImGui::TextUnformatted("Burst interval");
+            ImGui::Indent(16.0f);
+            struct BI { const char* label; float v; };
+            BI bopts[] = {{"0.5 sec", 0.5f}, {"1.0 sec", 1.0f},
+                          {"2.0 sec", 2.0f}, {"5.0 sec", 5.0f}};
+            for (auto& b : bopts) {
+                bool sel = std::fabs(burst_interval_ - b.v) < 0.01f;
+                if (ImGui::RadioButton(b.label, sel) && !sel) {
+                    burst_interval_ = b.v;
+                    markConfigDirty();
+                }
+            }
+            ImGui::Unindent(16.0f);
+            ImGui::EndTabItem();
+        }
+
+        // ---- Behavior ----
+        if (ImGui::BeginTabItem("Behavior")) {
+            ImGui::Spacing();
+            bool si = single_instance_mode_;
+            if (ImGui::Checkbox("Single instance (double-clicked files reuse this window)",
+                                &si)) {
+                single_instance_mode_ = si;
+                markConfigDirty();
+                saveConfig();   // persist immediately - see main-menu note
+                if (single_instance_mode_) {
+                    if (SingleInstance::activate()) {
+                        showOsd("Single instance on  (this window is now primary)", 2.6f);
+                    } else {
+                        showOsd("Single instance on  (another Banana Player is already primary)", 3.0f);
+                    }
+                } else {
+                    SingleInstance::deactivate();
+                    showOsd("Single instance off  (each launch opens a new window)", 2.6f);
+                }
+            }
+            ImGui::TextDisabled("When off, each launch opens a new Banana Player window.");
+            ImGui::EndTabItem();
+        }
+
+        ImGui::EndTabBar();
+    }
+
+    ImGui::EndChild();
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    // Bottom row: close button + hint
+    if (ImGui::Button("Close")) show_settings_ = false;
+    ImGui::SameLine();
+    ImGui::TextDisabled("Press Esc or Ctrl+, to close");
+
+    ImGui::End();
+    ImGui::PopStyleVar();
+}
+
+void UIController::drawSubtitles(int W, int H) {
+    if (!subtitles_enabled_) return;
+    if (!player_->isLoaded()) return;
+    const SubtitleCue* cue = subtitles_.empty()
+        ? nullptr
+        : currentSubtitle(player_->getCurrentTime());
+    const SubtitleCue* cue2 = subtitles_secondary_.empty()
+        ? nullptr
+        : currentSubtitleSecondary(player_->getCurrentTime());
+    // Embedded (container) subtitle track. Renders in the primary slot
+    // when no external primary sidecar is loaded. If both an external
+    // primary AND an embedded track are active, the external one wins
+    // (users who explicitly load a sidecar are expressing a preference).
+    SubtitleCue embed_cue_storage;
+    if (!cue && player_->getActiveEmbeddedSubtitle() >= 0) {
+        std::string embed = player_->getEmbeddedSubtitleAt(
+                                player_->getCurrentTime() - subtitle_offset_);
+        if (!embed.empty()) {
+            embed_cue_storage.text  = std::move(embed);
+            embed_cue_storage.start = 0.0;
+            embed_cue_storage.end   = 0.0;
+            cue = &embed_cue_storage;
+        }
+    }
+    if (!cue && !cue2) return;
+
+    // Pick the subtitle font: user preset if available, fall back to
+    // the merged default. GetSubtitleFont returns nullptr when the
+    // preset's TTF wasn't found on the system.
+    ImFont* font = Style::GetSubtitleFont(
+                        (Style::SubtitleFont)subtitle_font_);
+    if (!font) font = ImGui::GetFont();
     float base_px = subtitleBasePx(W, H);
 
-    // Split into physical lines and measure each.
-    std::vector<std::string> lines;
-    {
+    auto split = [](const std::string& text, std::vector<std::string>& out) {
+        out.clear();
         std::string cur;
-        for (char c : cue->text) {
-            if (c == '\n') { lines.push_back(cur); cur.clear(); }
+        for (char c : text) {
+            if (c == '\n') { out.push_back(cur); cur.clear(); }
             else cur.push_back(c);
         }
-        if (!cur.empty()) lines.push_back(cur);
-    }
+        if (!cur.empty()) out.push_back(cur);
+    };
+
+    // Split PRIMARY into physical lines and measure each.
+    std::vector<std::string> lines;
+    if (cue) split(cue->text, lines);
+
+    // Secondary lines - rendered at ~85% of primary size, in a slightly
+    // dimmer color, sitting on a separate row BELOW the primary block.
+    std::vector<std::string> lines2;
+    if (cue2) split(cue2->text, lines2);
+    float base_px2 = base_px * 0.85f;
 
     // Draw stacked from the bottom up, above the bottom overlay area.
     // subtitle_vpos_ shifts the block vertically as a fraction of H:
     // positive raises it, negative lowers it (clamped to keep the block
-    // inside the picture area).
+    // inside the picture area). The secondary block sits at the bottom;
+    // primary sits ABOVE it (traditional dual-sub layout: native language
+    // on top, target language below - matches how PotPlayer and MX
+    // Player present dual subs).
     ImDrawList* dl = ImGui::GetForegroundDrawList();
-    float line_h    = base_px * 1.15f;
-    float bottom_pad = 120.0f;   // sit above the ~108px bottom overlay
+    float line_h    = base_px  * 1.15f;
+    float line_h2   = base_px2 * 1.15f;
+    float bottom_pad = 120.0f;
     float vshift    = std::clamp(subtitle_vpos_, -0.15f, 0.60f) * (float)H;
-    float block_h   = line_h * (float)lines.size();
-    float y_top     = (float)H - bottom_pad - block_h - vshift;
-    // Keep the block on-screen even at extreme nudges.
-    if (y_top < 8.0f) y_top = 8.0f;
-    if (y_top + block_h > (float)H - 8.0f) y_top = (float)H - 8.0f - block_h;
+    float block_h   = line_h  * (float)lines.size();
+    float block_h2  = line_h2 * (float)lines2.size();
+    float gap       = (block_h > 0.0f && block_h2 > 0.0f) ? line_h * 0.25f : 0.0f;
+
+    float sec_y_top = (float)H - bottom_pad - block_h2 - vshift;
+    float pri_y_top = sec_y_top - gap - block_h;
+    if (pri_y_top < 8.0f) { pri_y_top = 8.0f; sec_y_top = pri_y_top + block_h + gap; }
+
+    // Text color: user preset. Secondary is drawn at 80% intensity so
+    // the eye picks the primary as the main line even when both are
+    // present. Alpha stays at ~245 on primary for solid readability.
+    auto colorForPreset = [](SubColor c, int alpha) -> ImU32 {
+        switch (c) {
+            case SubColor::Yellow:  return IM_COL32(255, 236, 120, alpha);
+            case SubColor::Cyan:    return IM_COL32(140, 240, 235, alpha);
+            case SubColor::SkyBlue: return IM_COL32(148, 202, 255, alpha);
+            case SubColor::Pink:    return IM_COL32(255, 190, 220, alpha);
+            case SubColor::White:
+            default:                return IM_COL32(255, 255, 255, alpha);
+        }
+    };
+    ImU32 sh_col  = IM_COL32(  0,   0,   0, 235);
+    ImU32 pri_col = colorForPreset(subtitle_color_, 245);
+    ImU32 sec_col = colorForPreset(subtitle_color_, 200);
+
+    // Outline radius. Thin keeps the historical 1-px 8-neighbor look;
+    // Normal doubles to 2 px; Thick to 3 px. The passes count grows
+    // (~(2r+1)^2 - 1), but subtitle text is tiny relative to per-frame
+    // work so even 24 extra AddText calls at Thick is imperceptible.
+    int outline_r = (subtitle_outline_ == SubOutline::Thick)  ? 3
+                  : (subtitle_outline_ == SubOutline::Normal) ? 2
+                                                              : 1;
+
+    auto drawLines = [&](const std::vector<std::string>& ls, float top,
+                          float px, float lh, ImU32 fg) {
+        float y = top;
+        for (const auto& s : ls) {
+            ImVec2 sz = font->CalcTextSizeA(px, FLT_MAX, 0.0f, s.c_str());
+            float x = ((float)W - sz.x) * 0.5f;
+            for (int dx = -outline_r; dx <= outline_r; ++dx) {
+                for (int dy = -outline_r; dy <= outline_r; ++dy) {
+                    if (dx == 0 && dy == 0) continue;
+                    dl->AddText(font, px, ImVec2(x + dx, y + dy), sh_col, s.c_str());
+                }
+            }
+            dl->AddText(font, px, ImVec2(x, y), fg, s.c_str());
+            y += lh;
+        }
+    };
 
     // Optional background box: one rounded rect that spans the widest
-    // line's width plus padding, sits behind ALL lines. Drawn first so
-    // the outlined text lands on top.
+    // line's width plus padding, encompassing BOTH primary and secondary
+    // blocks so the pair reads as one unit. Drawn first.
     if (subtitle_bg_) {
         float widest = 0.0f;
         for (const auto& s : lines) {
             ImVec2 sz = font->CalcTextSizeA(base_px, FLT_MAX, 0.0f, s.c_str());
             if (sz.x > widest) widest = sz.x;
         }
+        for (const auto& s : lines2) {
+            ImVec2 sz = font->CalcTextSizeA(base_px2, FLT_MAX, 0.0f, s.c_str());
+            if (sz.x > widest) widest = sz.x;
+        }
         float pad_x = base_px * 0.5f;
         float pad_y = base_px * 0.20f;
-        ImVec2 tl(((float)W - widest) * 0.5f - pad_x, y_top - pad_y);
-        ImVec2 br(((float)W + widest) * 0.5f + pad_x,
-                  y_top + block_h + pad_y);
+        float top_y = (block_h > 0.0f) ? pri_y_top : sec_y_top;
+        float bot_y = (block_h2 > 0.0f) ? (sec_y_top + block_h2) : (pri_y_top + block_h);
+        ImVec2 tl(((float)W - widest) * 0.5f - pad_x, top_y - pad_y);
+        ImVec2 br(((float)W + widest) * 0.5f + pad_x, bot_y + pad_y);
         dl->AddRectFilled(tl, br, IM_COL32(0, 0, 0, 170), base_px * 0.20f);
     }
 
-    float y = y_top;
-    for (const auto& s : lines) {
-        ImVec2 sz = font->CalcTextSizeA(base_px, FLT_MAX, 0.0f, s.c_str());
-        float x = ((float)W - sz.x) * 0.5f;
-        // Dark shadow / outline: draw the text 8x offset in dark, then once
-        // in white on top. Cheap but readable over any content.
-        ImU32 sh = IM_COL32(0, 0, 0, 220);
-        ImU32 fg = IM_COL32(255, 255, 255, 245);
-        for (int dx = -1; dx <= 1; ++dx) {
-            for (int dy = -1; dy <= 1; ++dy) {
-                if (dx == 0 && dy == 0) continue;
-                dl->AddText(font, base_px, ImVec2(x + dx, y + dy), sh, s.c_str());
-            }
-        }
-        dl->AddText(font, base_px, ImVec2(x, y), fg, s.c_str());
-        y += line_h;
+    if (block_h  > 0.0f) drawLines(lines,  pri_y_top, base_px,  line_h,  pri_col);
+    if (block_h2 > 0.0f) drawLines(lines2, sec_y_top, base_px2, line_h2, sec_col);
+}
+
+void UIController::freeBitmapSubtitleTexture() {
+    if (sub_bitmap_tex_) {
+        SDL_DestroyTexture(sub_bitmap_tex_);
+        sub_bitmap_tex_ = nullptr;
     }
+    sub_bitmap_tex_id_ = 0;
+    sub_bitmap_tex_w_  = 0;
+    sub_bitmap_tex_h_  = 0;
+}
+
+void UIController::drawBitmapSubtitle(int W, int H) {
+    if (!subtitles_enabled_) { freeBitmapSubtitleTexture(); return; }
+    if (!player_ || !player_->isLoaded() || !renderer_) {
+        freeBitmapSubtitleTexture(); return;
+    }
+    if (player_->getActiveEmbeddedSubtitle() < 0) {
+        freeBitmapSubtitleTexture(); return;
+    }
+    auto v = player_->getEmbeddedBitmapSubtitleAt(
+                    player_->getCurrentTime() - subtitle_offset_);
+    if (v.id == 0 || v.w <= 0 || v.h <= 0 || v.rgba.empty()) {
+        freeBitmapSubtitleTexture(); return;
+    }
+    // Rebuild the SDL_Texture when the cue changes (id delta) or the
+    // dimensions differ from the cached one. Same-cue frames just
+    // reuse the previous upload.
+    if (v.id != sub_bitmap_tex_id_
+        || v.w  != sub_bitmap_tex_w_
+        || v.h  != sub_bitmap_tex_h_
+        || !sub_bitmap_tex_) {
+        freeBitmapSubtitleTexture();
+        sub_bitmap_tex_ = SDL_CreateTexture(renderer_,
+            SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, v.w, v.h);
+        if (!sub_bitmap_tex_) return;
+        SDL_SetTextureBlendMode(sub_bitmap_tex_, SDL_BLENDMODE_BLEND);
+        SDL_SetTextureScaleMode(sub_bitmap_tex_, SDL_SCALEMODE_LINEAR);
+        SDL_UpdateTexture(sub_bitmap_tex_, nullptr,
+                          v.rgba.data(), v.w * (int)sizeof(uint32_t));
+        sub_bitmap_tex_id_ = v.id;
+        sub_bitmap_tex_w_  = v.w;
+        sub_bitmap_tex_h_  = v.h;
+    }
+    // Scale from source-video pixel space to on-screen. Approximation:
+    // fit the video area at the window's aspect assuming no user zoom
+    // or pan (bitmap subs already carry their own positioning). Users
+    // with heavy zoom / pan can turn off embedded subs and use a text
+    // sidecar instead.
+    if (v.video_w <= 0 || v.video_h <= 0) return;
+    float src_aspect = (float)v.video_w / (float)v.video_h;
+    float win_aspect = (float)W / (float)H;
+    float box_w, box_h, box_x, box_y;
+    if (win_aspect > src_aspect) {
+        box_h = (float)H;
+        box_w = H * src_aspect;
+        box_x = ((float)W - box_w) * 0.5f;
+        box_y = 0.0f;
+    } else {
+        box_w = (float)W;
+        box_h = W / src_aspect;
+        box_x = 0.0f;
+        box_y = ((float)H - box_h) * 0.5f;
+    }
+    float sx = box_w / (float)v.video_w;
+    float sy = box_h / (float)v.video_h;
+    // Use ImGui's foreground draw list so the bitmap sits on top of
+    // the video texture (which is drawn by main.cpp's RenderTexture
+    // before ImGui's own pass runs). ImTextureID is directly the
+    // SDL_Texture* on the SDLRenderer3 backend.
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    ImVec2 tl(box_x + v.x * sx,           box_y + v.y * sy);
+    ImVec2 br(box_x + (v.x + v.w) * sx,   box_y + (v.y + v.h) * sy);
+    dl->AddImage((ImTextureID)(intptr_t)sub_bitmap_tex_, tl, br);
 }
 
 void UIController::seekPrevChapter() {
@@ -1897,6 +3503,25 @@ void UIController::handleNaturalEnd() {
     // Finishing a file clears its resume mark so re-opening starts at 0.
     if (!player_->getFilename().empty()) { clearResume(player_->getFilename()); }
 
+    // Countdown branch: only when there's actually a next item to go to
+    // (peek without mutating the playlist) AND the user hasn't set the
+    // countdown to 0 (immediate). Repeat One skips the countdown (the
+    // same file just replays; nothing to preview).
+    bool has_next_target =
+        playlist_.hasNext()
+     || (playlist_.repeatMode() == Playlist::RepeatMode::All
+         && playlist_.size() > 1);
+    if (auto_next_countdown_ > 0
+        && has_next_target
+        && playlist_.repeatMode() != Playlist::RepeatMode::One) {
+        auto_next_active_ = true;
+        auto_next_secs_   = (float)auto_next_countdown_;
+        return;
+    }
+    handleNaturalEndImmediate();
+}
+
+void UIController::handleNaturalEndImmediate() {
     // Repeat One: replay the same file.
     if (playlist_.repeatMode() == Playlist::RepeatMode::One) {
         player_->seek(0.0);
@@ -1925,6 +3550,11 @@ void UIController::handleNaturalEnd() {
         }
     }
     // else: just paused at end
+}
+
+void UIController::cancelAutoNext() {
+    auto_next_active_ = false;
+    auto_next_secs_   = 0.0f;
 }
 
 void UIController::newFrame() {
@@ -2030,6 +3660,53 @@ void UIController::render(int W, int H) {
         if (snapshot_flash_ < 0.0f) snapshot_flash_ = 0.0f;
     }
 
+    // Per-file watch statistics: accumulate dt only while the file is
+    // actually playing (not paused). Clamp dt to guard against Windows
+    // going to sleep with the window open - a giant dt would add hours
+    // of phantom watch time. Committed to `stats_` on file switch / quit.
+    if (player_ && player_->isLoaded() && player_->isPlaying()) {
+        float clamped = dt;
+        if (clamped > 1.0f) clamped = 1.0f;   // ignore stalls/sleeps
+        stats_accum_this_session_ += (double)clamped;
+    }
+
+    // Auto-next countdown tick. When it hits 0, do the deferred advance.
+    if (auto_next_active_) {
+        auto_next_secs_ -= dt;
+        if (auto_next_secs_ <= 0.0f) {
+            auto_next_active_ = false;
+            auto_next_secs_   = 0.0f;
+            handleNaturalEndImmediate();
+        }
+    }
+
+    // Burst-snapshot tick: fires one snapshot every burst_interval_
+    // seconds until remaining hits zero. Only takes shots while a file
+    // is loaded; a natural EOF mid-burst just leaves the counter at
+    // whatever it was and stops. Shows one progress OSD per shot
+    // ("Burst 3/10") instead of the usual "Saved <path>" - avoids the
+    // OSD stack ballooning to 10+ entries during a long burst. The
+    // shot itself still gets written; only the toast is suppressed
+    // (see takeSnapshot's `burst_remaining_` check).
+    if (burst_remaining_ > 0 && player_->isLoaded()) {
+        burst_next_at_ -= dt;
+        if (burst_next_at_ <= 0.0f) {
+            int taken_after = burst_count_ - burst_remaining_ + 1;
+            takeSnapshot();
+            --burst_remaining_;
+            burst_next_at_ = burst_interval_;
+            char b[32];
+            std::snprintf(b, sizeof(b), "Burst %d/%d",
+                          taken_after, burst_count_);
+            // Short duration so successive progress toasts replace each
+            // other rather than piling up on screen.
+            showOsd(b, 0.8f);
+            if (burst_remaining_ == 0) {
+                showOsd("Burst finished", 1.4f);
+            }
+        }
+    }
+
     // Deferred single-click play/pause: fires once the short (~220 ms)
     // double-click window has passed without a second click arriving.
     if (pending_video_click_) {
@@ -2066,11 +3743,16 @@ void UIController::render(int W, int H) {
     // Subtitles sit above the overlay area but below the OSD/flash so nothing
     // covers them. Only draws when a cue is active.
     if (loaded) drawSubtitles(W, H);
+    if (loaded) drawBitmapSubtitle(W, H);
 
     drawShortcutsPanel(W, H);
     drawAboutPanel(W, H);
     drawInfoPanel(W, H);
     drawHistoryPanel(W, H);
+    drawSettingsDialog(W, H);
+    drawSubtitleSearchPanel(W, H);
+    drawFirstRunHint(W, H);
+    drawAutoNextOverlay(W, H);
 
     // Right-click context menu: open on request, position at cursor,
     // reuse the Settings menu contents so both surfaces stay in sync.
@@ -2104,28 +3786,31 @@ void UIController::drawSplash(int W, int H) {
     ImGui::Begin("##Splash", nullptr, flags);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    // Base gradient: cooler top, near-black bottom. Slightly darker than
-    // before so the wordmark and accent underline pop harder.
+    // Base gradient: warm near-black top, deeper warm-brown bottom. Warmer
+    // than the previous cool blue-black so the banana wordmark and yellow
+    // underline live in the same colour family as their surface.
     Style::GradientRect(dl, ImVec2(0, 0), ImVec2((float)W, (float)H),
-                        IM_COL32(14, 18, 28, 255), IM_COL32(3, 4,  8, 255));
-    // Decorative color washes - accent-tinted from the top-left, warmer purple
-    // from the bottom-right for a subtle "spotlight" feel.
+                        IM_COL32(24, 20, 14, 255), IM_COL32(6, 5, 3, 255));
+    // Decorative colour washes - a warm banana-yellow wash from the
+    // top-left and an amber peel-toe wash from the bottom-right for a
+    // subtle "spotlight" feel that echoes the brand palette.
     float rmax = std::max((float)W, (float)H);
     dl->AddCircleFilled(ImVec2(0, 0),
-                        rmax * 0.60f, IM_COL32( 60,  96, 190, 34), 96);
+                        rmax * 0.60f, IM_COL32(255, 201,  58, 30), 96);
     dl->AddCircleFilled(ImVec2((float)W, (float)H),
-                        rmax * 0.55f, IM_COL32(120,  70, 200, 26), 96);
-    // A hairline horizontal accent glow through the vertical midline. This is
-    // the "premium dark landing page" trick every SaaS marketing team ships.
+                        rmax * 0.55f, IM_COL32(227, 128,  40, 24), 96);
+    // A hairline horizontal accent glow through the vertical midline. This
+    // is the "premium dark landing page" trick every SaaS marketing team
+    // ships. Yellow now that we're a warm-palette brand.
     {
         float ay = H * 0.34f;
         dl->AddRectFilledMultiColor(
             ImVec2(0.0f,     ay),
             ImVec2((float)W, ay + 1.0f),
-            IM_COL32( 96, 176, 246,  0),
-            IM_COL32( 96, 176, 246, 55),
-            IM_COL32( 96, 176, 246, 55),
-            IM_COL32( 96, 176, 246,  0));
+            IM_COL32(255, 201,  58,  0),
+            IM_COL32(255, 201,  58, 55),
+            IM_COL32(255, 201,  58, 55),
+            IM_COL32(255, 201,  58,  0));
     }
 
     float cx = W * 0.5f;
@@ -2133,66 +3818,136 @@ void UIController::drawSplash(int W, int H) {
     float cy = H * 0.34f;
     ImFont* font = ImGui::GetFont();
 
-    // --- Wordmark: large "VELA" with a gradient wash + subtle glow beneath ---
-    const char* wordmark = "VELA";
-    // Scale with window height so it never dominates or shrinks to a whisper.
-    float ts = std::clamp((float)H * 0.13f, 56.0f, 108.0f);
+    // --- Wordmark: large "Banana Player" with a small banana glyph on the
+    // left, gradient wash + subtle glow beneath. The wordmark is 13 chars
+    // (vs the old 4-char "VELA"), so the type-size clamp is a chunk smaller
+    // to survive the 640 px minimum window width without wrapping/clipping.
+    const char* wordmark = "Banana Player";
+    // Scale with window height AND width so the wordmark never runs off
+    // either axis. The min of the two clamps means small windows shrink
+    // uniformly; wide-tall windows still get a comfortable hero size.
+    float ts_by_h = std::clamp((float)H * 0.11f, 34.0f, 72.0f);
+    float ts_by_w = std::clamp((float)W * 0.078f, 34.0f, 72.0f);
+    float ts = std::min(ts_by_h, ts_by_w);
     ImVec2 td = font->CalcTextSizeA(ts, FLT_MAX, 0.0f, wordmark);
-    // Extra letter spacing for a mark-like feel (draw each glyph separately).
-    float letter_gap = ts * 0.10f;
-    float total_w = td.x + letter_gap * 3.0f;  // 3 gaps for 4 letters
+    // Slightly more letter spacing than the old VELA to give "Banana Player"
+    // a friendly mark-like rhythm (12 % vs the previous 10 %).
+    float letter_gap = ts * 0.02f;
+    int   letters    = 0;
+    for (const char* p = wordmark; *p; ++p) if (*p != ' ') letters++;
+    float total_text_w = td.x + letter_gap * (float)std::max(0, letters - 1);
+    // Small banana glyph rendered LEFT of the wordmark so the icon and the
+    // word live in one visual unit. Sized proportional to the type height.
+    float glyph_r = ts * 0.55f;
+    float glyph_gap = ts * 0.32f;
+    float total_w = glyph_r * 2.0f + glyph_gap + total_text_w;
     float wm_x = cx - total_w * 0.5f;
     float wm_y = cy - ts * 0.5f;
+
+    // Banana glyph. Same construction as the app icon (crescent from two
+    // overlapping ellipse regions) but drawn with ImDrawList primitives so
+    // it lives in the vector-only icon rule for in-app art. A tilted arc
+    // with a filled convex-poly fallback would be cheaper, but overlapping
+    // filled circles + subtract-via-second-circle is what we can express
+    // in ImDrawList - so we fake the crescent with a fat yellow arc that
+    // reads correctly at splash sizes (>= 34 px).
     {
-        float x = wm_x;
+        ImVec2 gc(wm_x + glyph_r, wm_y + ts * 0.55f);
+        float r_out = glyph_r;
+        float r_in  = glyph_r * 0.72f;
+        float rot   = -0.55f * 3.14159265f;   // ~-100 deg: banana lying horizontal
+        // Build the crescent as a thick arc: sweep from 30..210 deg around
+        // the center, with the arc STROKED at a big thickness. That reads
+        // as a fat banana with tapered ends.
+        int seg = 40;
+        dl->PathClear();
+        for (int i = 0; i <= seg; ++i) {
+            float t = (float)i / seg;
+            float a = 0.35f * 3.14159265f + t * (2.30f * 3.14159265f - 0.35f * 3.14159265f);
+            // Rotate the coordinate frame so the crescent lies horizontal
+            // with the concave side pointing down/right (play direction).
+            float ca = std::cos(a + rot), sa = std::sin(a + rot);
+            float rr = (r_out + r_in) * 0.5f;
+            dl->PathLineTo(ImVec2(gc.x + ca * rr, gc.y + sa * rr));
+        }
+        float stroke = (r_out - r_in);
+        // Shadow pass.
+        dl->PathStroke(IM_COL32(0, 0, 0, 100), 0, stroke + 3.0f);
+        // Peel-toe pass.
+        dl->PathClear();
+        for (int i = 0; i <= seg; ++i) {
+            float t = (float)i / seg;
+            float a = 0.35f * 3.14159265f + t * (2.30f * 3.14159265f - 0.35f * 3.14159265f);
+            float ca = std::cos(a + rot), sa = std::sin(a + rot);
+            float rr = (r_out + r_in) * 0.5f;
+            dl->PathLineTo(ImVec2(gc.x + ca * rr, gc.y + sa * rr));
+        }
+        dl->PathStroke(IM_COL32(227, 154, 28, 255), 0, stroke);
+        // Bright body pass (slightly thinner, offset toward the highlight
+        // side, so it reads as a gradient without needing per-vertex colours).
+        dl->PathClear();
+        for (int i = 0; i <= seg; ++i) {
+            float t = (float)i / seg;
+            float a = 0.35f * 3.14159265f + t * (2.30f * 3.14159265f - 0.35f * 3.14159265f);
+            float ca = std::cos(a + rot), sa = std::sin(a + rot);
+            float rr = (r_out + r_in) * 0.5f - 1.0f;
+            dl->PathLineTo(ImVec2(gc.x + ca * rr - 1.0f, gc.y + sa * rr - 1.0f));
+        }
+        dl->PathStroke(IM_COL32(255, 201, 58, 255), 0, stroke * 0.75f);
+    }
+
+    // Wordmark text.
+    {
+        float x = wm_x + glyph_r * 2.0f + glyph_gap;
         for (const char* p = wordmark; *p; ++p) {
             char one[2] = { *p, 0 };
             ImVec2 gd = font->CalcTextSizeA(ts, FLT_MAX, 0.0f, one);
             // Layered shadow: two low-alpha offsets so the wordmark reads
-            // "lifted", not "underlined." Kept small so it can't feel cheesy.
+            // "lifted", not "underlined". Kept small so it can't feel cheesy.
             dl->AddText(font, ts, ImVec2(x + 1.5f, wm_y + 5.0f),
                         IM_COL32(0, 0, 0, 90),  one);
             dl->AddText(font, ts, ImVec2(x + 0.5f, wm_y + 2.5f),
                         IM_COL32(0, 0, 0, 60),  one);
-            // Faint accent glow behind the crisp glyph so it feels tinted
-            // rather than pure-white on video.
+            // Faint banana-yellow glow behind the crisp glyph so the type
+            // feels tinted rather than pure-white on video.
             dl->AddText(font, ts, ImVec2(x, wm_y + 1.0f),
-                        IM_COL32( 96, 176, 246, 50), one);
+                        IM_COL32(255, 201, 58, 55), one);
             dl->AddText(font, ts, ImVec2(x, wm_y),
-                        IM_COL32(244, 248, 255, 255), one);
-            x += gd.x + letter_gap;
+                        IM_COL32(248, 244, 232, 255), one);
+            x += gd.x + (*p == ' ' ? 0.0f : letter_gap);
         }
     }
 
-    // Accent underline: horizontal gradient bar under the wordmark, plus a
-    // second thinner glow line for the "under-luminance" premium feel.
+    // Accent underline: horizontal banana-yellow gradient bar under the
+    // wordmark, plus a second thinner glow line for the "under-luminance"
+    // premium feel. Width tracks the full wordmark including the glyph.
     float bar_y = wm_y + ts + 8.0f;
     float bar_w = total_w * 0.62f;
     float bar_h = 3.0f;
     dl->AddRectFilledMultiColor(
         ImVec2(cx - bar_w * 0.5f, bar_y),
         ImVec2(cx + bar_w * 0.5f, bar_y + bar_h),
-        IM_COL32( 64, 132, 216,  0),
-        IM_COL32(148, 202, 255, 255),
-        IM_COL32(148, 202, 255, 255),
-        IM_COL32( 64, 132, 216,  0));
+        IM_COL32(227, 154,  28,   0),
+        IM_COL32(255, 222, 122, 255),
+        IM_COL32(255, 222, 122, 255),
+        IM_COL32(227, 154,  28,   0));
     // Second, wider, low-alpha glow bar below - a bloom.
     dl->AddRectFilledMultiColor(
         ImVec2(cx - bar_w * 0.75f, bar_y + bar_h + 1.0f),
         ImVec2(cx + bar_w * 0.75f, bar_y + bar_h + 4.0f),
-        IM_COL32( 96, 176, 246,   0),
-        IM_COL32( 96, 176, 246,  90),
-        IM_COL32( 96, 176, 246,  90),
-        IM_COL32( 96, 176, 246,   0));
+        IM_COL32(255, 201,  58,   0),
+        IM_COL32(255, 201,  58,  90),
+        IM_COL32(255, 201,  58,  90),
+        IM_COL32(255, 201,  58,   0));
 
-    // Tagline: what Vela is for. Slightly larger + brighter than the hints
-    // so the reader's eye lands on it first after the wordmark.
-    const char* tagline = "Focused, keyboard-first video playback";
+    // Tagline: what Banana Player is for. Slightly larger + brighter than
+    // the hints so the reader's eye lands on it first after the wordmark.
+    const char* tagline = "Peel and play.";
     float tag_size = 17.0f;
     ImVec2 tag_dim = font->CalcTextSizeA(tag_size, FLT_MAX, 0.0f, tagline);
     float tag_y = bar_y + bar_h + 24.0f;
     dl->AddText(font, tag_size, ImVec2(cx - tag_dim.x * 0.5f, tag_y),
-                IM_COL32(196, 210, 234, 235), tagline);
+                IM_COL32(234, 220, 190, 235), tagline);
 
     // Hint row (small): common actions. Two lines so the trailing "? for
     // shortcuts" tip has room even at 640 px width.
@@ -2201,13 +3956,13 @@ void UIController::drawSplash(int W, int H) {
     ImVec2 sd = font->CalcTextSizeA(ss, FLT_MAX, 0.0f, subtitle);
     float sub_y = tag_y + tag_size + 12.0f;
     dl->AddText(font, ss, ImVec2(cx - sd.x * 0.5f, sub_y),
-                IM_COL32(140, 156, 185, 210), subtitle);
+                IM_COL32(185, 170, 138, 210), subtitle);
 
     const char* subtitle2 = "?  or  F1  for keyboard shortcuts";
     ImVec2 sd2 = font->CalcTextSizeA(ss, FLT_MAX, 0.0f, subtitle2);
     float sub2_y = sub_y + ss + 6.0f;
     dl->AddText(font, ss, ImVec2(cx - sd2.x * 0.5f, sub2_y),
-                IM_COL32(118, 134, 165, 210), subtitle2);
+                IM_COL32(165, 148, 118, 210), subtitle2);
 
     // "Open File" button.
     ImVec2 btn_size(240, 46);
@@ -2229,9 +3984,9 @@ void UIController::drawSplash(int W, int H) {
         float label_size = 12.0f;
         ImVec2 lsz = font->CalcTextSizeA(label_size, FLT_MAX, 0.0f, label);
         dl->AddCircleFilled(ImVec2(cx - half_w + 3.0f, top + lsz.y * 0.5f),
-                            3.0f, IM_COL32(96, 176, 246, 200), 12);
+                            3.0f, IM_COL32(255, 201, 58, 220), 12);
         dl->AddText(font, label_size, ImVec2(cx - half_w + 12.0f, top),
-                    IM_COL32(150, 174, 210, 230), label);
+                    IM_COL32(210, 195, 160, 230), label);
         // Divider: gradient hairline so the rule doesn't clip hard at either
         // end - matches the wordmark underline treatment.
         dl->AddRectFilledMultiColor(
@@ -2249,9 +4004,10 @@ void UIController::drawSplash(int W, int H) {
         size_t max_rows = 6;
         // Style push: transparent selectable so we can paint our own accent
         // hover state (a soft left-side bar) instead of the default filled
-        // rect - reads more like a modern list row.
-        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.24f, 0.36f, 0.58f, 0.35f));
-        ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0.30f, 0.48f, 0.78f, 0.55f));
+        // rect - reads more like a modern list row. Warm-brown hover /
+        // amber active to sit inside the banana palette.
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.42f, 0.32f, 0.14f, 0.35f));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive,  ImVec4(0.68f, 0.50f, 0.18f, 0.55f));
         for (size_t i = 0;
              i < recent_files_.size() && i < max_rows && (rec_y + row_h) < bottom_limit;
              ++i) {
@@ -2267,7 +4023,7 @@ void UIController::drawSplash(int W, int H) {
                 ImVec2 rmax = ImGui::GetItemRectMax();
                 dl->AddRectFilled(ImVec2(rmin.x - 6.0f, rmin.y + 3.0f),
                                   ImVec2(rmin.x - 3.0f, rmax.y - 3.0f),
-                                  IM_COL32(96, 176, 246, 230), 1.5f);
+                                  IM_COL32(255, 201, 58, 230), 1.5f);
             }
             if (clicked) loadPath(f);
             ImGui::PopID();
@@ -2289,9 +4045,9 @@ void UIController::drawSplash(int W, int H) {
     float total = vh.x + sep + vs.x;
     float base_x = W - total - 18.0f;
     dl->AddText(font, vf_size, ImVec2(base_x, H - 24.0f),
-                IM_COL32(140, 156, 190, 240), verhead);
+                IM_COL32(210, 188, 138, 240), verhead);
     dl->AddText(font, vf_size, ImVec2(base_x + vh.x + sep, H - 24.0f),
-                IM_COL32( 90, 104, 132, 220), stack);
+                IM_COL32(132, 120,  90, 220), stack);
 
     ImGui::End();
 }
@@ -2538,7 +4294,11 @@ void UIController::drawBottomOverlay(int W, int H, float alpha) {
                 float x = rmin.x + (float)(ch.start / dur) * (rmax.x - rmin.x);
                 if (std::fabs(mx - x) < 6.0f) { hover_ch = &ch; break; }
             }
-            if (hover_ch) {
+            // Suppress this stand-alone chapter tooltip when the
+            // thumbnail preview is active - the thumbnail popup embeds
+            // the chapter title itself, so drawing this one on top would
+            // be a duplicate.
+            if (hover_ch && !(thumbnail_preview_enabled_ && thumb_provider_)) {
                 char label[256];
                 if (!hover_ch->title.empty()) {
                     std::snprintf(label, sizeof(label), "%s  (%s)",
@@ -2913,9 +4673,85 @@ void UIController::drawBottomOverlay(int W, int H, float alpha) {
         show_playlist_ = !show_playlist_;
         nudgeVisible();
     }
+    // HDR tone-map toggle pill. Only shown when the loaded file is
+    // actually HDR - a plain SDR playback should never see it. Text pill
+    // instead of an icon because "HDR" is more legible than any glyph
+    // we could hand-draw at 34 px, and there's no established icon for
+    // "tone map on/off". Active state = tone map engaged (accent blue);
+    // inactive = passthrough (translucent). Same accent palette as the
+    // rest of the overlay so it doesn't stand out as a mismatch.
+    if (player_ && player_->getHdrKind() != VideoPlayer::HdrKind::None) {
+        ImGui::SameLine();
+        ImVec2 cursor = ImGui::GetCursorScreenPos();
+        ImVec2 pill_sz(btn_sz.x + 8.0f, btn_sz.y);
+        ImGui::PushID("hdr_toggle");
+        bool clicked  = ImGui::InvisibleButton("btn", pill_sz);
+        bool hovered  = ImGui::IsItemHovered();
+        bool held     = ImGui::IsItemActive();
+        ImGui::PopID();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 br(cursor.x + pill_sz.x, cursor.y + pill_sz.y);
+        float rounding = pill_sz.y * 0.30f;
+        ImU32 bg;
+        if (hdr_tonemap_enabled_) {
+            bg = held    ? IM_COL32( 64, 132, 216, 210)
+               : hovered ? IM_COL32(148, 202, 255, 235)
+                         : IM_COL32( 96, 176, 246, 225);
+        } else {
+            bg = held    ? IM_COL32(255, 255, 255,  55)
+               : hovered ? IM_COL32(255, 255, 255,  40)
+                         : IM_COL32(  0,   0,   0,   0);
+        }
+        bg = Style::Fade(bg, alpha);
+        if ((bg >> IM_COL32_A_SHIFT) != 0) {
+            dl->AddRectFilled(cursor, br, bg, rounding);
+        }
+        if (!hdr_tonemap_enabled_) {
+            // Hairline outline so the OFF state doesn't disappear over
+            // dark video. Matches the muted-icon color used at rest.
+            dl->AddRect(cursor, br,
+                        Style::Fade(IM_COL32(216, 222, 236, 130), alpha),
+                        rounding, 0, 1.0f);
+        }
+        ImU32 fg = hdr_tonemap_enabled_
+                       ? Style::Fade(IM_COL32(255, 255, 255, 255), alpha)
+                       : Style::Fade(IM_COL32(216, 222, 236, 255), alpha);
+        const char* label = "HDR";
+        ImVec2 lsz = ImGui::CalcTextSize(label);
+        dl->AddText(ImVec2(cursor.x + (pill_sz.x - lsz.x) * 0.5f,
+                           cursor.y + (pill_sz.y - lsz.y) * 0.5f),
+                    fg, label);
+        if (hovered) {
+            const char* kind_str =
+                (player_->getHdrKind() == VideoPlayer::HdrKind::PQ)  ? " PQ"
+              : (player_->getHdrKind() == VideoPlayer::HdrKind::HLG) ? " HLG"
+                                                                     : "";
+            ImGui::SetTooltip("HDR%s tone map: %s  (Shift+H)",
+                              kind_str,
+                              hdr_tonemap_enabled_ ? "on" : "off");
+        }
+        if (clicked) {
+            toggleHdrToneMap();
+            nudgeVisible();
+        }
+    }
     ImGui::SameLine();
+    // Gear icon = Settings dialog directly (Ctrl+, alt). The full main
+    // menu (file ops, playlist, per-file bits) is still one right-click
+    // away on the video surface, so the icon can be single-purpose.
     if (Style::IconButton("menu", Style::Icon::Settings, btn_sz,
-                          "Settings", false, 1.0f, alpha)) {
+                          "Settings (Ctrl+, / right-click video for menu)",
+                          show_settings_, 1.0f, alpha)) {
+        show_settings_ = !show_settings_;
+        if (show_settings_) {
+            show_shortcuts_ = false; show_about_ = false;
+            show_info_ = false;      show_history_ = false;
+        }
+    }
+    // Long-standing users still expect the popup menu on this icon -
+    // right-click on the icon itself as an escape hatch, in addition
+    // to right-clicking on the video area.
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
         ImGui::OpenPopup("main_menu");
     }
     ImGui::SameLine();
@@ -2927,7 +4763,7 @@ void UIController::drawBottomOverlay(int W, int H, float alpha) {
         setFullscreen(!fullscreen_);
     }
 
-    // Popup menu attached to the settings button
+    // Popup menu (right-click on gear icon opens this; left-click opens dialog above)
     if (ImGui::BeginPopup("main_menu")) {
         drawMainMenuContents();
         ImGui::EndPopup();
@@ -2959,13 +4795,31 @@ void UIController::drawSeekBarThumbnail(int W, int H, float duration) {
     if (frac > 1.0f) frac = 1.0f;
     double t = (double)frac * (double)duration;
 
+    // Chapter snap: if the cursor is close to a chapter tick, request
+    // the thumbnail AT the chapter start (not at the raw cursor time).
+    // Makes chapter preview reliable at any cursor precision and
+    // pairs the chapter title with the thumbnail below.
+    const VideoPlayer::Chapter* snap_ch = nullptr;
+    if (!chapters_.empty() && duration > 0.0f) {
+        float px_per_sec = (r.z - r.x) / (float)duration;
+        const float snap_px = 10.0f;
+        for (const auto& ch : chapters_) {
+            if (ch.start <= 0.05 || ch.start >= duration) continue;
+            float dx = std::fabs(((float)ch.start - (float)t) * px_per_sec);
+            if (dx <= snap_px) { snap_ch = &ch; t = ch.start; break; }
+        }
+    }
+
     ThumbnailProvider::Result res = thumb_provider_->requestAt(t);
 
     // Compute popup geometry - even without a texture yet, draw a small
     // "loading..." placeholder so the user sees feedback while the first
     // decode is in flight.
     const float pad = 4.0f;
-    const float label_h = ImGui::GetFontSize() + 2.0f;
+    // Extra title line when a chapter tick was snapped and it has a name.
+    const bool  has_chapter_line = snap_ch && !snap_ch->title.empty();
+    const float label_h = ImGui::GetFontSize() + 2.0f
+                          + (has_chapter_line ? (ImGui::GetFontSize() + 2.0f) : 0.0f);
     int tw = res.tex ? res.w : 200;
     int th = res.tex ? res.h : 112;
     // Fall back to a 16:9 placeholder if we don't know the aspect yet.
@@ -3012,11 +4866,32 @@ void UIController::drawSeekBarThumbnail(int W, int H, float duration) {
                     IM_COL32(200, 210, 230, 220), msg);
     }
 
-    // Time label below the image.
+    // Chapter title (when snapped) above the time label.
+    float ly = img_max.y + 2.0f;
+    if (has_chapter_line) {
+        // Truncate very long titles with an ellipsis so the popup width
+        // stays sane. box_w was computed from thumb width so we cap to
+        // (box_w - 2*pad) minus a safety margin.
+        std::string title = snap_ch->title;
+        float max_w = box_w - 2.0f * pad - 6.0f;
+        while (!title.empty()) {
+            ImVec2 ts = ImGui::CalcTextSize(title.c_str());
+            if (ts.x <= max_w) break;
+            title.pop_back();
+        }
+        if (title != snap_ch->title && title.size() > 1) {
+            title.replace(title.size() - 1, 1, "...");
+        }
+        ImVec2 tsz2 = ImGui::CalcTextSize(title.c_str());
+        float tx2 = box_x + (box_w - tsz2.x) * 0.5f;
+        dl->AddText(ImVec2(tx2, ly),
+                    IM_COL32(148, 202, 255, 255), title.c_str());
+        ly += ImGui::GetFontSize() + 2.0f;
+    }
+    // Time label.
     std::string tlabel = formatTime(t);
     ImVec2 lsz = ImGui::CalcTextSize(tlabel.c_str());
     float lx = box_x + (box_w - lsz.x) * 0.5f;
-    float ly = img_max.y + 2.0f;
     dl->AddText(ImVec2(lx, ly), IM_COL32(220, 230, 250, 255), tlabel.c_str());
 }
 
@@ -3113,6 +4988,10 @@ void UIController::drawMainMenuContents() {
         if (ImGui::MenuItem("Load Subtitle...", nullptr, false, player_->isLoaded())) {
             openSubtitleDialog();
         }
+        if (ImGui::MenuItem("Find subtitles online...", nullptr, false,
+                            player_->isLoaded())) {
+            searchSubtitlesOnline();
+        }
         if (ImGui::MenuItem("Enabled", "S", subtitles_enabled_)) {
             subtitles_enabled_ = !subtitles_enabled_;
             markConfigDirty();
@@ -3141,42 +5020,125 @@ void UIController::drawMainMenuContents() {
                 ImGui::EndMenu();
             }
         }
-        ImGui::Separator();
-        if (ImGui::BeginMenu("Size")) {
-            struct Entry { const char* label; SubtitleSize s; };
-            Entry opts[] = {
-                {"Small",  SubtitleSize::Small},
-                {"Medium", SubtitleSize::Medium},
-                {"Large",  SubtitleSize::Large},
-                {"XL",     SubtitleSize::XL},
-            };
-            for (auto& e : opts) {
-                if (ImGui::MenuItem(e.label, nullptr, subtitle_size_ == e.s)) {
-                    subtitle_size_ = e.s;
-                    markConfigDirty();
+        // Container-embedded subtitle tracks (MKV / MP4). Text-only:
+        // SRT / ASS / SSA / mov_text. Bitmap subs (PGS, DVB) show up
+        // as disabled entries. Rendered in the primary slot when no
+        // external sidecar is loaded.
+        {
+            auto tracks = player_->getEmbeddedSubtitleTracks();
+            if (!tracks.empty()) {
+                if (ImGui::BeginMenu("Embedded track (in file)")) {
+                    int cur = player_->getActiveEmbeddedSubtitle();
+                    if (ImGui::MenuItem("(none)", nullptr, cur < 0)) {
+                        player_->setActiveEmbeddedSubtitle(-1);
+                        showOsd("Embedded subs off", 1.4f);
+                    }
+                    for (size_t i = 0; i < tracks.size(); ++i) {
+                        const auto& t = tracks[i];
+                        char label[256];
+                        std::snprintf(label, sizeof(label),
+                                      "#%d  %s%s%s%s  [%s]%s",
+                                      t.stream_idx,
+                                      t.title.empty() ? "" : t.title.c_str(),
+                                      t.title.empty() ? "" : "  ",
+                                      t.language.empty() ? "" : "(",
+                                      t.language.empty() ? "" : t.language.c_str(),
+                                      t.codec_name.c_str(),
+                                      t.selectable ? "" : "  (unsupported)");
+                        bool active = ((int)i == cur);
+                        if (ImGui::MenuItem(label, nullptr, active, t.selectable)) {
+                            if (player_->setActiveEmbeddedSubtitle((int)i)) {
+                                // Mid-playback activation: subtitle packets
+                                // that already went past the demuxer were
+                                // dropped (no decoder was open then). Seek
+                                // slightly back so the decode thread re-
+                                // reads the region around the current head
+                                // and populates cues covering it. Skip when
+                                // near the start (nothing to seek to).
+                                double cur_t = player_->getCurrentTime();
+                                if (cur_t > 2.0) {
+                                    player_->seek(cur_t - 2.0);
+                                }
+                                char m[256];
+                                std::snprintf(m, sizeof(m), "Embedded subs: %s",
+                                              t.language.empty() ? t.codec_name.c_str()
+                                                                 : t.language.c_str());
+                                showOsd(m, 1.8f);
+                            } else {
+                                showOsd("Embedded subs: cannot open track", 2.0f);
+                            }
+                        }
+                    }
+                    ImGui::EndMenu();
                 }
             }
-            ImGui::Separator();
-            ImGui::TextDisabled("G cycles");
-            ImGui::EndMenu();
         }
-        char sync_buf[64];
-        std::snprintf(sync_buf, sizeof(sync_buf),
-                      "Sync offset: %+d ms",
-                      (int)std::lround(subtitle_offset_ * 1000.0));
-        ImGui::MenuItem(sync_buf, nullptr, false, false);
-        ImGui::TextDisabled("  Ctrl+Shift+Left/Right  .  Ctrl+Shift+0 reset");
+        if (subtitle_tracks_.size() > 1) {
+            // Secondary track picker for dual-subtitle display. Rendered
+            // BELOW the primary line in a smaller, dimmer style - typical
+            // learn-a-language layout (native tongue on top, target below).
+            if (ImGui::BeginMenu("Secondary track (dual subs)")) {
+                if (ImGui::MenuItem("(none)", nullptr,
+                                    subtitle_secondary_track_active_ < 0)) {
+                    subtitles_secondary_.clear();
+                    subtitle_secondary_cache_idx_ = 0;
+                    subtitle_secondary_track_active_ = -1;
+                    showOsd("Secondary subs off", 1.4f);
+                }
+                for (size_t i = 0; i < subtitle_tracks_.size(); ++i) {
+                    // Skip the one already used as primary - picking the
+                    // same file twice is never what the user wants.
+                    if ((int)i == subtitle_track_active_) continue;
+                    bool active = (int)i == subtitle_secondary_track_active_;
+                    if (ImGui::MenuItem(subtitle_tracks_[i].label.c_str(),
+                                        nullptr, active)) {
+                        if (loadSubtitleSidecarSecondary(
+                                subtitle_tracks_[i].path)) {
+                            subtitle_secondary_track_active_ = (int)i;
+                            char buf[192];
+                            std::snprintf(buf, sizeof(buf), "Secondary subs: %s",
+                                          subtitle_tracks_[i].label.c_str());
+                            showOsd(buf, 1.6f);
+                        } else {
+                            showOsd("Secondary subs load failed", 2.0f);
+                        }
+                    }
+                }
+                ImGui::EndMenu();
+            }
+        }
         ImGui::Separator();
-        if (ImGui::MenuItem("Background box", "B", subtitle_bg_)) {
-            subtitle_bg_ = !subtitle_bg_;
-            markConfigDirty();
+        {
+            // Read-only display of current per-file sync + position - the
+            // actual controls are keyboard-only for speed. Styling
+            // (size/color/outline/font/background) lives in Settings.
+            char sync_buf[64];
+            std::snprintf(sync_buf, sizeof(sync_buf),
+                          "Sync offset: %+d ms  (Ctrl+Shift+Left/Right)",
+                          (int)std::lround(subtitle_offset_ * 1000.0));
+            ImGui::MenuItem(sync_buf, nullptr, false, false);
+            char vpos_buf[64];
+            std::snprintf(vpos_buf, sizeof(vpos_buf),
+                          "Position: %+d%%  (Alt+Up/Down)",
+                          (int)std::lround(subtitle_vpos_ * 100.0f));
+            ImGui::MenuItem(vpos_buf, nullptr, false, false);
         }
-        char vpos_buf[64];
-        std::snprintf(vpos_buf, sizeof(vpos_buf),
-                      "Position: %+d%%",
-                      (int)std::lround(subtitle_vpos_ * 100.0f));
-        ImGui::MenuItem(vpos_buf, nullptr, false, false);
-        ImGui::TextDisabled("  Alt+Up/Down  .  Alt+0 reset");
+        ImGui::Separator();
+        // Language-learning helpers: quick clipboard capture + look up
+        // the currently-visible line in Google (redirects to whatever
+        // dictionary/translation service the user has set as default).
+        if (ImGui::MenuItem("Copy current line to clipboard",
+                            nullptr, false, player_->isLoaded()
+                                             && !(subtitles_.empty()
+                                                  && subtitles_secondary_.empty()))) {
+            copyCurrentSubtitleToClipboard();
+        }
+        if (ImGui::MenuItem("Look up current line in browser",
+                            nullptr, false, player_->isLoaded()
+                                             && !(subtitles_.empty()
+                                                  && subtitles_secondary_.empty()))) {
+            lookupCurrentSubtitleInBrowser();
+        }
         ImGui::EndMenu();
     }
 
@@ -3200,6 +5162,77 @@ void UIController::drawMainMenuContents() {
     }
 
     if (ImGui::MenuItem("Snapshot", "Ctrl+S", false, player_->isLoaded())) takeSnapshot();
+    {
+        bool have_ab = (loop_a_ >= 0.0 && loop_b_ >= 0.0);
+        char label[64];
+        if (have_ab) {
+            std::snprintf(label, sizeof(label),
+                          "Save A-B segment...  (%.1fs)",
+                          loop_b_ - loop_a_);
+        } else {
+            std::snprintf(label, sizeof(label),
+                          "Save A-B segment...  (set A and B first)");
+        }
+        if (ImGui::MenuItem(label, nullptr, false,
+                            player_->isLoaded() && have_ab)) {
+            exportABSegmentToFile();
+        }
+        char glabel[64];
+        if (have_ab) {
+            std::snprintf(glabel, sizeof(glabel),
+                          "Save A-B as GIF...  (%.1fs, max 20s)",
+                          loop_b_ - loop_a_);
+        } else {
+            std::snprintf(glabel, sizeof(glabel),
+                          "Save A-B as GIF...  (set A and B first)");
+        }
+        if (ImGui::MenuItem(glabel, nullptr, false,
+                            player_->isLoaded() && have_ab)) {
+            exportABSegmentAsGif();
+        }
+    }
+    if (ImGui::BeginMenu("Burst snapshots (Ctrl+Shift+G)", player_->isLoaded())) {
+        char label[64];
+        std::snprintf(label, sizeof(label),
+                      "Fire now  (%d x %.1fs)", burst_count_, burst_interval_);
+        if (ImGui::MenuItem(label, nullptr, false, player_->isLoaded())) {
+            triggerBurstSnapshot();
+        }
+        ImGui::Separator();
+        if (ImGui::BeginMenu("Count")) {
+            for (int n : {5, 10, 20, 50}) {
+                char l[16]; std::snprintf(l, sizeof(l), "%d", n);
+                if (ImGui::MenuItem(l, nullptr, burst_count_ == n)) {
+                    burst_count_ = n;
+                    markConfigDirty();
+                }
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Interval")) {
+            struct I { const char* label; float v; };
+            I opts[] = {
+                {"0.2 s", 0.2f}, {"0.5 s", 0.5f},
+                {"1.0 s", 1.0f}, {"2.0 s", 2.0f},
+            };
+            for (auto& e : opts) {
+                bool active = std::fabs(burst_interval_ - e.v) < 0.001f;
+                if (ImGui::MenuItem(e.label, nullptr, active)) {
+                    burst_interval_ = e.v;
+                    markConfigDirty();
+                }
+            }
+            ImGui::EndMenu();
+        }
+        if (burst_remaining_ > 0) {
+            ImGui::Separator();
+            char r[64]; std::snprintf(r, sizeof(r),
+                                     "In progress: %d left  (press again to cancel)",
+                                     burst_remaining_);
+            ImGui::TextDisabled("%s", r);
+        }
+        ImGui::EndMenu();
+    }
 
     if (ImGui::BeginMenu("Bookmarks", player_->isLoaded())) {
         if (ImGui::MenuItem("Add bookmark at current time", "Ctrl+M", false,
@@ -3278,17 +5311,20 @@ void UIController::drawMainMenuContents() {
         showOsd(always_on_top_ ? "Always on top" : "Always on top off");
         markConfigDirty();
     }
-    if (ImGui::MenuItem("Thumbnail preview on seek bar", nullptr,
-                        thumbnail_preview_enabled_)) {
-        thumbnail_preview_enabled_ = !thumbnail_preview_enabled_;
-        showOsd(thumbnail_preview_enabled_
-                    ? "Seek preview on"
-                    : "Seek preview off");
-        markConfigDirty();
+    if (ImGui::MenuItem("Picture in Picture", "Shift+P", pip_active_)) {
+        togglePipMode();
     }
-
+    if (ImGui::MenuItem("HDR tone map (SDR display)", "Shift+H",
+                        hdr_tonemap_enabled_)) {
+        toggleHdrToneMap();
+    }
     ImGui::Separator();
 
+    if (ImGui::MenuItem("Settings...", "Ctrl+,")) {
+        show_settings_ = true;
+        show_shortcuts_ = false; show_about_ = false;
+        show_info_ = false;      show_history_ = false;
+    }
     if (ImGui::MenuItem("Media Info", "I", false, player_->isLoaded())) {
         show_info_ = true; show_shortcuts_ = false; show_about_ = false;
         show_history_ = false;
@@ -3303,7 +5339,7 @@ void UIController::drawMainMenuContents() {
         show_info_ = false;
         show_history_ = false;
     }
-    if (ImGui::MenuItem("About Vela")) {
+    if (ImGui::MenuItem("About Banana Player")) {
         show_about_ = true;
         show_shortcuts_ = false;
         show_info_ = false;
@@ -3578,6 +5614,33 @@ void UIController::handleEvent(const SDL_Event& event) {
 
         nudgeVisible();
 
+        // Hardware media keys - Play/Pause, Stop, Next, Previous.
+        // SDL3 translates WM_APPCOMMAND / VK_MEDIA_* from Windows into
+        // these keycodes, which fire while the window has keyboard
+        // focus. (Truly global-hotkey behavior would need RegisterHotKey
+        // + SDL_SetWindowsMessageHook; not covered here.) Handled ahead
+        // of the plain-letter shortcuts so nothing else can eat them.
+        if (key == SDLK_MEDIA_PLAY_PAUSE || key == SDLK_MEDIA_PLAY) {
+            if (player_ && player_->isLoaded()) {
+                bool p = player_->isPlaying();
+                player_->togglePause();
+                showOsd(p ? "Pause" : "Play");
+            }
+            return;
+        }
+        if (key == SDLK_MEDIA_STOP) {
+            closeCurrent();
+            return;
+        }
+        if (key == SDLK_MEDIA_NEXT_TRACK) {
+            playNextInPlaylist();
+            return;
+        }
+        if (key == SDLK_MEDIA_PREVIOUS_TRACK) {
+            playPrevInPlaylist();
+            return;
+        }
+
         if (key == SDLK_SPACE) {
             if (player_->isLoaded()) {
                 bool p = player_->isPlaying();
@@ -3592,10 +5655,12 @@ void UIController::handleEvent(const SDL_Event& event) {
             return;
         }
         if (key == SDLK_ESCAPE) {
+            if (show_subtitle_search_) { show_subtitle_search_ = false; return; }
             if (show_shortcuts_) { show_shortcuts_ = false; return; }
             if (show_about_)     { show_about_    = false; return; }
             if (show_info_)      { show_info_     = false; return; }
             if (show_history_)   { show_history_  = false; return; }
+            if (show_settings_)  { show_settings_ = false; return; }
             if (show_playlist_)  { show_playlist_ = false; return; }
             if (fullscreen_)     { setFullscreen(false);   return; }
             return;
@@ -3616,6 +5681,16 @@ void UIController::handleEvent(const SDL_Event& event) {
             if (show_history_) {
                 show_shortcuts_ = false; show_about_ = false;
                 show_info_ = false;
+            }
+            return;
+        }
+        // Settings dialog (Ctrl+,). Convention across most Windows apps.
+        // Plain comma stays reserved for backward frame step.
+        if (key == SDLK_COMMA && (mod & SDL_KMOD_CTRL)) {
+            show_settings_ = !show_settings_;
+            if (show_settings_) {
+                show_shortcuts_ = false; show_about_ = false;
+                show_info_ = false; show_history_ = false;
             }
             return;
         }
@@ -3764,6 +5839,18 @@ void UIController::handleEvent(const SDL_Event& event) {
             return;
         }
         if (sc == SDL_SCANCODE_S && (mod & SDL_KMOD_CTRL)) { takeSnapshot(); return; }
+        // Ctrl+F - subtitle text search.
+        if (sc == SDL_SCANCODE_F && (mod & SDL_KMOD_CTRL) && !(mod & SDL_KMOD_SHIFT)) {
+            openSubtitleSearch();
+            return;
+        }
+        // Ctrl+Shift+G - burst-snapshot trigger (N shots at fixed
+        // interval, defaults 10x0.5s). Second press mid-burst cancels.
+        if (sc == SDL_SCANCODE_G
+            && (mod & SDL_KMOD_CTRL) && (mod & SDL_KMOD_SHIFT)) {
+            triggerBurstSnapshot();
+            return;
+        }
         // Ctrl+W closes the currently-loaded file (playlist stays intact
         // so the user can pick something else without re-scanning).
         if (sc == SDL_SCANCODE_W && (mod & SDL_KMOD_CTRL)) {
@@ -3808,7 +5895,16 @@ void UIController::handleEvent(const SDL_Event& event) {
             }
             return;
         }
-        if (sc == SDL_SCANCODE_P && !(mod & SDL_KMOD_CTRL)) {
+        // Shift+P - picture-in-picture toggle. Checked ahead of the
+        // plain-P playlist toggle so the modifier doesn't fall through.
+        if (sc == SDL_SCANCODE_P
+            && (mod & SDL_KMOD_SHIFT)
+            && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT))) {
+            togglePipMode();
+            return;
+        }
+        if (sc == SDL_SCANCODE_P
+            && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_SHIFT))) {
             show_playlist_ = !show_playlist_;
             return;
         }
@@ -3843,15 +5939,28 @@ void UIController::handleEvent(const SDL_Event& event) {
             snapWindowToVideo();
             return;
         }
-        // Shuffle toggle (H, no modifiers).
-        if (sc == SDL_SCANCODE_H && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT))) {
+        // HDR tone-map toggle (Shift+H). Silent when the current file
+        // isn't HDR - the toggle still flips but there's nothing to
+        // announce, so no OSD noise. Check BEFORE the plain-H Shuffle
+        // branch so Shift+H doesn't fall through to it.
+        if (sc == SDL_SCANCODE_H
+            && (mod & SDL_KMOD_SHIFT)
+            && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT))) {
+            toggleHdrToneMap();
+            return;
+        }
+        // Shuffle toggle (H, no modifiers - Shift is now reserved for
+        // the HDR toggle above).
+        if (sc == SDL_SCANCODE_H
+            && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_SHIFT))) {
             playlist_.setShuffle(!playlist_.shuffle());
             showOsd(playlist_.shuffle() ? "Shuffle on" : "Shuffle off");
             markConfigDirty();
             return;
         }
         // Always-on-top toggle (T, no modifiers).
-        if (sc == SDL_SCANCODE_T && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT))) {
+        if (sc == SDL_SCANCODE_T
+            && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_SHIFT))) {
             always_on_top_ = !always_on_top_;
             SDL_SetWindowAlwaysOnTop(window_, always_on_top_);
             showOsd(always_on_top_ ? "Always on top" : "Always on top off");
@@ -3874,7 +5983,7 @@ void UIController::handleEvent(const SDL_Event& event) {
         if (key == SDLK_PAGEUP)   { if (player_->isLoaded()) { player_->seekRelative( 30.0); SEEK_OSD("+ 30s"); } return; }
         if (key == SDLK_PAGEDOWN) { if (player_->isLoaded()) { player_->seekRelative(-30.0); SEEK_OSD("- 30s"); } return; }
         // Frame step. OSD is shown unconditionally (not gated behind
-        // NDEBUG like the ±5s / ±30s toasts) because a single-frame move
+        // NDEBUG like the +/-5s / +/-30s toasts) because a single-frame move
         // is often too small to spot visually - the user needs some
         // acknowledgement that the key press landed. Uses real fps with
         // a 30 fps fallback.
@@ -3941,6 +6050,24 @@ void UIController::handleEvent(const SDL_Event& event) {
             }
             return;
         }
+        // Ctrl+A - cycle audio track. Checked BEFORE the plain-A A-B
+        // loop toggle so the modifier doesn't fall through to it.
+        if (key == SDLK_A && (mod & SDL_KMOD_CTRL) && !(mod & SDL_KMOD_ALT)) {
+            cycleAudioTrack();
+            return;
+        }
+        // J - cycle external subtitle sidecar (mpv convention).
+        if (key == SDLK_J && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_SHIFT))) {
+            cycleSubtitleTrack();
+            return;
+        }
+        // Alt+0 - reset video zoom and pan to defaults.
+        if (key == SDLK_0 && (mod & SDL_KMOD_ALT)
+            && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_SHIFT))) {
+            resetVideoZoomPan();
+            showOsd("Zoom 100%  Pan 0", 1.2f);
+            return;
+        }
         if (key == SDLK_A && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT))) {
             cycleABLoop();
             return;
@@ -3956,6 +6083,26 @@ void UIController::handleEvent(const SDL_Event& event) {
             markConfigDirty();
             return;
         }
+    } else if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
+        // Auto-pause when the window loses keyboard focus. Only touches
+        // playback state if the toggle is on AND the video is currently
+        // playing - so backgrounding an already-paused clip stays paused.
+        // We remember that WE paused it so we can resume on focus regain.
+        if (pause_on_focus_loss_ && player_ && player_->isLoaded()
+            && player_->isPlaying()) {
+            player_->pause();
+            paused_by_focus_loss_ = true;
+        }
+    } else if (event.type == SDL_EVENT_WINDOW_FOCUS_GAINED) {
+        if (paused_by_focus_loss_ && player_ && player_->isLoaded()
+            && !player_->isPlaying()) {
+            player_->play();
+            // OSD once we're back so the user can attribute the resume
+            // to the auto-pause feature (and remember to turn it off if
+            // it's not what they wanted).
+            showOsd("Resumed (window focus)", 1.4f);
+        }
+        paused_by_focus_loss_ = false;
     } else if (event.type == SDL_EVENT_DROP_FILE) {
         if (event.drop.data) {
             std::string p = event.drop.data;
@@ -4005,7 +6152,76 @@ void UIController::handleEvent(const SDL_Event& event) {
         }
     } else if (event.type == SDL_EVENT_MOUSE_MOTION) {
         nudgeVisible();
+        // Alt+left-drag pan. Accumulates delta from the button-down
+        // anchor into video_pan_x_/y_ (normalized to a 0..1 fraction of
+        // window size, so the pan value stays sensible across resizes).
+        if (video_panning_ && window_) {
+            int ww = 1, wh = 1;
+            SDL_GetWindowSize(window_, &ww, &wh);
+            float dx = (event.motion.x - video_pan_start_x_) / (float)ww;
+            float dy = (event.motion.y - video_pan_start_y_) / (float)wh;
+            float nx = video_pan_orig_x_ + dx;
+            float ny = video_pan_orig_y_ + dy;
+            // Cap: keep at least a corner of the picture visible so a
+            // user can't lose it entirely off-screen.
+            if (nx < -1.5f) nx = -1.5f;  if (nx > 1.5f) nx = 1.5f;
+            if (ny < -1.5f) ny = -1.5f;  if (ny > 1.5f) ny = 1.5f;
+            video_pan_x_ = nx;
+            video_pan_y_ = ny;
+        }
+        // Click-and-drag window move. Promote the pending anchor to a
+        // real drag the first time the cursor travels > 4 px from the
+        // button-down point; that promotion also cancels the pending
+        // play/pause click so the drag doesn't also pause.
+        if (window_drag_pending_ && window_ && !fullscreen_) {
+            float dx = event.motion.x - window_drag_mouse_x_;
+            float dy = event.motion.y - window_drag_mouse_y_;
+            if (!window_dragging_ && (dx*dx + dy*dy) >= 16.0f) {
+                window_dragging_ = true;
+                pending_video_click_       = false;
+                pending_video_click_timer_ = 0.0f;
+            }
+            if (window_dragging_) {
+                // Move the OS window by the cursor delta. Use screen-
+                // relative global mouse pos so a fast drag that races
+                // the resulting window move (which changes the client
+                // origin the next motion event is relative to) still
+                // tracks the cursor 1:1. Global position isn't in the
+                // motion event, so query it fresh each tick.
+                float gx = 0.0f, gy = 0.0f;
+                SDL_GetGlobalMouseState(&gx, &gy);
+                int new_x = (int)std::lround(gx) - (int)window_drag_mouse_x_;
+                int new_y = (int)std::lround(gy) - (int)window_drag_mouse_y_;
+                SDL_SetWindowPosition(window_, new_x, new_y);
+            }
+        }
+    } else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP) {
+        if (event.button.button == SDL_BUTTON_LEFT && video_panning_) {
+            video_panning_ = false;
+        }
+        if (event.button.button == SDL_BUTTON_LEFT) {
+            window_drag_pending_ = false;
+            window_dragging_     = false;
+        }
     } else if (event.type == SDL_EVENT_MOUSE_WHEEL) {
+        // Ctrl+Wheel zooms the video (over any surface, so it also works
+        // while the cursor is on the seek bar or a button). Range 0.5 -
+        // 4.0 with a 1.05x per-notch multiplicative step so a few clicks
+        // feel proportional. Reset via Alt+0.
+        if ((SDL_GetModState() & SDL_KMOD_CTRL) && player_->isLoaded()) {
+            float factor = (event.wheel.y > 0 ? 1.05f : (1.0f / 1.05f));
+            float z = video_zoom_ * factor;
+            if (z < 0.50f) z = 0.50f;
+            if (z > 4.00f) z = 4.00f;
+            if (z != video_zoom_) {
+                video_zoom_ = z;
+                char buf[32]; std::snprintf(buf, sizeof(buf), "Zoom %d%%",
+                                            (int)std::lround(z * 100.0f));
+                showOsd(buf, 1.2f);
+            }
+            nudgeVisible();
+            return;
+        }
         // Shift+Wheel adjusts playback speed +/-0.05 (mirrors [ / ] keys),
         // clamped to the same 0.25-3.0 range. Checked before the seekbar/volume
         // branches so it fires anywhere over the window.
@@ -4086,12 +6302,40 @@ void UIController::handleEvent(const SDL_Event& event) {
             return;
         }
         if (io.WantCaptureMouse) return;
+        // Alt + left-drag pans the (zoomed) picture. Start point is
+        // captured here; the actual delta is applied in MOUSE_MOTION.
+        // We suppress the play/pause and fullscreen click behavior for
+        // this Alt-modified button-down so the pan doesn't also pause.
+        if (event.button.button == SDL_BUTTON_LEFT
+            && (SDL_GetModState() & SDL_KMOD_ALT)) {
+            video_panning_       = true;
+            video_pan_start_x_   = event.button.x;
+            video_pan_start_y_   = event.button.y;
+            video_pan_orig_x_    = video_pan_x_;
+            video_pan_orig_y_    = video_pan_y_;
+            pending_video_click_ = false;
+            pending_video_click_timer_ = 0.0f;
+            return;
+        }
         if (event.button.button == SDL_BUTTON_LEFT) {
             if (event.button.clicks >= 2) {
-                // Double-click -> fullscreen. Cancel any pending single-click
-                // toggle so a real double-click ends up as JUST fullscreen.
+                // Double-click -> fullscreen. Cancel any pending single-
+                // click toggle AND any pending / active window-drag
+                // anchor so a real double-click ends up as JUST
+                // fullscreen. Note: no anchor is recorded on this
+                // branch. On a double-click that EXITS fullscreen, the
+                // second-click DOWN arrives while the window origin has
+                // just changed under us, and event.button.x/y (which
+                // was client-relative to the fullscreen surface at
+                // (0,0)) numerically equals the global mouse - so if
+                // we recorded an anchor here and any pixel of jitter
+                // followed before button-up, the drag promotion would
+                // compute new_x = global - anchor ~ 0 and snap the
+                // window to the top-left corner.
                 pending_video_click_ = false;
                 pending_video_click_timer_ = 0.0f;
+                window_drag_pending_ = false;
+                window_dragging_     = false;
                 setFullscreen(!fullscreen_);
             } else if (player_->isLoaded()) {
                 // Single click: defer the toggle so a follow-up second click
@@ -4108,6 +6352,23 @@ void UIController::handleEvent(const SDL_Event& event) {
                 pending_video_click_ = true;
                 pending_video_click_timer_ = (float)(dct_ms + 20) / 1000.0f;
             }
+            // Record a window-drag anchor ONLY on a genuine single
+            // click (clicks == 1). MOUSE_MOTION promotes to a real
+            // drag once the cursor moves > ~4 px; that promotion also
+            // cancels pending_video_click_ so a drag never fires
+            // play/pause. Skipped in fullscreen (SDL_SetWindowPosition
+            // is a no-op there anyway) and on any clicks >= 2 event
+            // (see the double-click comment above for the fullscreen-
+            // exit bug that would otherwise fire).
+            if (event.button.clicks == 1 && !fullscreen_ && window_) {
+                window_drag_pending_ = true;
+                window_dragging_     = false;
+                window_drag_mouse_x_ = event.button.x;
+                window_drag_mouse_y_ = event.button.y;
+                SDL_GetWindowPosition(window_,
+                                      &window_drag_win_x_,
+                                      &window_drag_win_y_);
+            }
         }
     }
 }
@@ -4116,24 +6377,8 @@ void UIController::handleEvent(const SDL_Event& event) {
 
 namespace {
 
-std::string sidecarPath(const char* name) {
-    char buf[MAX_PATH];
-    DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return name;
-    std::string s(buf, n);
-    size_t p = s.find_last_of("\\/");
-    return (p == std::string::npos) ? std::string(name)
-                                    : (s.substr(0, p) + "\\" + name);
-}
-
-std::string configPath() {
-    char buf[MAX_PATH];
-    DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return "vela.config";
-    std::string s(buf, n);
-    size_t p = s.find_last_of("\\/");
-    return (p == std::string::npos) ? "vela.config" : (s.substr(0, p) + "\\vela.config");
-}
+std::string sidecarPath(const char* name) { return dataDir() + name; }
+std::string configPath()                   { return dataDir() + "vela.config"; }
 
 std::string strLower(std::string s) {
     for (auto& c : s) c = (char)std::tolower((unsigned char)c);
@@ -4176,7 +6421,15 @@ bool UIController::isVideoFile(const std::string& path) {
 void UIController::loadConfig() {
     std::string path = configPath();
     FILE* fp = nullptr;
-    if (fopen_s(&fp, path.c_str(), "rb") != 0 || !fp) return;
+    // First-run detection: the config sidecar is created lazily on the
+    // first quit. If it doesn't exist, we assume this is a fresh
+    // install and enable the welcome banner. The banner then persists
+    // `first_run_done=1` so a subsequent launch (with a config now on
+    // disk) suppresses it.
+    if (fopen_s(&fp, path.c_str(), "rb") != 0 || !fp) {
+        first_run_hint_pending_ = true;
+        return;
+    }
     char line[512];
     while (std::fgets(line, sizeof(line), fp)) {
         // Trim trailing CRLF
@@ -4202,8 +6455,83 @@ void UIController::loadConfig() {
             subtitle_vpos_ = std::clamp(f, -0.15f, 0.60f);
         }
         else if (std::strcmp(k, "subtitle_bg") == 0)     subtitle_bg_ = (std::atoi(v) != 0);
+        else if (std::strcmp(k, "subtitle_color") == 0) {
+            int i = std::atoi(v);
+            subtitle_color_ = (i == 1) ? SubColor::Yellow
+                            : (i == 2) ? SubColor::Cyan
+                            : (i == 3) ? SubColor::SkyBlue
+                            : (i == 4) ? SubColor::Pink
+                                       : SubColor::White;
+        }
+        else if (std::strcmp(k, "subtitle_outline") == 0) {
+            int i = std::atoi(v);
+            subtitle_outline_ = (i == 2) ? SubOutline::Thick
+                              : (i == 1) ? SubOutline::Normal
+                                         : SubOutline::Thin;
+        }
+        else if (std::strcmp(k, "subtitle_font") == 0) {
+            int i = std::atoi(v);
+            if (i < 0) i = 0; else if (i > 3) i = 3;
+            subtitle_font_ = i;
+        }
         else if (std::strcmp(k, "subtitles_enabled") == 0) subtitles_enabled_ = std::atoi(v) != 0;
         else if (std::strcmp(k, "always_on_top") == 0)   always_on_top_ = std::atoi(v) != 0;
+        else if (std::strcmp(k, "hdr_tonemap") == 0)     hdr_tonemap_enabled_ = std::atoi(v) != 0;
+        else if (std::strcmp(k, "audio_out_latency_ms") == 0) {
+            int i = std::atoi(v);
+            if (i < 0) i = 0; else if (i > 500) i = 500;
+            audio_out_latency_ms_ = i;
+        }
+        else if (std::strcmp(k, "loudness_normalize") == 0) {
+            loudness_normalize_ = std::atoi(v) != 0;
+        }
+        else if (std::strcmp(k, "hdr_half_res") == 0) {
+            // 0 = Off (default), 1 = Auto (on for 4K+ HDR), 2 = ForceOn.
+            int i = std::atoi(v);
+            if (i < 0) i = 0; else if (i > 2) i = 2;
+            hdr_half_res_mode_ = i;
+        }
+        else if (std::strcmp(k, "pause_on_focus_loss") == 0) pause_on_focus_loss_ = std::atoi(v) != 0;
+        else if (std::strcmp(k, "snapshot_overlays") == 0) snapshot_include_overlays_ = std::atoi(v) != 0;
+        else if (std::strcmp(k, "burst_count") == 0) {
+            int i = std::atoi(v); if (i > 0 && i <= 200) burst_count_ = i;
+        }
+        else if (std::strcmp(k, "burst_interval") == 0) {
+            float f = (float)std::atof(v);
+            if (f >= 0.05f && f <= 10.0f) burst_interval_ = f;
+        }
+        else if (std::strcmp(k, "snapshot_dir") == 0) {
+            // Values are stored as-is (no quoting) - stop at first
+            // newline. Empty string keeps the default (appDir()).
+            snapshot_dir_ = v ? v : "";
+        }
+        else if (std::strcmp(k, "normalize_mode") == 0) {
+            int i = std::atoi(v);
+            VideoPlayer::NormalizeMode m =
+                (i == 2) ? VideoPlayer::NormalizeMode::Strong
+              : (i == 1) ? VideoPlayer::NormalizeMode::Soft
+                         : VideoPlayer::NormalizeMode::Off;
+            if (player_) player_->setNormalizeMode(m);
+        }
+        else if (std::strcmp(k, "first_run_done") == 0) {
+            if (std::atoi(v) != 0) first_run_hint_pending_ = false;
+        }
+        else if (std::strcmp(k, "auto_next_countdown") == 0) {
+            int i = std::atoi(v);
+            if (i < 0) i = 0; else if (i > 60) i = 60;
+            auto_next_countdown_ = i;
+        }
+        else if (std::strcmp(k, "single_instance") == 0) {
+            single_instance_mode_ = std::atoi(v) != 0;
+        }
+        else if (std::strcmp(k, "deinterlace_mode") == 0) {
+            int i = std::atoi(v);
+            VideoPlayer::DeinterlaceMode m =
+                (i == 2) ? VideoPlayer::DeinterlaceMode::On
+              : (i == 0) ? VideoPlayer::DeinterlaceMode::Off
+                         : VideoPlayer::DeinterlaceMode::Auto;
+            if (player_) player_->setDeinterlaceMode(m);
+        }
         else if (std::strcmp(k, "repeat_mode") == 0) {
             int i = std::atoi(v);
             if (i < 0) i = 0; else if (i > 2) i = 2;
@@ -4226,28 +6554,77 @@ void UIController::loadConfig() {
     }
     std::fclose(fp);
     if (always_on_top_) SDL_SetWindowAlwaysOnTop(window_, true);
+    if (player_) {
+        player_->setHdrToneMapEnabled(hdr_tonemap_enabled_);
+        VideoPlayer::HdrHalfResMode m =
+            (hdr_half_res_mode_ == 2) ? VideoPlayer::HdrHalfResMode::ForceOn
+          : (hdr_half_res_mode_ == 1) ? VideoPlayer::HdrHalfResMode::Auto
+                                      : VideoPlayer::HdrHalfResMode::Off;
+        player_->setHdrHalfResMode(m);
+        player_->setAudioOutputLatencyMs(audio_out_latency_ms_);
+        player_->setLoudnessNormalize(loudness_normalize_);
+    }
 }
 
 void UIController::saveConfig() {
-    std::string path = configPath();
-    FILE* fp = nullptr;
-    if (fopen_s(&fp, path.c_str(), "wb") != 0 || !fp) return;
-    std::fprintf(fp, "# Vela persistent settings\n");
+    writeSidecarAtomic(configPath(), [&](std::FILE* fp) {
+    std::fprintf(fp, "# Banana Player persistent settings\n");
     std::fprintf(fp, "volume=%.4f\n",           player_->getVolume());
     std::fprintf(fp, "muted=%d\n",              player_->isMuted() ? 1 : 0);
     std::fprintf(fp, "subtitle_size=%d\n",      (int)subtitle_size_);
     std::fprintf(fp, "subtitle_offset=%.4f\n",  subtitle_offset_);
     std::fprintf(fp, "subtitle_vpos=%.3f\n",    subtitle_vpos_);
     std::fprintf(fp, "subtitle_bg=%d\n",        subtitle_bg_ ? 1 : 0);
+    std::fprintf(fp, "subtitle_color=%d\n",     (int)subtitle_color_);
+    std::fprintf(fp, "subtitle_outline=%d\n",   (int)subtitle_outline_);
+    std::fprintf(fp, "subtitle_font=%d\n",      subtitle_font_);
     std::fprintf(fp, "subtitles_enabled=%d\n",  subtitles_enabled_ ? 1 : 0);
     std::fprintf(fp, "always_on_top=%d\n",      always_on_top_ ? 1 : 0);
+    std::fprintf(fp, "hdr_tonemap=%d\n",        hdr_tonemap_enabled_ ? 1 : 0);
+    std::fprintf(fp, "audio_out_latency_ms=%d\n", audio_out_latency_ms_);
+    std::fprintf(fp, "loudness_normalize=%d\n",   loudness_normalize_ ? 1 : 0);
+    std::fprintf(fp, "hdr_half_res=%d\n",       hdr_half_res_mode_);
+    std::fprintf(fp, "pause_on_focus_loss=%d\n", pause_on_focus_loss_ ? 1 : 0);
+    std::fprintf(fp, "auto_next_countdown=%d\n", auto_next_countdown_);
+    std::fprintf(fp, "single_instance=%d\n",     single_instance_mode_ ? 1 : 0);
+    std::fprintf(fp, "snapshot_overlays=%d\n",   snapshot_include_overlays_ ? 1 : 0);
+    std::fprintf(fp, "burst_count=%d\n",         burst_count_);
+    std::fprintf(fp, "burst_interval=%.3f\n",    burst_interval_);
+    if (!snapshot_dir_.empty()) {
+        std::fprintf(fp, "snapshot_dir=%s\n",    snapshot_dir_.c_str());
+    }
+    {
+        int nm = 0;
+        if (player_) {
+            auto m = player_->getNormalizeMode();
+            nm = (m == VideoPlayer::NormalizeMode::Strong) ? 2
+               : (m == VideoPlayer::NormalizeMode::Soft)   ? 1
+                                                           : 0;
+        }
+        std::fprintf(fp, "normalize_mode=%d\n", nm);
+    }
+    // Once we've written a config file, the app has "seen" first run.
+    // Emit the flag unconditionally so any subsequent launch skips the
+    // welcome banner, regardless of whether the user dismissed it or
+    // just started playing something.
+    std::fprintf(fp, "first_run_done=1\n");
+    {
+        int dm = 0;   // Off default
+        if (player_) {
+            auto m = player_->getDeinterlaceMode();
+            dm = (m == VideoPlayer::DeinterlaceMode::On)  ? 2
+               : (m == VideoPlayer::DeinterlaceMode::Off) ? 0
+                                                          : 1;
+        }
+        std::fprintf(fp, "deinterlace_mode=%d\n", dm);
+    }
     std::fprintf(fp, "repeat_mode=%d\n",        (int)playlist_.repeatMode());
     std::fprintf(fp, "shuffle=%d\n",            playlist_.shuffle() ? 1 : 0);
     std::fprintf(fp, "thumbnail_preview=%d\n",  thumbnail_preview_enabled_ ? 1 : 0);
     std::fprintf(fp, "youtube_quality=%s\n",    youtubeQualityToString(youtube_quality_));
     // NOTE: rotation AND av_sync_offset are deliberately NOT saved -
     // both are per-file transients. See loadConfig for the ignore branches.
-    std::fclose(fp);
+    });
     config_dirty_ = false;
 }
 
@@ -4269,12 +6646,10 @@ void UIController::loadRecents() {
 }
 
 void UIController::saveRecents() {
-    std::string path = sidecarPath("vela.recent");
-    FILE* fp = nullptr;
-    if (fopen_s(&fp, path.c_str(), "wb") != 0 || !fp) return;
-    std::fprintf(fp, "# Vela recent files - most recent first\n");
-    for (const auto& p : recent_files_) std::fprintf(fp, "%s\n", p.c_str());
-    std::fclose(fp);
+    writeSidecarAtomic(sidecarPath("vela.recent"), [&](std::FILE* fp) {
+        std::fprintf(fp, "# Banana Player recent files - most recent first\n");
+        for (const auto& p : recent_files_) std::fprintf(fp, "%s\n", p.c_str());
+    });
 }
 
 void UIController::applyStoredWindowGeometry() {
@@ -4420,11 +6795,10 @@ void UIController::saveLastPlaylist() {
         std::remove(path.c_str());
         return;
     }
-    FILE* fp = nullptr;
-    if (fopen_s(&fp, path.c_str(), "wb") != 0 || !fp) return;
-    std::fprintf(fp, "#EXTM3U\n");
-    for (const auto& p : playlist_.items()) std::fprintf(fp, "%s\n", p.c_str());
-    std::fclose(fp);
+    writeSidecarAtomic(path, [&](std::FILE* fp) {
+        std::fprintf(fp, "#EXTM3U\n");
+        for (const auto& p : playlist_.items()) std::fprintf(fp, "%s\n", p.c_str());
+    });
 }
 
 // -------------- Open Folder + M3U --------------

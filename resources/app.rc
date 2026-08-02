@@ -8,8 +8,11 @@
 IDI_APPICON ICON "icon.ico"
 
 // Version info block shows up in File Properties -> Details.
-#define APP_VERSION       0,1,0,0
-#define APP_VERSION_STR   "0.1.0.0"
+// Bump in lockstep with Version.hpp / CMakeLists.txt project(...) - the
+// RC compiler can't include Version.hpp, so keep the three in sync by
+// hand. Comma-separated tuple + string are both required by VERSIONINFO.
+#define APP_VERSION       1,4,0,0
+#define APP_VERSION_STR   "1.4.0.0"
 
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION    APP_VERSION
@@ -24,12 +27,13 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "CompanyName",      "Vela"
-            VALUE "FileDescription",  "Vela Player"
+            VALUE "CompanyName",      "Banana Player"
+            VALUE "FileDescription",  "Banana Player - peel and play"
             VALUE "FileVersion",      APP_VERSION_STR
             VALUE "InternalName",     "Vela"
+            VALUE "LegalCopyright",   "MIT License. FFmpeg is LGPL - see LICENSE-3RDPARTY."
             VALUE "OriginalFilename", "Vela.exe"
-            VALUE "ProductName",      "Vela"
+            VALUE "ProductName",      "Banana Player"
             VALUE "ProductVersion",   APP_VERSION_STR
         END
     END
