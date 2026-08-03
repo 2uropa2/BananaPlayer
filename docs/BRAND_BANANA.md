@@ -73,9 +73,9 @@ WCAG AAA.
 
 1. **Name recognition.** "Banana" is written in katakana / hangul as
    [바나나](banana) in Korean and is universally understood - no
-   localization footnote needed. Unlike "Vela" (which lacked a hangul
-   pronunciation cue), 바나나 플레이어 is trivially typable and searchable
-   on Naver / Google KR.
+   localization footnote needed. Unlike the previous "Vela" name (which
+   lacked a hangul pronunciation cue), 바나나 플레이어 is trivially typable
+   and searchable on Naver / Google KR.
 2. **Color association.** Yellow reads "cheerful, casual" in the Korean
    consumer software market (Kakao's brand equity has done decades of that
    work for us). This is the opposite of the "corporate blue" many domestic
@@ -84,21 +84,26 @@ WCAG AAA.
 3. **Font ordering.** In dialogs that mix Latin + Hangul, keep the layout
    left-to-right and let Malgun handle the mixing - do NOT swap font atlases
    mid-line. The subtitle preset picker already handles this correctly.
-4. **Sidecar files retain the `vela.` prefix** (see rebrand notes) - Korean
-   users who have already accumulated watch history should experience zero
-   data loss on upgrade.
+4. **Sidecar files now use the `banana.` prefix** with a one-time
+   migration from any pre-rename `vela.*` files present next to the exe
+   on first launch, so Korean users who have already accumulated watch
+   history experience zero data loss on upgrade.
 
 ## Rebrand scope
 
-Display-name-only. Internal identifiers (`Vela.exe`, `%APPDATA%\Vela\`,
-`vela.config`, registry keys under `HKCR\Applications\Vela.exe`, CMake
-target `Vela`) stay exactly as they are. Renaming those would strip every
-existing user's watch history, resume positions, and file-association
-registrations on upgrade - a rebrand should never look like a data wipe.
+Full rename shipped. Internal identifiers were migrated across the board:
+`BananaPlayer.exe`, `%APPDATA%\BananaPlayer\`, `banana.config`, registry
+keys under `HKCR\Applications\BananaPlayer.exe`, CMake target
+`BananaPlayer`. A first-launch sidecar migration copies any legacy
+`vela.*` files (config / resume / bookmarks / recent / session.m3u /
+stats / hdrlut / window) to the `banana.*` names so an upgrading user's
+watch history, resume positions, and preferences carry over automatically.
+The installer replaces the old file-association registrations rather than
+duplicating them.
 
 User-facing strings that changed:
 
-- Splash wordmark ("VELA" -> "Banana Player" / "바나나 플레이어")
+- Splash wordmark (old "VELA" -> "Banana Player" / "바나나 플레이어")
 - Splash tagline
 - About panel wordmark, tagline, menu item ("About Vela" -> "About Banana Player")
 - Window title ("<file> - Vela" -> "<file> - Banana Player")

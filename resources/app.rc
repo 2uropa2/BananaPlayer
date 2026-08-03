@@ -30,9 +30,9 @@ BEGIN
             VALUE "CompanyName",      "Banana Player"
             VALUE "FileDescription",  "Banana Player - peel and play"
             VALUE "FileVersion",      APP_VERSION_STR
-            VALUE "InternalName",     "Vela"
+            VALUE "InternalName",     "BananaPlayer"
             VALUE "LegalCopyright",   "MIT License. FFmpeg is LGPL - see LICENSE-3RDPARTY."
-            VALUE "OriginalFilename", "Vela.exe"
+            VALUE "OriginalFilename", "BananaPlayer.exe"
             VALUE "ProductName",      "Banana Player"
             VALUE "ProductVersion",   APP_VERSION_STR
         END

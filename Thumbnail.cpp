@@ -34,6 +34,12 @@ void ThumbnailProvider::openFile(const std::string& path) {
         reopen_requested_ = true;
         // Any pending job from the previous file is meaningless now.
         has_pending_ = false;
+        // Bump generation. Old-file decodes still in flight will land
+        // in pending_uploads_ with the pre-bump generation number;
+        // the main-thread drain discards them by generation mismatch,
+        // preventing the old file's frames from getting cached under
+        // bucket keys the new file's requests will hit.
+        ++current_generation_;
     }
     // Destroy all cached textures for the previous file (main thread call).
     for (auto& e : cache_) {
@@ -55,6 +61,7 @@ void ThumbnailProvider::close() {
         close_requested_ = true;
         has_pending_ = false;
         pending_uploads_.clear();
+        ++current_generation_;   // same rationale as openFile
     }
     // Main-thread texture destruction.
     for (auto& e : cache_) {
@@ -105,11 +112,17 @@ void ThumbnailProvider::drainPendingUploadsMainThread() {
     // Move ownership of the queued uploads to a local first so we can
     // release the mutex before spending time on SDL calls.
     std::deque<PendingUpload> local;
+    uint64_t gen_now = 0;
     {
         std::lock_guard<std::mutex> lk(mutex_);
         local.swap(pending_uploads_);
+        gen_now = current_generation_;
     }
     for (auto& up : local) {
+        // Discard uploads stamped with an obsolete generation - they
+        // were decoded against the pre-openFile file and should NOT
+        // land in the cache (bucket_key alone isn't file-unique).
+        if (up.generation != gen_now) continue;
         // If a bucket already lives in the cache (a duplicate finished
         // decode) skip creating a second texture.
         if (findByBucket(up.bucket_key)) continue;
@@ -164,6 +177,11 @@ void ThumbnailProvider::workerLoop() {
                 target = pending_target_;
                 has_pending_ = false;
                 do_decode = true;
+                // Snapshot the generation we're decoding under. If
+                // openFile bumps current_generation_ mid-decode, this
+                // captured value is what the pending upload gets tagged
+                // with, and the main-thread drain will discard it.
+                worker_generation_ = current_generation_;
             }
         }
         if (do_close) {
@@ -371,6 +389,7 @@ void ThumbnailProvider::decodeOne(double target_pts) {
     up.pts = got_pts;
     up.w = out_w;
     up.h = out_h;
+    up.generation = worker_generation_;   // set by workerLoop at decode start
     up.rgba = std::move(buf);
     {
         std::lock_guard<std::mutex> lk(mutex_);

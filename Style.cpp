@@ -468,6 +468,25 @@ void DrawIcon(ImDrawList* dl, ImVec2 c, float s, Icon icon, ImU32 col) {
                           ImVec2(c.x + s * 0.11f, c.y + s * 0.55f), col, s * 0.08f);
         break;
     }
+    case Icon::Subtitle: {
+        // CC-style: rounded rectangle frame containing two short
+        // horizontal bars (short + long) suggesting subtitle text.
+        // Reads at 12 px sizes because the frame silhouette dominates.
+        ImVec2 tl(c.x - s * 0.85f, c.y - s * 0.55f);
+        ImVec2 br(c.x + s * 0.85f, c.y + s * 0.55f);
+        dl->AddRect(tl, br, col, s * 0.20f, 0, t * 0.95f);
+        // Two lines inside the frame - top row narrower, bottom wider.
+        float bar_h = s * 0.16f;
+        float y1 = c.y - s * 0.20f - bar_h * 0.5f;
+        float y2 = c.y + s * 0.20f - bar_h * 0.5f;
+        dl->AddRectFilled(ImVec2(c.x - s * 0.55f, y1),
+                          ImVec2(c.x + s * 0.30f, y1 + bar_h),
+                          col, s * 0.06f);
+        dl->AddRectFilled(ImVec2(c.x - s * 0.60f, y2),
+                          ImVec2(c.x + s * 0.60f, y2 + bar_h),
+                          col, s * 0.06f);
+        break;
+    }
     }
 }
 

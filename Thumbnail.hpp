@@ -106,6 +106,16 @@ private:
     // always chases the freshest pointer position.
     bool   has_pending_ = false;
     double pending_target_ = 0.0;
+    // File generation counter, bumped on every openFile / close.
+    // The worker's in-flight decode carries the generation it started
+    // with; the main-thread drain compares against current_generation_
+    // and discards any pending upload whose generation is stale. Without
+    // this, an old-file decode that finishes AFTER an openFile clear
+    // would land in the cache under a bucket_key shared with the new
+    // file - and later a matching-t hover would surface the old file's
+    // frame.
+    uint64_t current_generation_ = 0;
+    uint64_t worker_generation_  = 0;   // stamped by workerLoop at decode start
 
     std::mutex mutex_;
     std::condition_variable cv_;
@@ -113,10 +123,11 @@ private:
     // Pending upload = worker finished a decode, main thread hasn't
     // yet turned it into an SDL_Texture. Guarded by mutex_.
     struct PendingUpload {
-        int64_t bucket_key = 0;
-        double  pts = 0.0;
-        int     w = 0;
-        int     h = 0;
+        int64_t  bucket_key = 0;
+        double   pts = 0.0;
+        int      w = 0;
+        int      h = 0;
+        uint64_t generation = 0;
         std::vector<uint8_t> rgba;  // packed RGBA8, tightly packed rows
     };
     std::deque<PendingUpload> pending_uploads_;

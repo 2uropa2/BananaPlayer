@@ -27,10 +27,18 @@ enum class Icon {
     StepBack,
     StepForward,
     Info,
+    Subtitle,   // CC-style rectangle with two subtitle lines
 };
 
 void SetupDarkTheme();
 void LoadFonts(float ui_scale = 1.0f);
+
+// Subtitle font presets. LoadFonts populates each of these; a nullptr
+// return means the font wasn't available on this system - callers
+// should fall back to the default. Kept small: adding more presets
+// each requires an extra atlas slot and startup work.
+enum class SubtitleFont { Default, MalgunBold, Gulim, Batang };
+ImFont* GetSubtitleFont(SubtitleFont f);
 
 // Draw a stateless icon at `center` within the current window's foreground draw list.
 void DrawIcon(ImDrawList* dl, ImVec2 center, float size, Icon icon, ImU32 color);

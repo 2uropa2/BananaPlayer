@@ -30,7 +30,10 @@ TEST_CASE("isValidUtf8 rejects obviously invalid bytes") {
 }
 
 TEST_CASE("isValidUtf8 rejects CP949 bytes typical of Korean text") {
-    // "가나다" in CP949 = B0 A1 B3 AA B4 D9. Not valid UTF-8.
+    // Byte pattern B0 A1 B3 AA B4 D9 is CP949 for the three-syllable
+    // "GaNaDa" test string. Not valid UTF-8 - two of the leading bytes
+    // (0xB0, 0xB3, 0xB4) start a 4-byte UTF-8 sequence but the follow
+    // bytes are not 10xxxxxx, so a strict validator must reject.
     CHECK_FALSE(isValidUtf8("\xB0\xA1\xB3\xAA\xB4\xD9"));
 }
 

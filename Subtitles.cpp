@@ -282,12 +282,21 @@ std::vector<SubtitleCue> parseSMI(std::string_view utf8, std::string_view prefer
             if (sp != std::string::npos) {
                 ++sp;
                 while (sp < syncTag.size() && (syncTag[sp] == ' ' || syncTag[sp] == '"' || syncTag[sp] == '\'')) ++sp;
-                long long ms = 0;
+                unsigned long long ms = 0;
                 bool any = false;
+                // Cap the accumulator so a malformed 20-digit timestamp
+                // in a broken SMI file doesn't trigger signed overflow
+                // (UB) or wrap. 10^15 ms == ~31,700 years - plenty of
+                // headroom for any real cue and safely within uint64
+                // range for the multiply.
+                constexpr unsigned long long kSmiMsCap = 1000000000000000ULL;
                 while (sp < syncTag.size() && syncTag[sp] >= '0' && syncTag[sp] <= '9') {
-                    ms = ms * 10 + (syncTag[sp] - '0'); ++sp; any = true;
+                    if (ms < kSmiMsCap) {
+                        ms = ms * 10 + (unsigned long long)(syncTag[sp] - '0');
+                    }
+                    ++sp; any = true;
                 }
-                if (any) start_sec = ms / 1000.0;
+                if (any) start_sec = (double)ms / 1000.0;
             }
         }
 

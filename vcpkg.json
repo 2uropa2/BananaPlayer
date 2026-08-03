@@ -1,0 +1,23 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "banana-player",
+  "version-string": "1.4.0",
+  "description": "Banana Player - keyboard-first Windows video player",
+  "dependencies": [
+    "sdl3",
+    {
+      "name": "imgui",
+      "features": ["sdl3-binding", "sdl3-renderer-binding"]
+    },
+    {
+      "name": "ffmpeg",
+      "features": [
+        "avcodec",
+        "avformat",
+        "avfilter",
+        "swresample",
+        "swscale"
+      ]
+    }
+  ]
+}

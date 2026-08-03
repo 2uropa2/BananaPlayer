@@ -2,6 +2,7 @@
 #include <SDL3/SDL_main.h>
 
 #include "VideoPlayer.hpp"
+#include "License.hpp"
 #include "UIController.hpp"
 #include "Style.hpp"
 #include "SingleInstance.hpp"
@@ -141,7 +142,7 @@ void renderOneFrame() {
 #ifdef _WIN32
 // Timer id used to drive rendering during the modal move/size loop.
 // Arbitrary but unique-within-window value.
-constexpr UINT_PTR kModalLoopTimerId = 0x56454C41;   // 'VELA'
+constexpr UINT_PTR kModalLoopTimerId = 0x42414E41;   // 'BANA'
 
 bool SDLCALL modalRenderMessageHook(void* userdata, MSG* msg) {
     (void)userdata;
@@ -163,10 +164,54 @@ bool SDLCALL modalRenderMessageHook(void* userdata, MSG* msg) {
 }   // anonymous namespace
 
 int main(int argc, char* argv[]) {
+    // License key generation mode. Server-side use: takes an email
+    // (after payment) and prints the matching Pro key to stdout so
+    // the delivery pipeline can email it to the buyer. Never runs
+    // any SDL / UI code - pure crypto + print.
+    //   BananaPlayer.exe --gen-license user@example.com
+    for (int i = 1; i < argc - 1; ++i) {
+        if (argv[i] && std::strcmp(argv[i], "--gen-license") == 0) {
+            // Release builds link as WINDOWS subsystem; stdout redirection
+            // from cmd/pwsh is unreliable. Write to a file arg instead:
+            //   BananaPlayer.exe --gen-license user@example.com key.txt
+            // The file receives one line with the key (no trailing LF).
+            const char* email = argv[i + 1];
+            std::string k = License::keyForEmail(email);
+            if (k.empty()) return 2;
+            const char* out_path = (i + 2 < argc) ? argv[i + 2] : nullptr;
+            if (!out_path) return 3;
+            std::FILE* f = std::fopen(out_path, "wb");
+            if (!f) return 4;
+            std::fwrite(k.data(), 1, k.size(), f);
+            std::fclose(f);
+            return 0;
+        }
+    }
+    // Smoke-test flag. Used by CI + local `install_local.ps1` follow-ups
+    // to verify the built exe can actually get through SDL init, window
+    // creation, ImGui bootstrap, font atlas load, UIController ctor
+    // (which reads every sidecar), and a couple of render frames -
+    // then exit 0. If any of that crashes, exit code is non-zero and
+    // CI catches the regression before it reaches users.
+    //   BananaPlayer.exe --check
+    // Skips single-instance handoff (would falsely forward + exit)
+    // and skips the interactive event loop.
+    bool smoke_check = false;
+    for (int i = 1; i < argc; ++i) {
+        if (argv[i] && (std::strcmp(argv[i], "--check") == 0
+                     || std::strcmp(argv[i], "--smoke-test") == 0)) {
+            smoke_check = true;
+            break;
+        }
+    }
 #ifdef _WIN32
     // Single-instance handoff. Read the persisted setting BEFORE SDL
     // init so the "forward + exit" fast path skips window creation.
-    bool single_instance_wanted = SingleInstance::peekPolicyFromConfig();
+    // (Skipped in smoke-test mode - we want a real init path here.)
+    bool single_instance_wanted = false;
+    if (!smoke_check) {
+        single_instance_wanted = SingleInstance::peekPolicyFromConfig();
+    }
     if (single_instance_wanted) {
         if (!SingleInstance::activate()) {
             // Another instance already primary. Forward each arg
@@ -262,6 +307,12 @@ int main(int argc, char* argv[]) {
 
     bool quit = false;
     ui.onExitRequested = [&]() { quit = true; };
+    // Smoke test: render a few frames then exit. Verifies the whole
+    // init chain (SDL video/audio/window/renderer + ImGui + font atlas
+    // + UIController ctor + all sidecar loads + Promo start + splash
+    // draw) completes without crashing. Any exception / assertion
+    // failure surfaces as non-zero exit code.
+    int smoke_frames_remaining = smoke_check ? 3 : 0;
 
     // Publish the render state to the file-scope AppRenderCtx so
     // renderOneFrame() (called both from the main loop and from the
@@ -349,6 +400,16 @@ int main(int argc, char* argv[]) {
         // Windows message hook can call the same code path while the
         // user is dragging the title bar or resizing the window edge.
         renderOneFrame();
+
+        // Smoke-test countdown. Every rendered frame we get past has
+        // exercised the same code paths a normal user would; three is
+        // enough to catch init-time crashes without hanging CI.
+        if (smoke_frames_remaining > 0) {
+            if (--smoke_frames_remaining == 0) {
+                std::fprintf(stderr, "smoke-test: OK (3 frames rendered)\n");
+                quit = true;
+            }
+        }
     }
 
     if (g_app.video_texture) SDL_DestroyTexture(g_app.video_texture);

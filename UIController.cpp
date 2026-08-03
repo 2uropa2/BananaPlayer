@@ -1,4 +1,6 @@
 #include "UIController.hpp"
+#include "License.hpp"
+#include "Promo.hpp"
 #include "SingleInstance.hpp"
 #include "Thumbnail.hpp"
 #include "Version.hpp"
@@ -39,7 +41,7 @@ namespace {
 // MoveFileEx to the real path. On Windows same-volume MoveFileEx is
 // atomic, so a crash / power loss during the write leaves the ORIGINAL
 // file intact instead of a half-truncated one. Used for every sidecar
-// (vela.resume / .bookmarks / .stats / .config / .recent / .session.m3u
+// (banana.resume / .bookmarks / .stats / .config / .recent / .session.m3u
 // / .hdrlut). Small files (<50 KB) but truncate-then-write was leaving
 // users without their last watched position after a crash.
 template <class Writer>
@@ -93,13 +95,13 @@ std::string appDir() {
     return (p == std::string::npos) ? "." : s.substr(0, p);
 }
 
-// Writable-for-sure sidecar location. When Vela is installed under
-// C:\Program Files\..., appDir() is admin-only and fopen("wb") on
-// vela.config there silently drops the file (no VirtualStore either
+// Writable-for-sure sidecar location. When Banana Player is installed
+// under C:\Program Files\..., appDir() is admin-only and fopen("wb") on
+// banana.config there silently drops the file (no VirtualStore either
 // on modern Windows for unmanifested exes) - the symptom is "settings
 // don't persist across launches". Route sidecars through
-// %APPDATA%\Vela\ instead. SDL_GetPrefPath creates the directory as a
-// side effect and returns a trailing-slash path.
+// %APPDATA%\BananaPlayer\ instead. SDL_GetPrefPath creates the directory
+// as a side effect and returns a trailing-slash path.
 //
 // A one-time migration in `migrateSidecarsToDataDir` copies files
 // found in appDir() to dataDir() on first read, so users who ran an
@@ -107,11 +109,11 @@ std::string appDir() {
 std::string dataDir() {
     static std::string cached;
     if (!cached.empty()) return cached;
-    // SDL_GetPrefPath("Vela", "Vela") -> "%APPDATA%\Vela\Vela\" which
-    // is nested one too deep. Pass empty org so the layout is
-    // "%APPDATA%\Vela\" - matches most well-behaved Windows apps.
+    // SDL_GetPrefPath("Banana", "BananaPlayer") -> nested one too deep.
+    // Pass empty org so the layout is "%APPDATA%\BananaPlayer\" -
+    // matches most well-behaved Windows apps.
     // Falls back to appDir() only if SDL failed (never seen in prod).
-    const char* p = SDL_GetPrefPath("", "Vela");
+    const char* p = SDL_GetPrefPath("", "BananaPlayer");
     if (p && *p) {
         cached = p;
         // SDL_GetPrefPath returns a pointer we don't free (SDL3 owns).
@@ -124,26 +126,62 @@ std::string dataDir() {
 // Migration: for each named sidecar, if it exists in appDir() but NOT
 // in dataDir(), copy it over. Preserves state for users who launched
 // old builds from the source tree before dataDir was introduced.
+// Also copies %APPDATA%\Vela\vela.* -> %APPDATA%\BananaPlayer\banana.*
+// so users upgrading from the pre-rename builds keep their settings,
+// resume points, bookmarks, recent files, and session playlist.
 // Called once from UIController's ctor before any sidecar reads.
 static void migrateSidecarsToDataDir() {
     static bool done = false;
     if (done) return;
     done = true;
+    // Current-generation sidecar filenames.
     const char* names[] = {
-        "vela.config", "vela.resume", "vela.bookmarks",
-        "vela.recent", "vela.session.m3u",
-        "vela.stats",  "vela.hdrlut"
+        "banana.config", "banana.resume", "banana.bookmarks",
+        "banana.recent", "banana.session.m3u",
+        "banana.stats",  "banana.hdrlut"
     };
-    std::string src_base = appDir() + "\\";
     std::string dst_base = dataDir();
-    for (const char* nm : names) {
-        std::string src = src_base + nm;
-        std::string dst = dst_base + nm;
-        DWORD dst_attr = GetFileAttributesA(dst.c_str());
-        if (dst_attr != INVALID_FILE_ATTRIBUTES) continue;   // dst exists
-        DWORD src_attr = GetFileAttributesA(src.c_str());
-        if (src_attr == INVALID_FILE_ATTRIBUTES) continue;   // src missing
-        CopyFileA(src.c_str(), dst.c_str(), TRUE);
+
+    // Pass 1: exe-adjacent -> dataDir (source-tree-run users).
+    {
+        std::string src_base = appDir() + "\\";
+        for (const char* nm : names) {
+            std::string src = src_base + nm;
+            std::string dst = dst_base + nm;
+            if (GetFileAttributesA(dst.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+            if (GetFileAttributesA(src.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+            CopyFileA(src.c_str(), dst.c_str(), TRUE);
+        }
+    }
+
+    // Pass 2: legacy %APPDATA%\Vela\vela.* -> %APPDATA%\BananaPlayer\banana.*
+    // (Vela-era users upgrading in place).
+    {
+        const char* appdata = std::getenv("APPDATA");
+        if (!appdata) return;
+        std::string legacy_dir = std::string(appdata) + "\\Vela\\";
+        if (GetFileAttributesA(legacy_dir.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+        const char* legacy_names[] = {
+            "vela.config", "vela.resume", "vela.bookmarks",
+            "vela.recent", "vela.session.m3u",
+            "vela.stats",  "vela.hdrlut"
+        };
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+            std::string src = legacy_dir + legacy_names[i];
+            std::string dst = dst_base + names[i];
+            if (GetFileAttributesA(dst.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+            if (GetFileAttributesA(src.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+            CopyFileA(src.c_str(), dst.c_str(), TRUE);
+        }
+        // Legacy window geometry uses the same filename in both eras.
+        {
+            std::string src = legacy_dir + "vela.window";
+            std::string dst = dst_base + "banana.window";
+            if (GetFileAttributesA(dst.c_str()) == INVALID_FILE_ATTRIBUTES &&
+                GetFileAttributesA(src.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                CopyFileA(src.c_str(), dst.c_str(), TRUE);
+            }
+        }
     }
 }
 
@@ -161,11 +199,11 @@ std::string timestampString() {
     return buf;
 }
 
-// Sidecar files all sit under dataDir() (usually %APPDATA%\Vela\).
+// Sidecar files all sit under dataDir() (usually %APPDATA%\BananaPlayer\).
 // See dataDir() for the "why not exe-adjacent" rationale.
-std::string resumeIndexPath()   { return dataDir() + "vela.resume"; }
-std::string bookmarkIndexPath() { return dataDir() + "vela.bookmarks"; }
-std::string statsIndexPath()    { return dataDir() + "vela.stats"; }
+std::string resumeIndexPath()   { return dataDir() + "banana.resume"; }
+std::string bookmarkIndexPath() { return dataDir() + "banana.bookmarks"; }
+std::string statsIndexPath()    { return dataDir() + "banana.stats"; }
 
 std::string openFileDialogWin() {
     OPENFILENAMEA ofn = {};
@@ -212,9 +250,21 @@ UIController::UIController(VideoPlayer* player, SDL_Window* window, SDL_Renderer
     // couldn't be dragged (SDL_MaximizeWindow + a bad clamp interaction
     // on the CENTERED sentinel). Re-enable only after both are fixed.
     // applyStoredWindowGeometry();
+    // License first, so Promo::start sees the correct suppressed state
+    // on its first render (Pro users never flash the promo banner even
+    // for a frame). init() also verifies the saved key against the
+    // current baked secret; a mismatch means the file was tampered or
+    // the key was minted for a different major version.
+    License::init(dataDir());
+    // Promo slot bootstrap. Fetch runs on a background thread so the
+    // splash never waits on network. Cache lives under dataDir().
+    Promo::start(dataDir());
 }
 
 UIController::~UIController() {
+    // Stop the promo fetcher before we start tearing anything down -
+    // its background thread must join cleanly before app exit.
+    Promo::shutdown();
     snapshotCurrentResume();
     if (resume_dirty_) writeResumeIndex();
     if (bookmark_dirty_) writeBookmarkIndex();
@@ -423,7 +473,7 @@ void UIController::clearBookmarks() {
 
 // ---------- Playback statistics ----------
 //
-// vela.stats sidecar layout: one line per file.
+// banana.stats sidecar layout: one line per file.
 //   <seconds><TAB><sessions><TAB><path>
 // Newest-first (MRU) so trimming to 500 drops the oldest.
 
@@ -588,6 +638,9 @@ bool UIController::loadPath(const std::string& path) {
     burst_remaining_ = 0;
     burst_next_at_   = 0.0f;
     video_panning_   = false;
+    // Chapter announcer resets so the FIRST chapter of the new file
+    // gets a "Chapter: X" toast when playback settles on it.
+    last_chapter_announced_ = -1;
     // Attempt to auto-load companion .srt / .smi.
     loadCompanionSubs(path);
 
@@ -733,7 +786,7 @@ bool UIController::loadPath(const std::string& path) {
 void UIController::enqueuePaths(const std::vector<std::string>& paths, bool play_first) {
     if (paths.empty()) return;
     // Expand any directory arguments to their video children so both CLI
-    // (`Vela.exe C:\videos`) and drag-drop of a folder do the intuitive
+    // (`BananaPlayer.exe C:\videos`) and drag-drop of a folder do the intuitive
     // thing. Non-directory paths are passed through untouched (FFmpeg can
     // still surface a "Cannot open" for anything it doesn't like).
     std::vector<std::string> expanded;
@@ -917,8 +970,13 @@ void UIController::addRecent(const std::string& path) {
 }
 
 void UIController::showOsd(const std::string& text, float duration) {
-    OsdMsg m{ text, duration, duration };
-    osd_.push_back(std::move(m));
+    // Single-slot OSD: a new message REPLACES whatever was showing. Prior
+    // behavior stacked messages down the right edge, which visually piled
+    // up during a burst of nudges (Ctrl+Left / Left + volume wheel, etc.)
+    // and each pill occupied a row for its full duration. User prefers a
+    // single anchored spot that always reflects the latest state.
+    osd_.clear();
+    osd_.push_back(OsdMsg{ text, duration, duration });
 }
 
 void UIController::nudgeVisible() {
@@ -937,7 +995,7 @@ void UIController::nudgeVisible() {
 
 void UIController::takeSnapshot() {
     if (!player_->isLoaded()) return;
-    // Default location: dataDir() (usually %APPDATA%\Vela\). Was
+    // Default location: dataDir() (usually %APPDATA%\BananaPlayer\). Was
     // appDir() historically but that's Program Files under a normal
     // install and non-admin writes get dropped. Users who preferred
     // the old exe-adjacent path can point snapshot_dir_ back at it.
@@ -1562,7 +1620,7 @@ void UIController::searchSubtitlesOnline() {
 
     // The public search page accepts both the query text and the
     // moviehash parameter. Users pick their language + download the
-    // .srt; dragging it onto Vela loads it via the existing drop
+    // .srt; dragging it onto Banana Player loads it via the existing drop
     // handler. No API key, no rate limits, no bundled HTTP client.
     std::string url = "https://www.opensubtitles.com/en/search-all?q="
                     + urlEncode(stem);
@@ -2124,7 +2182,7 @@ void UIController::drawShortcutsPanel(int W, int H) {
     const std::vector<Group> groups = {
         { "Playback", {
             { "Space",           "Play / Pause" },
-            { "F  /  Enter  /  F11", "Fullscreen" },
+            { "F  /  Enter  /  F11  /  Alt+Enter", "Fullscreen" },
             { "Esc",             "Exit fullscreen / close panel" },
             { "Double-click",    "Toggle fullscreen" },
             { "Middle click",    "Toggle fullscreen" },
@@ -2137,6 +2195,8 @@ void UIController::drawShortcutsPanel(int W, int H) {
             { "PgUp  /  PgDn",   "Back / forward 30 s" },
             { "Mouse X1 / X2",   "Back / forward 5 s (side buttons)" },
             { "Home  /  End",    "Jump to start / near end" },
+            { "Ctrl + Home / End","Also jump to start / near end" },
+            { "Ctrl + G",        "Go to timestamp (H:MM:SS)" },
             { ",  /  .",         "Frame step" },
             { "A",               "A-B loop: set A / set B / clear" },
             { "Alt + Left / Right","Previous / next chapter" },
@@ -2152,6 +2212,7 @@ void UIController::drawShortcutsPanel(int W, int H) {
             { "Ctrl + A",        "Cycle audio track" },
             { "Media keys",      "Play/Pause  Stop  Next  Prev  (window focused)" },
             { "Up  /  Down",     "Volume +/- 5 %  (up to 200 %)" },
+            { "+  /  -",         "Same as Up / Down" },
             { "Mouse wheel",     "Volume (over video)" },
             { "M",               "Mute" },
         }},
@@ -2165,6 +2226,9 @@ void UIController::drawShortcutsPanel(int W, int H) {
             { "Ctrl + Shift + O","Open folder..." },
             { "Ctrl + V",        "Paste URL or path from clipboard and play" },
             { "Ctrl + W",        "Close current file" },
+            { "F4 / Backspace",  "Close current file, back to splash" },
+            { "F5",              "Reload current file" },
+            { "Ctrl + Q",        "Quit" },
             { "Ctrl + S",        "Snapshot (PNG next to the app)" },
             { "Ctrl + Shift + S","Snapshot to clipboard" },
             { "0 - 9",           "Jump to 0 - 90 % of the file" },
@@ -2234,8 +2298,10 @@ void UIController::drawAboutPanel(int W, int H) {
     bg->AddRectFilled(ImVec2(0, 0), ImVec2((float)W, (float)H),
                       IM_COL32(0, 0, 0, 150));
 
-    const float pw = std::min(480.0f, W - 80.0f);
-    const float ph = 320.0f;
+    const float pw = std::min(520.0f, W - 80.0f);
+    // Panel grows tall enough for the license row below the tagline
+    // (email + key inputs + Verify + status line) plus the Close button.
+    const float ph = 460.0f;
     ImVec2 tl((W - pw) * 0.5f, (H - ph) * 0.5f);
     ImVec2 br(tl.x + pw, tl.y + ph);
 
@@ -2292,7 +2358,7 @@ void UIController::drawAboutPanel(int W, int H) {
     // Version
     {
         char v[48];
-        std::snprintf(v, sizeof(v), "Version %s", VELA_VERSION);
+        std::snprintf(v, sizeof(v), "Version %s", BP_VERSION);
         float sz = 14.0f;
         ImVec2 d = font->CalcTextSizeA(sz, FLT_MAX, 0.0f, v);
         bg->AddText(font, sz, ImVec2(cx - d.x * 0.5f, tl.y + 128.0f),
@@ -2321,6 +2387,71 @@ void UIController::drawAboutPanel(int W, int H) {
         ImVec2 d = font->CalcTextSizeA(sz, FLT_MAX, 0.0f, t);
         bg->AddText(font, sz, ImVec2(cx - d.x * 0.5f, tl.y + 224.0f),
                     IM_COL32(160, 148, 118, 180), t);
+    }
+
+    // License row: shows "Pro - active for <email>" when registered,
+    // otherwise an email + key input pair with a Verify button. The
+    // whole row lives in its own ImGui window overlaid at a fixed y
+    // offset so it can host real inputs (draw list can't).
+    {
+        ImGuiWindowFlags lflags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize
+                                | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar
+                                | ImGuiWindowFlags_NoBackground
+                                | ImGuiWindowFlags_NoBringToFrontOnFocus
+                                | ImGuiWindowFlags_NoSavedSettings;
+        float lic_y = tl.y + 250.0f;
+        float lic_h = 140.0f;
+        ImGui::SetNextWindowPos(ImVec2(tl.x + 24.0f, lic_y));
+        ImGui::SetNextWindowSize(ImVec2(pw - 48.0f, lic_h));
+        ImGui::Begin("##AboutLicense", nullptr, lflags);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.35f, 1.0f));
+        ImGui::TextUnformatted("License");
+        ImGui::PopStyleColor();
+        ImGui::Separator();
+        ImGui::Spacing();
+        License::Status st = License::status();
+        if (st == License::Status::Valid) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.72f, 0.90f, 0.60f, 1.0f));
+            ImGui::TextUnformatted("Banana Player Pro");
+            ImGui::PopStyleColor();
+            std::string em = License::activatedEmail();
+            ImGui::TextDisabled("registered to %s", em.c_str());
+            ImGui::Spacing();
+            if (ImGui::SmallButton("Remove license")) {
+                License::deactivate();
+                license_email_buf_[0] = '\0';
+                license_key_buf_[0]   = '\0';
+                license_msg_.clear();
+            }
+        } else {
+            ImGui::TextDisabled("Enter the email + key you received after purchase.");
+            ImGui::Spacing();
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputTextWithHint("##lic_email", "your@email.com",
+                                     license_email_buf_,
+                                     sizeof(license_email_buf_));
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputTextWithHint("##lic_key", "V4-XXXX-XXXX-XXXX",
+                                     license_key_buf_,
+                                     sizeof(license_key_buf_));
+            if (ImGui::Button("Verify", ImVec2(90.0f, 0.0f))) {
+                if (License::activate(license_email_buf_, license_key_buf_)) {
+                    license_msg_ = "Pro unlocked. Thank you!";
+                } else {
+                    license_msg_ = "Invalid email + key combination.";
+                }
+            }
+            if (!license_msg_.empty()) {
+                ImGui::SameLine();
+                bool ok = (License::status() == License::Status::Valid);
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    ok ? ImVec4(0.72f, 0.90f, 0.60f, 1.0f)
+                       : ImVec4(1.00f, 0.55f, 0.55f, 1.0f));
+                ImGui::TextUnformatted(license_msg_.c_str());
+                ImGui::PopStyleColor();
+            }
+        }
+        ImGui::End();
     }
 
     // Close button via ImGui window overlaid at the bottom.
@@ -2443,6 +2574,22 @@ void UIController::drawInfoPanel(int W, int H) {
         section("FILE");
         row("Name", baseName(path.c_str()), true);
         row("Path", path, true);
+        // Reveal / copy actions right under the path. Handy for people
+        // who need to grab the file for another app or share the
+        // location without hunting through Explorer.
+        {
+            float y0 = ImGui::GetCursorPosY();
+            ImGui::SetCursorPos(ImVec2(value_x, y0));
+            if (ImGui::SmallButton("Reveal in Explorer")) {
+                revealInExplorer(path);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Copy path")) {
+                copyPathToClipboard(path);
+                showOsd("Copied path");
+            }
+            ImGui::Spacing();
+        }
 
         // File size via GetFileAttributesExA - returns "" for URLs which is
         // fine, the row just shows "-".
@@ -2920,6 +3067,97 @@ void UIController::drawHistoryPanel(int W, int H) {
     ImGui::PopStyleVar();
 }
 
+void UIController::drawGotoTimeDialog(int W, int H) {
+    if (!show_goto_time_) return;
+    if (!player_->isLoaded()) { show_goto_time_ = false; return; }
+
+    ImDrawList* bg = ImGui::GetBackgroundDrawList();
+    bg->AddRectFilled(ImVec2(0, 0), ImVec2((float)W, (float)H),
+                      IM_COL32(0, 0, 0, 120));
+
+    const float pw = 340.0f;
+    const float ph = 130.0f;
+    ImVec2 tl((W - pw) * 0.5f, (H - ph) * 0.5f);
+    ImVec2 br(tl.x + pw, tl.y + ph);
+    bg->AddRectFilled(ImVec2(tl.x - 3, tl.y - 3), ImVec2(br.x + 3, br.y + 6),
+                      IM_COL32(0, 0, 0, 100), 12.0f);
+    bg->AddRectFilled(tl, br, IM_COL32(18, 16, 12, 250), 10.0f);
+    bg->AddRect(tl, br, IM_COL32(255, 201, 58, 180), 10.0f, 0, 1.2f);
+
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize
+                             | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar
+                             | ImGuiWindowFlags_NoBackground
+                             | ImGuiWindowFlags_NoSavedSettings;
+    ImGui::SetNextWindowPos(tl);
+    ImGui::SetNextWindowSize(ImVec2(pw, ph));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(18, 14));
+    ImGui::Begin("##GotoModal", nullptr, flags);
+
+    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.35f, 1.0f), "Go to time");
+    ImGui::TextDisabled("Format: H:MM:SS  .  MM:SS  .  or seconds");
+    ImGui::Spacing();
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGuiInputTextFlags itf = ImGuiInputTextFlags_EnterReturnsTrue
+                            | ImGuiInputTextFlags_AutoSelectAll;
+    bool submitted = false;
+    // Grab keyboard focus once when the dialog opens.
+    if (goto_focus_pending_) {
+        ImGui::SetKeyboardFocusHere();
+        goto_focus_pending_ = false;
+    }
+    if (ImGui::InputText("##goto_time_input",
+                         goto_time_buf_, sizeof(goto_time_buf_), itf)) {
+        submitted = true;
+    }
+    // Parse: "H:MM:SS" -> h*3600 + m*60 + s
+    //        "MM:SS"   -> m*60 + s
+    //        plain     -> raw seconds
+    auto parse = [](const char* text, double& out) -> bool {
+        if (!text || !*text) return false;
+        int h = 0, m = 0, s = 0;
+        double raw = 0.0;
+        if (std::sscanf(text, "%d:%d:%d", &h, &m, &s) == 3) {
+            out = h * 3600.0 + m * 60.0 + s;
+            return out >= 0.0;
+        }
+        if (std::sscanf(text, "%d:%d", &m, &s) == 2) {
+            out = m * 60.0 + s;
+            return out >= 0.0;
+        }
+        if (std::sscanf(text, "%lf", &raw) == 1) {
+            out = raw;
+            return out >= 0.0;
+        }
+        return false;
+    };
+    ImGui::Spacing();
+    bool go_click = ImGui::Button("Go", ImVec2(76.0f, 0.0f));
+    ImGui::SameLine();
+    bool cancel_click = ImGui::Button("Cancel", ImVec2(76.0f, 0.0f));
+    if (cancel_click || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        show_goto_time_ = false;
+        goto_time_buf_[0] = '\0';
+    }
+    if (submitted || go_click) {
+        double t = 0.0;
+        if (parse(goto_time_buf_, t)) {
+            double d = player_->getDuration();
+            if (d > 0.0 && t > d) t = d - 1.0;
+            if (t < 0.0) t = 0.0;
+            player_->seek(t);
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "Goto %s", formatTime(t).c_str());
+            showOsd(buf, 1.6f);
+            show_goto_time_ = false;
+            goto_time_buf_[0] = '\0';
+        } else {
+            showOsd("Invalid time - try 1:23 or 3600", 1.8f);
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleVar();
+}
+
 void UIController::drawSettingsDialog(int W, int H) {
     if (!show_settings_) return;
 
@@ -3129,6 +3367,24 @@ void UIController::drawSettingsDialog(int W, int H) {
             ImGui::TextDisabled("%s", cur.c_str());
             ImGui::PopTextWrapPos();
             if (ImGui::Button("Choose folder...")) openSnapshotFolderDialog();
+            ImGui::SameLine();
+            if (ImGui::Button("Open in Explorer")) {
+                // Resolve to the effective folder: user override wins,
+                // otherwise fall back to whatever takeSnapshot() would
+                // use (dataDir - typically %APPDATA%\BananaPlayer). ShellExecute
+                // on the folder path pops it up in a new Explorer window.
+                std::string dir = snapshot_dir_.empty() ? dataDir() : snapshot_dir_;
+                while (!dir.empty() && (dir.back() == '\\' || dir.back() == '/')) {
+                    dir.pop_back();
+                }
+                if (dir.empty()) {
+                    showOsd("No snapshot folder");
+                } else {
+                    HINSTANCE h = ShellExecuteA(nullptr, "open", dir.c_str(),
+                                                nullptr, nullptr, SW_SHOWNORMAL);
+                    if ((INT_PTR)h <= 32) showOsd("Explorer open failed");
+                }
+            }
             ImGui::SameLine();
             if (ImGui::Button("Reset to default")) {
                 snapshot_dir_.clear();
@@ -3600,6 +3856,32 @@ void UIController::render(int W, int H) {
     // regardless of overlay state so the loop keeps working while hidden.
     if (loaded) checkABLoop();
 
+    // Chapter announcer: when natural playback crosses into a new
+    // chapter, fire a subtle "Chapter: <title>" OSD. Skipped when the
+    // user is seek-dragging (their seek OSD is louder anyway) and when
+    // the file has no chapters. Announces on the FIRST chapter of a
+    // freshly loaded file too - useful when files skip past intro.
+    if (loaded && !chapters_.empty() && !seek_dragging_) {
+        double t = player_->getCurrentTime();
+        int cur_ch = -1;
+        for (size_t i = 0; i < chapters_.size(); ++i) {
+            if (t + 0.05 >= chapters_[i].start) cur_ch = (int)i;
+            else break;
+        }
+        if (cur_ch >= 0 && cur_ch != last_chapter_announced_) {
+            last_chapter_announced_ = cur_ch;
+            const auto& ch = chapters_[(size_t)cur_ch];
+            char buf[256];
+            if (!ch.title.empty()) {
+                std::snprintf(buf, sizeof(buf), "Chapter %d: %s",
+                              cur_ch + 1, ch.title.c_str());
+            } else {
+                std::snprintf(buf, sizeof(buf), "Chapter %d", cur_ch + 1);
+            }
+            showOsd(buf, 2.0f);
+        }
+    }
+
     // Auto-hide: once a video is loaded, controls fade after 3 s of true idle
     // so the viewer can focus on the picture. Only real input (mouse motion,
     // key press, wheel, click-drag) resets the timer - a parked cursor over
@@ -3750,6 +4032,7 @@ void UIController::render(int W, int H) {
     drawInfoPanel(W, H);
     drawHistoryPanel(W, H);
     drawSettingsDialog(W, H);
+    drawGotoTimeDialog(W, H);
     drawSubtitleSearchPanel(W, H);
     drawFirstRunHint(W, H);
     drawAutoNextOverlay(W, H);
@@ -3964,18 +4247,124 @@ void UIController::drawSplash(int W, int H) {
     dl->AddText(font, ss, ImVec2(cx - sd2.x * 0.5f, sub2_y),
                 IM_COL32(165, 148, 118, 210), subtitle2);
 
-    // "Open File" button.
-    ImVec2 btn_size(240, 46);
+    // Two buttons side-by-side: "Open File..." (primary, filled) and
+    // "Paste URL" (secondary). Paste is the fast path for YouTube /
+    // direct HTTP links since Ctrl+V from the splash otherwise does
+    // nothing visible - the button both discovers the feature and
+    // shortcuts the workflow.
+    ImVec2 btn_size(220, 46);
+    ImVec2 paste_size(150, 46);
+    float gap = 12.0f;
+    float two_btn_w = btn_size.x + gap + paste_size.x;
     float btn_y = sub2_y + ss + 22.0f;
-    ImGui::SetCursorScreenPos(ImVec2(cx - btn_size.x * 0.5f, btn_y));
+    ImGui::SetCursorScreenPos(ImVec2(cx - two_btn_w * 0.5f, btn_y));
     if (Style::TextButton("Open File...", btn_size, true)) {
         openFileDialog();
+    }
+    ImGui::SameLine(0.0f, gap);
+    if (Style::TextButton("Paste URL", paste_size, false)) {
+        pasteAndPlay();
+    }
+
+    // Continue-watching hero: the most recently played file that has a
+    // resume position gets a big-target row above the RECENT list, so a
+    // returning user can pick up in one click without hunting through a
+    // list of similarly-named files. Matches the "Continue" strip every
+    // streaming service uses. Only rendered when there's a resume entry
+    // with a meaningful playhead (not right at the start or right at the
+    // end - same window loadPath uses when deciding whether to restore).
+    float post_hero_y = btn_y + btn_size.y + 30.0f;
+    ResumeEntry const* hero = nullptr;
+    for (const auto& e : resume_index_) {
+        if (e.duration > 20.0 && e.pos > 5.0 && e.pos < e.duration - 10.0) {
+            hero = &e;
+            break;
+        }
+    }
+    if (hero) {
+        float hero_top = btn_y + btn_size.y + 24.0f;
+        float hero_w   = std::min(560.0f, W * 0.72f);
+        float hero_h   = 62.0f;
+        float hero_x   = cx - hero_w * 0.5f;
+        // Invisible button covers the whole card so click / hover feel
+        // native. Drawing happens on top via the foreground list.
+        ImGui::SetCursorScreenPos(ImVec2(hero_x, hero_top));
+        bool hero_clicked = ImGui::InvisibleButton("##continue_hero",
+                                                    ImVec2(hero_w, hero_h));
+        bool hero_hov = ImGui::IsItemHovered();
+        // Card background: warm dark w/ amber accent bar on the left so it
+        // reads as the primary CTA even next to the Open File button.
+        ImU32 bg_col   = hero_hov
+            ? IM_COL32( 44,  36,  22, 230)
+            : IM_COL32( 34,  28,  18, 210);
+        ImU32 edge_col = hero_hov
+            ? IM_COL32(255, 201,  58, 220)
+            : IM_COL32(255, 201,  58, 150);
+        dl->AddRectFilled(ImVec2(hero_x, hero_top),
+                          ImVec2(hero_x + hero_w, hero_top + hero_h),
+                          bg_col, 6.0f);
+        dl->AddRect(ImVec2(hero_x, hero_top),
+                    ImVec2(hero_x + hero_w, hero_top + hero_h),
+                    edge_col, 6.0f, 0, 1.0f);
+        dl->AddRectFilled(ImVec2(hero_x, hero_top + 6.0f),
+                          ImVec2(hero_x + 4.0f, hero_top + hero_h - 6.0f),
+                          IM_COL32(255, 201, 58, 240), 2.0f);
+        // Label + filename on top row. Filename truncated to fit.
+        float text_x = hero_x + 16.0f;
+        dl->AddText(font, 11.0f, ImVec2(text_x, hero_top + 8.0f),
+                    IM_COL32(200, 175, 110, 220), "CONTINUE WATCHING");
+        const char* bn = baseName(hero->path.c_str());
+        char name_buf[256];
+        std::snprintf(name_buf, sizeof(name_buf), "%s", bn);
+        // Truncate if wider than available room.
+        float max_name_w = hero_w - 32.0f - 90.0f;
+        ImVec2 nm_dim = font->CalcTextSizeA(17.0f, FLT_MAX, 0.0f, name_buf);
+        if (nm_dim.x > max_name_w) {
+            // Trim tail chars until it fits, leaving room for the ellipsis.
+            int len = (int)std::strlen(name_buf);
+            while (len > 4) {
+                name_buf[--len] = '\0';
+                std::strcpy(name_buf + len - 3, "...");
+                ImVec2 d = font->CalcTextSizeA(17.0f, FLT_MAX, 0.0f, name_buf);
+                if (d.x <= max_name_w) break;
+                name_buf[len - 3] = '\0';
+            }
+        }
+        dl->AddText(font, 17.0f, ImVec2(text_x, hero_top + 22.0f),
+                    IM_COL32(245, 235, 210, 240), name_buf);
+        // Progress bar + time-left, bottom row.
+        float bar_left  = text_x;
+        float bar_right = hero_x + hero_w - 100.0f;
+        float bar_y2    = hero_top + hero_h - 12.0f;
+        dl->AddRectFilled(ImVec2(bar_left, bar_y2),
+                          ImVec2(bar_right, bar_y2 + 3.0f),
+                          IM_COL32(90, 80, 60, 180), 1.5f);
+        double frac = std::clamp(hero->pos / hero->duration, 0.0, 1.0);
+        dl->AddRectFilled(
+            ImVec2(bar_left, bar_y2),
+            ImVec2(bar_left + (float)((bar_right - bar_left) * frac), bar_y2 + 3.0f),
+            IM_COL32(255, 201, 58, 235), 1.5f);
+        // Time text right-aligned inside the card. Format "M:SS left" if
+        // under an hour, "H:MM left" otherwise.
+        double left_sec = std::max(0.0, hero->duration - hero->pos);
+        char time_buf[32];
+        int lh = (int)(left_sec / 3600.0);
+        int lm = (int)std::fmod(left_sec / 60.0, 60.0);
+        int ls = (int)std::fmod(left_sec, 60.0);
+        if (lh > 0) std::snprintf(time_buf, sizeof(time_buf), "%d:%02d left", lh, lm);
+        else        std::snprintf(time_buf, sizeof(time_buf), "%d:%02d left", lm, ls);
+        ImVec2 td_dim = font->CalcTextSizeA(12.0f, FLT_MAX, 0.0f, time_buf);
+        dl->AddText(font, 12.0f,
+                    ImVec2(hero_x + hero_w - 16.0f - td_dim.x, hero_top + hero_h - 22.0f),
+                    IM_COL32(220, 200, 155, 230), time_buf);
+        if (hero_clicked) loadPath(hero->path);
+        post_hero_y = hero_top + hero_h + 22.0f;
     }
 
     // Recent files list. Half-column width scales with the window so the
     // header, divider, and selectable rows all fit inside the 640 minimum.
     if (!recent_files_.empty()) {
-        float top = btn_y + btn_size.y + 30.0f;
+        float top = post_hero_y;
         float half_w = std::min(220.0f, W * 0.44f);
         float sel_w  = half_w * 2.0f;
         // Header: uppercase label with an accent dot on the left so it feels
@@ -4032,11 +4421,59 @@ void UIController::drawSplash(int W, int H) {
         ImGui::PopStyleColor(2);
     }
 
-    // Version bottom-right. Single source of truth via VELA_VERSION. The
+    // Promo slot: single-line banner above the version footer. Only
+    // ever draws on splash (never during playback), only when the
+    // fetcher has cached content, only when not suppressed by a Pro
+    // license. Positioned so it stays clear of the recent-files list
+    // above and the version footer below.
+    if (const Promo::Banner* pb = Promo::current()) {
+        float promo_y = (float)H - 62.0f;
+        // Don't draw over the recent files list if it happens to reach
+        // this low - bumps the promo up so nothing overlaps.
+        if (!recent_files_.empty()) {
+            float top_recent_bar = 60.0f;   // splash-top offset for RECENT
+            float est_bottom = top_recent_bar + 200.0f;
+            if (est_bottom + 12.0f > promo_y) promo_y = est_bottom + 12.0f;
+        }
+        // Compose the display text. Sub-line optional.
+        std::string display = pb->headline;
+        if (!pb->subline.empty()) display += "   .   " + pb->subline;
+        ImFont* pf = ImGui::GetFont();
+        float promo_size = 13.0f;
+        ImVec2 pd = pf->CalcTextSizeA(promo_size, FLT_MAX, 0.0f, display.c_str());
+        float pad_x = 12.0f, pad_y = 5.0f;
+        float bw = pd.x + pad_x * 2;
+        float bh = pd.y + pad_y * 2;
+        float bx = (W - bw) * 0.5f;
+        ImVec2 tl(bx, promo_y);
+        ImVec2 br(bx + bw, promo_y + bh);
+        // Warm accent border to signal the brand's yellow palette
+        // without a solid fill that would compete with the wordmark.
+        dl->AddRectFilled(tl, br, IM_COL32(28, 22, 12, 200), 8.0f);
+        dl->AddRect(tl, br, IM_COL32(255, 201, 58, 150), 8.0f, 0, 1.0f);
+        dl->AddText(pf, promo_size, ImVec2(bx + pad_x, promo_y + pad_y),
+                    IM_COL32(238, 224, 190, 255), display.c_str());
+        // Click surface via InvisibleButton over the drawn area.
+        if (!pb->click_url.empty()) {
+            ImGui::SetCursorScreenPos(tl);
+            ImGui::PushID("##promo_btn");
+            ImGui::InvisibleButton("p", ImVec2(bw, bh));
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            }
+            if (ImGui::IsItemClicked()) {
+                ShellExecuteA(nullptr, "open", pb->click_url.c_str(),
+                              nullptr, nullptr, SW_SHOWNORMAL);
+            }
+            ImGui::PopID();
+        }
+    }
+
+    // Version bottom-right. Single source of truth via BP_VERSION. The
     // "v" prefix goes into a slightly brighter tone than the tech stack so
     // the release number reads first at a glance.
     char verhead[24];
-    std::snprintf(verhead, sizeof(verhead), "v%s", VELA_VERSION);
+    std::snprintf(verhead, sizeof(verhead), "v%s", BP_VERSION);
     const char* stack = "SDL3  +  FFmpeg  +  Dear ImGui";
     float vf_size = 12.0f;
     ImVec2 vh = font->CalcTextSizeA(vf_size, FLT_MAX, 0.0f, verhead);
@@ -4243,7 +4680,39 @@ void UIController::drawBottomOverlay(int W, int H, float alpha) {
     bool  show_rate = std::fabs(pb_rate - 1.0f) > 0.01f;
     char  rate_buf[16] = {0};
     if (show_rate) std::snprintf(rate_buf, sizeof(rate_buf), "%.2fx", pb_rate);
-    std::string tstr = formatTime(cur) + "  /  " + formatTime(dur);
+    // Time display cycles on click. See time_display_mode_ in the header.
+    std::string tstr;
+    switch (time_display_mode_) {
+        case 1: {
+            // Remaining time (accounts for playback rate: at 2x, half the
+            // wall time is left; at 0.5x, twice the wall time is left).
+            double rem = (double)std::max(0.0f, dur - cur);
+            double wall_rem = (pb_rate > 0.01f) ? (rem / pb_rate) : rem;
+            tstr = "-" + formatTime(wall_rem);
+            break;
+        }
+        case 2: {
+            // Elapsed + when it'll finish on the wall clock. Compact enough
+            // to fit next to the seek bar at 640 px.
+            double rem = (double)std::max(0.0f, dur - cur);
+            double wall_rem = (pb_rate > 0.01f) ? (rem / pb_rate) : rem;
+            std::time_t now_t = std::time(nullptr);
+            std::tm lt{};
+            localtime_s(&lt, &now_t);
+            int end_min_total = lt.tm_hour * 60 + lt.tm_min
+                              + (int)(wall_rem / 60.0 + 0.5);
+            int end_h = (end_min_total / 60) % 24;
+            int end_m = end_min_total % 60;
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%s   ends %02d:%02d",
+                          formatTime(cur).c_str(), end_h, end_m);
+            tstr = buf;
+            break;
+        }
+        default:
+            tstr = formatTime(cur) + "  /  " + formatTime(dur);
+            break;
+    }
     ImVec2 tsz = ImGui::CalcTextSize(tstr.c_str());
     // Include the badge width so the seek bar doesn't jitter when speed
     // toggles - reserve room even when not shown, so layout stays stable
@@ -4259,10 +4728,42 @@ void UIController::drawBottomOverlay(int W, int H, float alpha) {
     bool seek_changed = Style::SeekBar("##seek", seek_val, 0.0f, dur, seek_w, 22.0f, &seek_held);
     // Remember the SeekBar's screen rect so the wheel handler can seek
     // instead of adjusting volume when the cursor is over it.
+    ImVec2 seek_rmin = ImGui::GetItemRectMin();
+    ImVec2 seek_rmax = ImGui::GetItemRectMax();
+    bool   seek_bar_hovered = ImGui::IsItemHovered();
     {
-        ImVec2 rmin = ImGui::GetItemRectMin();
-        ImVec2 rmax = ImGui::GetItemRectMax();
-        last_seekbar_rect_ = ImVec4(rmin.x, rmin.y, rmax.x, rmax.y);
+        last_seekbar_rect_ = ImVec4(seek_rmin.x, seek_rmin.y, seek_rmax.x, seek_rmax.y);
+    }
+    // Lightweight "time under cursor" label above the seek bar. Fires
+    // any time the bar is hovered - independent of the thumbnail
+    // preview feature (which is opt-in and heavier). Suppressed while
+    // dragging so it doesn't fight the seek OSD and while a chapter
+    // hover-tooltip is showing.
+    if (seek_bar_hovered && !seek_held && dur > 0.0f) {
+        ImGuiIO& sb_io = ImGui::GetIO();
+        float mx_local = sb_io.MousePos.x;
+        if (mx_local >= seek_rmin.x && mx_local <= seek_rmax.x) {
+            float t = (mx_local - seek_rmin.x) / (seek_rmax.x - seek_rmin.x) * dur;
+            if (t < 0.0f) t = 0.0f; if (t > dur) t = dur;
+            std::string ts = formatTime(t);
+            ImDrawList* fg_dl = ImGui::GetForegroundDrawList();
+            ImVec2 tsz2 = ImGui::CalcTextSize(ts.c_str());
+            float lpad = 6.0f;
+            float lx = std::clamp(mx_local - tsz2.x * 0.5f - lpad,
+                                  seek_rmin.x,
+                                  seek_rmax.x - tsz2.x - 2.0f * lpad);
+            float ly = seek_rmin.y - tsz2.y - 8.0f;
+            // Suppress when thumbnail preview is on - the popup embeds
+            // its own time label + frame, so this would be a duplicate.
+            if (!thumbnail_preview_enabled_ || !thumb_provider_) {
+                fg_dl->AddRectFilled(ImVec2(lx, ly),
+                                     ImVec2(lx + tsz2.x + 2.0f * lpad,
+                                            ly + tsz2.y + 4.0f),
+                                     IM_COL32(20, 24, 34, 220), 3.0f);
+                fg_dl->AddText(ImVec2(lx + lpad, ly + 2.0f),
+                               IM_COL32(230, 240, 255, 255), ts.c_str());
+            }
+        }
     }
     // Draw chapter tick markers over the seek bar. A muted sky-blue post
     // per chapter start, skipping the file-start (0.0) which would sit
@@ -4363,8 +4864,9 @@ void UIController::drawBottomOverlay(int W, int H, float alpha) {
                 if (std::fabs(mx - x) < 6.0f) { hit = (int)i; break; }
             }
             if (hit >= 0) {
-                char label[128];
-                std::snprintf(label, sizeof(label), "Bookmark  %s",
+                char label[160];
+                std::snprintf(label, sizeof(label),
+                              "Bookmark  %s   (click seek  .  right-click remove)",
                               formatTime(bookmarks_current_[(size_t)hit]).c_str());
                 ImDrawList* fg = ImGui::GetForegroundDrawList();
                 ImVec2 tsz = ImGui::CalcTextSize(label);
@@ -4377,6 +4879,21 @@ void UIController::drawBottomOverlay(int W, int H, float alpha) {
                                   IM_COL32(24, 20, 12, 230), 4.0f);
                 fg->AddText(ImVec2(tx + pad, ty + 3.0f),
                             IM_COL32(255, 220, 170, 255), label);
+                // Click actions on the diamond. Diamonds sit BELOW the
+                // seek bar (diamond_y = rmax.y + 6), so click-vs-seek
+                // never collide. Cursor visual hints at interactivity.
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                double target_t = bookmarks_current_[(size_t)hit];
+                if (io.MouseClicked[ImGuiMouseButton_Left]) {
+                    player_->seek(target_t);
+                    char msg[64];
+                    std::snprintf(msg, sizeof(msg), "Bookmark  %s",
+                                  formatTime(target_t).c_str());
+                    showOsd(msg, 1.4f);
+                }
+                if (io.MouseClicked[ImGuiMouseButton_Right]) {
+                    removeBookmark((size_t)hit);   // OSD fires internally
+                }
             }
         }
     }
@@ -4456,14 +4973,100 @@ void UIController::drawBottomOverlay(int W, int H, float alpha) {
     ImGui::SameLine();
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 2.0f);
     if (show_rate) {
-        // Small blue pill left of the time. Matches the "PLAYLIST N/M"
-        // badge style so the two overlay states feel like siblings.
-        Style::Badge(rate_buf,
-                     Style::Fade(IM_COL32(60, 90, 160, 230), alpha),
-                     Style::Fade(IM_COL32(220, 230, 250, 255), alpha));
+        // Clickable playback-rate pill. Left click cycles common speeds
+        // (1.0 -> 1.25 -> 1.5 -> 2.0 -> 0.5 -> 0.75 -> 1.0). Right
+        // click resets to 1.0x. Discoverable via cursor + tooltip;
+        // hidden entirely when rate is 1.0 so the pill IS the state.
+        ImVec2 bpos = ImGui::GetCursorScreenPos();
+        ImVec2 bsz  = ImGui::CalcTextSize(rate_buf);
+        float bpad_x = 9.0f, bpad_y = 3.5f;
+        ImGui::PushID("##rate_pill");
+        ImGui::InvisibleButton("r",
+            ImVec2(bsz.x + bpad_x * 2, bsz.y + bpad_y * 2));
+        bool rate_hovered  = ImGui::IsItemHovered();
+        bool rate_clicked  = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+        bool rate_rclicked = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+        if (rate_hovered) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            ImGui::SetTooltip("Left click: cycle speed  .  Right click: reset");
+        }
+        // Draw badge manually at the reserved area (same look as
+        // Style::Badge but positioned over the InvisibleButton).
+        ImDrawList* rdl = ImGui::GetWindowDrawList();
+        ImVec2 rbr(bpos.x + bsz.x + bpad_x * 2, bpos.y + bsz.y + bpad_y * 2);
+        float rrounding = (bsz.y + bpad_y * 2) * 0.5f;
+        ImU32 pill_bg = rate_hovered
+            ? Style::Fade(IM_COL32(80, 118, 200, 240), alpha)
+            : Style::Fade(IM_COL32(60,  90, 160, 230), alpha);
+        rdl->AddRectFilled(bpos, rbr, pill_bg, rrounding);
+        int pa = (pill_bg >> IM_COL32_A_SHIFT) & 0xFF;
+        rdl->AddLine(ImVec2(bpos.x + rrounding * 0.6f, bpos.y + 0.5f),
+                     ImVec2(rbr.x  - rrounding * 0.6f, bpos.y + 0.5f),
+                     IM_COL32(255, 255, 255, std::min(80, pa / 3)), 1.0f);
+        rdl->AddText(ImVec2(bpos.x + bpad_x, bpos.y + bpad_y),
+                     Style::Fade(IM_COL32(220, 230, 250, 255), alpha),
+                     rate_buf);
+        if (rate_clicked) {
+            // Cycle order picked so common accelerated-watching speeds
+            // come first (users hit rate to skim). Reset back to 1.0
+            // caps the cycle so the pill disappears on full reset.
+            const float cycle[] = {0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f};
+            int cur_i = -1;
+            for (int k = 0; k < (int)(sizeof(cycle)/sizeof(cycle[0])); ++k) {
+                if (std::fabs(cycle[k] - pb_rate) < 0.01f) { cur_i = k; break; }
+            }
+            float nr = (cur_i < 0) ? 1.0f : cycle[(cur_i + 1) % 6];
+            player_->setPlaybackRate(nr);
+            char msg[32]; std::snprintf(msg, sizeof(msg), "Speed %.2fx", nr);
+            showOsd(msg);
+        }
+        if (rate_rclicked) {
+            player_->setPlaybackRate(1.0f);
+            showOsd("Speed 1.00x");
+        }
+        ImGui::PopID();
         ImGui::SameLine();
     }
-    ImGui::TextColored(ImVec4(0.85f, 0.90f, 1.0f, 1.0f), "%s", tstr.c_str());
+    // Clickable time text - cycles the display mode. Use InvisibleButton
+    // sized to the text so the click surface exactly matches what the user
+    // sees. Hover cursor stays on the fingertip via SetMouseCursor.
+    {
+        ImVec2 tpos = ImGui::GetCursorScreenPos();
+        ImVec2 tsz_now = ImGui::CalcTextSize(tstr.c_str());
+        ImGui::PushID("##time_cycle");
+        ImGui::InvisibleButton("t", ImVec2(tsz_now.x + 4.0f, tsz_now.y + 4.0f));
+        bool time_clicked  = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+        bool time_rclicked = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+        bool time_hovered  = ImGui::IsItemHovered();
+        if (time_hovered) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            ImGui::SetTooltip("Left click: cycle display  .  Right click: copy timestamp");
+        }
+        // Repaint text on top so it sits above the invisible click surface.
+        ImDrawList* tdl = ImGui::GetWindowDrawList();
+        ImU32 tcol = time_hovered
+            ? IM_COL32(255, 224, 130, 255)   // amber-hint on hover
+            : IM_COL32(217, 230, 255, 255);
+        tdl->AddText(ImVec2(tpos.x + 2.0f, tpos.y + 2.0f),
+                     Style::Fade(tcol, alpha), tstr.c_str());
+        if (time_clicked) {
+            time_display_mode_ = (time_display_mode_ + 1) % 3;
+            markConfigDirty();
+            const char* label = (time_display_mode_ == 0) ? "Time: elapsed / total"
+                              : (time_display_mode_ == 1) ? "Time: remaining"
+                                                          : "Time: elapsed + end clock";
+            showOsd(label, 1.6f);
+        }
+        if (time_rclicked) {
+            // Copy current playhead as HH:MM:SS to the clipboard.
+            // Useful for sharing "look at 12:34" pointers on forums /
+            // Discord without recording the whole clip.
+            std::string ts = formatTime(cur);
+            SDL_SetClipboardText(ts.c_str());
+            showOsd(std::string("Copied  ") + ts, 1.4f);
+        }
+        ImGui::PopID();
+    }
 
     // --- Row 2: buttons ---
     // Unified 34x34 icon buttons, chunky 52x40 play button.
@@ -4595,8 +5198,27 @@ void UIController::drawBottomOverlay(int W, int H, float alpha) {
     ImGui::SetCursorPosY(slider_row_y + slider_y_off);
     ImGui::SetNextItemWidth(slider_w);
     float vol = player_->getVolume();
+    // Muted state dims the slider so it visually reads as "silenced" -
+    // just the icon change was easy to miss.
+    if (muted) ImGui::PushStyleVar(ImGuiStyleVar_Alpha,
+                                   ImGui::GetStyle().Alpha * 0.45f);
     if (ImGui::SliderFloat("##vol", &vol, 0.0f, 2.0f, "")) {
         player_->setVolume(vol);
+        // Dragging the slider while muted implicitly unmutes - the
+        // mixer convention. Otherwise the user pulls the fader up
+        // and hears nothing which is baffling.
+        if (muted) player_->setMuted(false);
+        nudgeVisible();
+    }
+    if (muted) ImGui::PopStyleVar();
+    // Right-click on the volume slider resets to 100 %. Universal
+    // convention in DAWs and every mixer app - restores unity gain
+    // without the user having to drag exactly to the middle tick.
+    if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+        player_->setVolume(1.0f);
+        if (muted) player_->setMuted(false);
+        showOsd("Volume 100%");
+        markConfigDirty();
         nudgeVisible();
     }
     // Boost-region indicator: the slider goes 0-200% but everything past
@@ -4619,6 +5241,30 @@ void UIController::drawBottomOverlay(int W, int H, float alpha) {
         sdl_dl->AddText(sfont, 9.0f,
                         ImVec2(mid_x - ld.x * 0.5f, s_min.y - ld.y - 1.0f),
                         Style::Fade(IM_COL32(200, 210, 235, 190), alpha), lbl);
+        // Normal-range percentage badge that follows the thumb on hover.
+        // Complements the AMP pill (shown only in boost region below);
+        // gives immediate readout while dragging in the 0-100 % zone.
+        bool slider_hovered = ImGui::IsItemHovered() || ImGui::IsItemActive();
+        if (slider_hovered && vol <= 1.0f) {
+            float grab_x = s_min.x + (s_max.x - s_min.x) * (vol / 2.0f);
+            char pct[16]; std::snprintf(pct, sizeof(pct), "%d%%",
+                                        (int)std::lround(vol * 100.0f));
+            ImFont* sfont_h = ImGui::GetFont();
+            ImVec2 pd = sfont_h->CalcTextSizeA(11.0f, FLT_MAX, 0.0f, pct);
+            float pad = 4.0f;
+            ImVec2 ptl(grab_x - pd.x * 0.5f - pad, s_min.y - pd.y - 6.0f);
+            ImVec2 pbr(grab_x + pd.x * 0.5f + pad, s_min.y - 3.0f);
+            float overflow_r = pbr.x - s_max.x;
+            if (overflow_r > 0.0f) { ptl.x -= overflow_r; pbr.x -= overflow_r; }
+            float overflow_l = s_min.x - ptl.x;
+            if (overflow_l > 0.0f) { ptl.x += overflow_l; pbr.x += overflow_l; }
+            sdl_dl->AddRectFilled(ptl, pbr,
+                                  Style::Fade(IM_COL32(28, 40, 60, 235), alpha),
+                                  (pbr.y - ptl.y) * 0.5f);
+            sdl_dl->AddText(sfont_h, 11.0f,
+                            ImVec2(ptl.x + pad, ptl.y + 1.0f),
+                            Style::Fade(IM_COL32(230, 240, 255, 255), alpha), pct);
+        }
         if (vol > 1.0f) {
             float grab_x = s_min.x + (s_max.x - s_min.x) * (vol / 2.0f);
             sdl_dl->AddRectFilled(ImVec2(mid_x, s_max.y - 3.0f),
@@ -4651,6 +5297,25 @@ void UIController::drawBottomOverlay(int W, int H, float alpha) {
         takeSnapshot();
     }
     ImGui::SameLine();
+    // Subtitle on/off toggle - only visible when a subtitle source is
+    // available (external sidecar loaded, embedded track active, or
+    // secondary track). Otherwise the button would be a dead surface;
+    // hiding it keeps the row uncluttered on subtitle-less files.
+    bool has_subs = !subtitles_.empty()
+                 || !subtitles_secondary_.empty()
+                 || (player_ && player_->getActiveEmbeddedSubtitle() >= 0);
+    if (has_subs) {
+        if (Style::IconButton("subs", Style::Icon::Subtitle, btn_sz,
+                              subtitles_enabled_ ? "Subtitles on (S)"
+                                                 : "Subtitles off (S)",
+                              subtitles_enabled_, 1.0f, alpha)) {
+            subtitles_enabled_ = !subtitles_enabled_;
+            showOsd(subtitles_enabled_ ? "Subtitles on" : "Subtitles off");
+            markConfigDirty();
+            nudgeVisible();
+        }
+        ImGui::SameLine();
+    }
     {
         Playlist::RepeatMode rm = playlist_.repeatMode();
         bool loop_active = (rm != Playlist::RepeatMode::None);
@@ -5161,6 +5826,45 @@ void UIController::drawMainMenuContents() {
         ImGui::EndMenu();
     }
 
+    // Chapters submenu - only shown when the container actually has
+    // chapters. Users can browse and jump by clicking, mark the active
+    // one at a glance, and read titles without the seek-bar tick-hover.
+    if (!chapters_.empty() && player_->isLoaded()) {
+        if (ImGui::BeginMenu("Chapters")) {
+            double t = player_->getCurrentTime();
+            int active_ch = -1;
+            for (size_t i = 0; i < chapters_.size(); ++i) {
+                if (t + 0.05 >= chapters_[i].start) active_ch = (int)i;
+                else break;
+            }
+            int target = -1;
+            for (size_t i = 0; i < chapters_.size(); ++i) {
+                char label[288];
+                if (!chapters_[i].title.empty()) {
+                    std::snprintf(label, sizeof(label), "%2zu.  %s   [%s]",
+                                  i + 1, chapters_[i].title.c_str(),
+                                  formatTime(chapters_[i].start).c_str());
+                } else {
+                    std::snprintf(label, sizeof(label), "%2zu.  Chapter %zu   [%s]",
+                                  i + 1, i + 1,
+                                  formatTime(chapters_[i].start).c_str());
+                }
+                if (ImGui::MenuItem(label, nullptr, (int)i == active_ch)) {
+                    target = (int)i;
+                }
+            }
+            ImGui::Separator();
+            ImGui::TextDisabled("Alt+Left / Alt+Right jumps prev / next");
+            ImGui::EndMenu();
+            if (target >= 0) {
+                player_->seek(chapters_[(size_t)target].start);
+                showOsd(chapters_[(size_t)target].title.empty()
+                        ? std::string("Chapter ") + std::to_string(target + 1)
+                        : std::string("Chapter: ") + chapters_[(size_t)target].title);
+            }
+        }
+    }
+
     if (ImGui::MenuItem("Snapshot", "Ctrl+S", false, player_->isLoaded())) takeSnapshot();
     {
         bool have_ab = (loop_a_ >= 0.0 && loop_b_ >= 0.0);
@@ -5383,9 +6087,38 @@ void UIController::drawPlaylistPanel(int W, int H, float alpha) {
 
     ImGui::TextColored(ImVec4(0.75f, 0.85f, 1.0f, 1.0f), "PLAYLIST");
     if (playlist_.size() > 0) {
+        // Compute total duration by pulling per-file duration from
+        // resume_index_ (populated whenever a file has been opened at
+        // least once). Files never opened contribute nothing, so we
+        // append a "+" when we know the total is incomplete. Useful
+        // for "how long will this queue take" at a glance.
+        double total_dur = 0.0;
+        int    known = 0;
+        for (const auto& p : playlist_.items()) {
+            for (const auto& e : resume_index_) {
+                if (e.path == p && e.duration > 0.0) {
+                    total_dur += e.duration;
+                    ++known;
+                    break;
+                }
+            }
+        }
         ImGui::SameLine();
-        char count[24];
-        std::snprintf(count, sizeof(count), "  %zu", playlist_.size());
+        char count[64];
+        if (known > 0) {
+            int total_min = (int)(total_dur / 60.0 + 0.5);
+            int h = total_min / 60, m = total_min % 60;
+            bool complete = (known == (int)playlist_.size());
+            if (h > 0) {
+                std::snprintf(count, sizeof(count), "  %zu  .  %dh %dm%s",
+                              playlist_.size(), h, m, complete ? "" : "+");
+            } else {
+                std::snprintf(count, sizeof(count), "  %zu  .  %dm%s",
+                              playlist_.size(), m, complete ? "" : "+");
+            }
+        } else {
+            std::snprintf(count, sizeof(count), "  %zu", playlist_.size());
+        }
         ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.75f, 1.0f), "%s", count);
     }
     const float close_sz = 26.0f;
@@ -5435,14 +6168,88 @@ void UIController::drawPlaylistPanel(int W, int H, float alpha) {
     for (size_t i = 0; i < playlist_.size(); ++i) {
         bool is_cur = (i == playlist_.index());
         ImGui::PushID((int)i);
-        char label[32];
-        std::snprintf(label, sizeof(label), "%zu. ", i + 1);
+        // Watched-status glyph before the row number. Distinguishes
+        // never-seen from in-progress from finished at a glance in a
+        // long playlist.
+        //   [ ]  never opened
+        //   [.]  in progress (has resume pos short of end)
+        //   [v]  finished (naturally reached end - resume cleared but
+        //        stats_ tracked real playing time close to duration)
+        // We check stats_ FIRST for the finished case since
+        // handleNaturalEnd clears the resume entry when a file plays
+        // out naturally; otherwise "finished" would only ever show
+        // when the user manually seeked near the end. Falls through
+        // to resume_index_ for the in-progress + partially-finished
+        // cases.
+        const char* status = " ";
+        const std::string& item_path = playlist_.items()[i];
+        auto si = stats_.find(item_path);
+        double item_dur_for_status = 0.0;
+        for (const auto& e : resume_index_) {
+            if (e.path == item_path) {
+                item_dur_for_status = e.duration;
+                if (e.duration > 0.0 && e.pos >= e.duration - 60.0) {
+                    status = "v";
+                } else if (e.pos > 5.0) {
+                    status = ".";
+                }
+                break;
+            }
+        }
+        if (status[0] == ' ' && si != stats_.end() && si->second.sessions > 0) {
+            // No resume mark (or resume mark was cleared by natural end).
+            // If we have real watch stats, mark as "in progress" or
+            // "finished" based on how much of the file was watched.
+            if (item_dur_for_status > 0.0
+                && si->second.seconds >= item_dur_for_status * 0.90) {
+                status = "v";
+            } else {
+                status = ".";
+            }
+        }
+        char label[48];
+        if (is_cur) {
+            const char* mark = player_->isPlaying() ? ">> " : "|| ";
+            std::snprintf(label, sizeof(label), "%s%s %zu. ", mark, status, i + 1);
+        } else {
+            std::snprintf(label, sizeof(label), "   %s %zu. ", status, i + 1);
+        }
         std::string s = std::string(label) + baseName(playlist_.items()[i].c_str());
+        // Append duration in mm:ss when known (pulled from resume_index_ -
+        // populated once the file has been opened at least once). Small
+        // enough to fit at 260 px panel width without truncating the
+        // filename for typical names.
+        double item_dur = 0.0;
+        for (const auto& e : resume_index_) {
+            if (e.path == playlist_.items()[i] && e.duration > 0.0) {
+                item_dur = e.duration; break;
+            }
+        }
+        if (item_dur > 0.0) {
+            int mins = (int)(item_dur / 60.0);
+            int secs = (int)item_dur % 60;
+            char dbuf[24];
+            std::snprintf(dbuf, sizeof(dbuf), "   [%d:%02d]", mins, secs);
+            s += dbuf;
+        }
         // Reserve space on the right for the action buttons.
         float avail_w = ImGui::GetContentRegionAvail().x;
         float sel_w   = std::max(60.0f, avail_w - btns_w - 12.0f);
         if (ImGui::Selectable(s.c_str(), is_cur, 0, ImVec2(sel_w, row_h))) {
             play_idx = i;
+        }
+        // Middle click removes - VLC convention that power users
+        // reach for reflexively when the x button feels too small.
+        if (ImGui::IsItemHovered()
+            && ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) {
+            remove_idx = (int)i;
+        }
+        // Auto-scroll to the current row when the playlist advances
+        // (N key / natural end / click). Only fires on the FIRST
+        // draw with the new index to avoid fighting user scroll.
+        if (is_cur && last_playlist_scroll_idx_ != playlist_.index()) {
+            ImGui::SetScrollHereY(0.5f);
+            last_playlist_scroll_idx_ = playlist_.index();
         }
         if (ImGui::IsItemHovered()) {
             // Full-path tooltip so long file names still tell the user which
@@ -5608,7 +6415,9 @@ void UIController::handleEvent(const SDL_Event& event) {
                 arrow_no_ctrl ||
                 (key == SDLK_PAGEUP) || (key == SDLK_PAGEDOWN) ||
                 (key == SDLK_UP)     || (key == SDLK_DOWN) ||
-                (key == SDLK_COMMA)  || (key == SDLK_PERIOD);
+                (key == SDLK_COMMA)  || (key == SDLK_PERIOD) ||
+                (key == SDLK_EQUALS) || (key == SDLK_PLUS) || (key == SDLK_KP_PLUS) ||
+                (key == SDLK_MINUS)  || (key == SDLK_KP_MINUS);
             if (!holdable) return;
         }
 
@@ -5661,6 +6470,7 @@ void UIController::handleEvent(const SDL_Event& event) {
             if (show_info_)      { show_info_     = false; return; }
             if (show_history_)   { show_history_  = false; return; }
             if (show_settings_)  { show_settings_ = false; return; }
+            if (show_goto_time_) { show_goto_time_ = false; goto_time_buf_[0] = '\0'; return; }
             if (show_playlist_)  { show_playlist_ = false; return; }
             if (fullscreen_)     { setFullscreen(false);   return; }
             return;
@@ -5691,6 +6501,16 @@ void UIController::handleEvent(const SDL_Event& event) {
             if (show_settings_) {
                 show_shortcuts_ = false; show_about_ = false;
                 show_info_ = false; show_history_ = false;
+            }
+            return;
+        }
+        // Ctrl+G: go to a specific timestamp. mpv / VLC convention.
+        // Plain G is reserved for subtitle-size cycle.
+        if (sc == SDL_SCANCODE_G && (mod & SDL_KMOD_CTRL) && !(mod & SDL_KMOD_SHIFT)) {
+            if (player_->isLoaded()) {
+                show_goto_time_ = true;
+                goto_focus_pending_ = true;
+                goto_time_buf_[0] = '\0';
             }
             return;
         }
@@ -5857,8 +6677,71 @@ void UIController::handleEvent(const SDL_Event& event) {
             closeCurrent();
             return;
         }
+        // F4 / Backspace: close current file, back to splash. F4 is the
+        // convention users bring in from other players; Backspace is the
+        // "back one level" reflex from browsers. Both do the same thing.
+        if ((key == SDLK_F4 && !(mod & (SDL_KMOD_ALT | SDL_KMOD_CTRL)))
+            || (key == SDLK_BACKSPACE && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_SHIFT | SDL_KMOD_ALT)))) {
+            closeCurrent();
+            return;
+        }
+        // Ctrl+Q: quit. Universal desktop-app shortcut for "close the
+        // whole thing"; Alt+F4 still works too (OS-level).
+        if (sc == SDL_SCANCODE_Q && (mod & SDL_KMOD_CTRL)) {
+            if (onExitRequested) onExitRequested();
+            return;
+        }
+        // F5: reload the current file. Re-opens from disk at position 0
+        // (same as double-clicking the file again from Explorer).
+        // Skipped when nothing loaded to keep the key inert on splash.
+        if (key == SDLK_F5 && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_SHIFT | SDL_KMOD_ALT))) {
+            if (player_->isLoaded()) {
+                std::string p = player_->getFilename();
+                if (!p.empty()) {
+                    loadPath(p);
+                    showOsd("Reloaded");
+                }
+            }
+            return;
+        }
+        // +/- as volume alternatives (matches most players). Ignores
+        // Ctrl/Shift/Alt combos so Ctrl+= (zoom) and shift+= (=+) stay
+        // available for other bindings. SDLK_KP_PLUS / KP_MINUS cover
+        // the numpad path.
+        if (!(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT))) {
+            if (key == SDLK_EQUALS || key == SDLK_PLUS || key == SDLK_KP_PLUS) {
+                float v = std::min(2.0f, player_->getVolume() + 0.05f);
+                player_->setVolume(v);
+                char buf[32]; std::snprintf(buf, sizeof(buf), "Volume %d%%", (int)(v * 100));
+                showOsd(buf);
+                markConfigDirty();
+                return;
+            }
+            if (key == SDLK_MINUS || key == SDLK_KP_MINUS) {
+                float v = std::max(0.0f, player_->getVolume() - 0.05f);
+                player_->setVolume(v);
+                char buf[32]; std::snprintf(buf, sizeof(buf), "Volume %d%%", (int)(v * 100));
+                showOsd(buf);
+                markConfigDirty();
+                return;
+            }
+        }
+        // Ctrl+Home / Ctrl+End: alternate jumps to start/end. Plain
+        // Home/End already do this; Ctrl-combos are the "start/end of
+        // document" convention from every text editor and browser.
+        if (sc == SDL_SCANCODE_HOME && (mod & SDL_KMOD_CTRL)) {
+            if (player_->isLoaded()) player_->seek(0.0);
+            return;
+        }
+        if (sc == SDL_SCANCODE_END && (mod & SDL_KMOD_CTRL)) {
+            if (player_->isLoaded()) {
+                double d = player_->getDuration();
+                if (d > 1.0) player_->seek(d - 1.0);
+            }
+            return;
+        }
         // Ctrl+M: add a user bookmark at the current playhead. Per-file,
-        // persisted to vela.bookmarks. Duplicate protection: a Ctrl+M
+        // persisted to banana.bookmarks. Duplicate protection: a Ctrl+M
         // within 1 s of an existing mark is a no-op.
         if (sc == SDL_SCANCODE_M && (mod & SDL_KMOD_CTRL)) {
             addBookmark();
@@ -6110,10 +6993,15 @@ void UIController::handleEvent(const SDL_Event& event) {
             // sidecar cues without touching playback state - matches VLC.
             if (isSubtitleFile(p) && player_->isLoaded()) {
                 if (loadSubtitleSidecar(p)) {
-                    char buf[128];
-                    std::snprintf(buf, sizeof(buf), "Subs  %s",
-                                  baseName(p.c_str()));
-                    showOsd(buf, 2.0f);
+                    // Include cue count in the toast so the user gets a
+                    // sanity check that parsing found actual lines.
+                    // Zero cues would be a red flag - typically a wrong
+                    // encoding fallback or a malformed SRT/SMI file.
+                    char buf[192];
+                    std::snprintf(buf, sizeof(buf), "Subs  %s  (%d cues)",
+                                  baseName(p.c_str()),
+                                  (int)subtitles_.size());
+                    showOsd(buf, 2.4f);
                 } else {
                     showOsd("Subtitle load failed");
                 }
@@ -6373,12 +7261,12 @@ void UIController::handleEvent(const SDL_Event& event) {
     }
 }
 
-// -------------- Persistent settings (vela.config) --------------
+// -------------- Persistent settings (banana.config) --------------
 
 namespace {
 
 std::string sidecarPath(const char* name) { return dataDir() + name; }
-std::string configPath()                   { return dataDir() + "vela.config"; }
+std::string configPath()                   { return dataDir() + "banana.config"; }
 
 std::string strLower(std::string s) {
     for (auto& c : s) c = (char)std::tolower((unsigned char)c);
@@ -6397,12 +7285,12 @@ bool UIController::isSubtitleFile(const std::string& path) {
 }
 
 bool UIController::isVideoFile(const std::string& path) {
-    // Every extension Vela will pick up during a folder scan or Open
-    // Folder. Videos AND stills - FFmpeg's image2 demuxer handles PNG /
-    // JPEG / BMP / TIFF / WebP as single-frame "videos" and VideoPlayer
-    // flags them via isStillImage() so they don't auto-advance in a
-    // playlist. Keep in sync with the openFileDialogWin() filter below
-    // and the OpenWithList block in resources/vela_reg_install.nsh.
+    // Every extension Banana Player will pick up during a folder scan or
+    // Open Folder. Videos AND stills - FFmpeg's image2 demuxer handles
+    // PNG / JPEG / BMP / TIFF / WebP as single-frame "videos" and
+    // VideoPlayer flags them via isStillImage() so they don't auto-advance
+    // in a playlist. Keep in sync with the openFileDialogWin() filter
+    // below and the OpenWithList block in resources/banana_reg_install.nsh.
     static const char* kExts[] = {
         // Video
         ".mp4", ".mkv", ".avi", ".mov", ".webm", ".wmv",
@@ -6484,6 +7372,11 @@ void UIController::loadConfig() {
         }
         else if (std::strcmp(k, "loudness_normalize") == 0) {
             loudness_normalize_ = std::atoi(v) != 0;
+        }
+        else if (std::strcmp(k, "time_display_mode") == 0) {
+            int i = std::atoi(v);
+            if (i < 0 || i > 2) i = 0;
+            time_display_mode_ = i;
         }
         else if (std::strcmp(k, "hdr_half_res") == 0) {
             // 0 = Off (default), 1 = Auto (on for 4K+ HDR), 2 = ForceOn.
@@ -6582,6 +7475,7 @@ void UIController::saveConfig() {
     std::fprintf(fp, "always_on_top=%d\n",      always_on_top_ ? 1 : 0);
     std::fprintf(fp, "hdr_tonemap=%d\n",        hdr_tonemap_enabled_ ? 1 : 0);
     std::fprintf(fp, "audio_out_latency_ms=%d\n", audio_out_latency_ms_);
+    std::fprintf(fp, "time_display_mode=%d\n",  time_display_mode_);
     std::fprintf(fp, "loudness_normalize=%d\n",   loudness_normalize_ ? 1 : 0);
     std::fprintf(fp, "hdr_half_res=%d\n",       hdr_half_res_mode_);
     std::fprintf(fp, "pause_on_focus_loss=%d\n", pause_on_focus_loss_ ? 1 : 0);
@@ -6629,7 +7523,7 @@ void UIController::saveConfig() {
 }
 
 void UIController::loadRecents() {
-    std::string path = sidecarPath("vela.recent");
+    std::string path = sidecarPath("banana.recent");
     FILE* fp = nullptr;
     if (fopen_s(&fp, path.c_str(), "rb") != 0 || !fp) return;
     recent_files_.clear();
@@ -6646,14 +7540,14 @@ void UIController::loadRecents() {
 }
 
 void UIController::saveRecents() {
-    writeSidecarAtomic(sidecarPath("vela.recent"), [&](std::FILE* fp) {
+    writeSidecarAtomic(sidecarPath("banana.recent"), [&](std::FILE* fp) {
         std::fprintf(fp, "# Banana Player recent files - most recent first\n");
         for (const auto& p : recent_files_) std::fprintf(fp, "%s\n", p.c_str());
     });
 }
 
 void UIController::applyStoredWindowGeometry() {
-    std::string path = sidecarPath("vela.window");
+    std::string path = sidecarPath("banana.window");
     FILE* fp = nullptr;
     if (fopen_s(&fp, path.c_str(), "rb") != 0 || !fp) return;
     int x = 0, y = 0, w = 0, h = 0, maximized = 0;
@@ -6761,7 +7655,7 @@ void UIController::captureWindowGeometry() {
     SDL_GetWindowPosition(window_, &x, &y);
     SDL_GetWindowSize(window_, &w, &h);
     bool maximized = (SDL_GetWindowFlags(window_) & SDL_WINDOW_MAXIMIZED) != 0;
-    std::string path = sidecarPath("vela.window");
+    std::string path = sidecarPath("banana.window");
     FILE* fp = nullptr;
     if (fopen_s(&fp, path.c_str(), "wb") != 0 || !fp) return;
     std::fprintf(fp, "x=%d\ny=%d\nw=%d\nh=%d\nmaximized=%d\n",
@@ -6770,7 +7664,7 @@ void UIController::captureWindowGeometry() {
 }
 
 void UIController::loadLastPlaylist() {
-    std::string path = sidecarPath("vela.session.m3u");
+    std::string path = sidecarPath("banana.session.m3u");
     FILE* fp = nullptr;
     if (fopen_s(&fp, path.c_str(), "rb") != 0 || !fp) return;
     // Don't auto-play the last session (VLC-like restraint). Just prime
@@ -6788,7 +7682,7 @@ void UIController::loadLastPlaylist() {
 }
 
 void UIController::saveLastPlaylist() {
-    std::string path = sidecarPath("vela.session.m3u");
+    std::string path = sidecarPath("banana.session.m3u");
     // Wipe the file if the playlist is empty so we don't strand yesterday's
     // list forever.
     if (playlist_.empty()) {

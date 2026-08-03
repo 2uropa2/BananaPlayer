@@ -23,7 +23,18 @@ Makefile
 *.lib
 *.a
 
-# Vela runtime sidecars (per-user state, not source)
+# Banana Player runtime sidecars (per-user state, not source)
+banana.config
+banana.recent
+banana.resume
+banana.session.m3u
+banana.window
+banana.bookmarks
+banana.stats
+banana.hdrlut
+banana.license
+banana.promo.json
+# Legacy Vela-era names (leave ignored so upgraded dev trees stay clean)
 vela.config
 vela.recent
 vela.resume
@@ -41,3 +52,6 @@ snapshot_*.png
 
 # Leftover working file from earlier session - not source
 UIController_modified.txt
+
+# Runtime output from tools/install_local.ps1 / install_elevated.ps1
+install_last.log

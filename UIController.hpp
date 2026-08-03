@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 class ThumbnailProvider;
@@ -122,11 +123,205 @@ private:
     bool show_playlist_ = false;
     RotationMode rotation_ = RotationMode::Deg0;
     bool always_on_top_ = false;
+    // Time display in the bottom bar cycles on click:
+    //   0 = "MM:SS  /  MM:SS"       (elapsed / total)
+    //   1 = "-MM:SS"                (time remaining)
+    //   2 = "MM:SS   ends 21:47"    (elapsed + wall-clock end time)
+    // Standard player affordance - PotPlayer, VLC, MPC, YouTube all do
+    // some form of this. Persisted in banana.config as `time_display_mode`.
+    int time_display_mode_ = 0;
+    // Tracks the last playlist index we auto-scrolled the panel to.
+    // When playlist_.index() advances (natural end, N key, click)
+    // and the panel is open, drawPlaylistPanel calls SetScrollHereY
+    // for the new current row so it stays visible. Comparing against
+    // this cache avoids the scroll firing every frame.
+    size_t last_playlist_scroll_idx_ = (size_t)-1;
+    // Playlist filter input. Only shown when the playlist has more
+    // than a handful of items - a 4-file queue doesn't need search.
+    // Case-insensitive substring match against baseName; empty string
+    // shows everything. Not persisted.
+    char playlist_filter_buf_[128] = {0};
+    // Tracks the last chapter index we OSD'd. When natural playback
+    // crosses into a new chapter, the main loop compares current-time
+    // against chapters_[] and fires a subtle "Chapter: X" toast. Reset
+    // to -1 on every loadPath so the FIRST chapter of a new file also
+    // announces (users often skim intro chapters and want to know
+    // when the actual content starts).
+    int last_chapter_announced_ = -1;
+    // HDR tone-map toggle (Shift+H). Default on; users with HDR displays
+    // can flip it off to send source values straight through the SDR
+    // pipeline without our Hable+709 flattening. Persisted in banana.config.
+    bool hdr_tonemap_enabled_ = true;
+    // Audio output latency in milliseconds. Persisted here; passed to
+    // VideoPlayer::setAudioOutputLatencyMs on load and on any change.
+    // Default 30 matches typical Windows WASAPI shared mode with wired
+    // audio; users with Bluetooth headphones or specific DACs may need
+    // 60-200 ms; users on exclusive-mode / low-latency setups can go
+    // 0-10 ms. Tuned once per system, not per file.
+    int audio_out_latency_ms_ = 30;
+    // Loudness normalize (dynaudnorm). Off default - engages a filter
+    // in the audio decode path. Persists across files.
+    bool loudness_normalize_ = false;
+    // Half-res-HDR user preference. Auto is default and turns half-
+    // res on for 4K+ HDR (keeps 4K HDR playback smooth without a
+    // config trip). Stored here just to persist to banana.config; the
+    // actual load-time decision lives in VideoPlayer. Old config key
+    // hdr_half_res=0 (from pre-1.4 users) maps to Auto, hdr_half_res=1
+    // maps to ForceOn - no explicit-Off value from the old bool, so
+    // opt-out is a fresh action for those users.
+    int hdr_half_res_mode_ = 0;   // 0 Auto, 1 ForceOn, 2 Off
+    // When true, playback auto-pauses when the window loses focus and
+    // auto-resumes when it regains focus. Default off - lots of viewers
+    // background their video on purpose while doing something else. The
+    // resume-on-focus behavior only fires if we paused ourselves; a
+    // manual pause survives the focus event unchanged.
+    bool pause_on_focus_loss_ = false;
+    bool paused_by_focus_loss_ = false;   // runtime flag, not persisted
+    // Picture-in-picture mode: shrinks the window to a compact size in
+    // a screen corner and forces always-on-top. Toggle via Shift+P.
+    // The captured geometry / always-on-top state is restored on exit.
+    // Not persisted - PiP is a "right now" mode, not a session default.
+    bool pip_active_ = false;
+    int  pip_saved_x_ = 0, pip_saved_y_ = 0;
+    int  pip_saved_w_ = 0, pip_saved_h_ = 0;
+    bool pip_saved_always_on_top_ = false;
+    bool pip_was_maximized_ = false;
+    void togglePipMode();
+    // Snapshot capture mode. Default (false) writes the source frame
+    // straight from the decoder - no overlay, no subs, no HUD. When
+    // true, Ctrl+S instead reads the composited SDL back buffer, so the
+    // PNG includes whatever is on screen (subtitles + HUD + OSD). Wait
+    // ~3 s for the overlays to fade before triggering if a "video + subs"
+    // capture is what you want.
+    bool snapshot_include_overlays_ = false;
+    // Per-file playback statistics. `banana.stats` sidecar records total
+    // watched seconds + open-count per file, MRU-ordered, capped at 500
+    // to bound the sidecar. `stats_accum_this_session_` accumulates
+    // real playing time (not wall time - pauses don't count) and is
+    // committed to the map on file switch / quit.
+    struct PlaybackStats {
+        double seconds  = 0.0;
+        int    sessions = 0;
+    };
+    std::unordered_map<std::string, PlaybackStats> stats_;
+    double stats_accum_this_session_ = 0.0;
+    bool   stats_dirty_ = false;
+    void   loadStatsIndex();
+    void   writeStatsIndex();
+    void   commitCurrentStats();
+    PlaybackStats getStatsFor(const std::string& path) const;
+    // Custom folder for Ctrl+S snapshots and Ctrl+Shift+G bursts.
+    // Empty = use exe-adjacent (the historical default). Persisted in
+    // banana.config. Useful when the exe lives under C:\Program Files
+    // (no write access) or the user wants everything landing in Pictures.
+    std::string snapshot_dir_;
+    void openSnapshotFolderDialog();
+    // Save-as dialog + stream-copy of the current A-B segment to a new
+    // media file. No-op with an OSD when A-B markers aren't both set.
+    void exportABSegmentToFile();
+    void exportABSegmentAsGif();
+    // Copy the currently displayed subtitle line to the clipboard as
+    // CF_UNICODETEXT. Silent no-op when no cue is on screen. Handy
+    // for language-learning workflows where the user wants to keep
+    // difficult lines for later review.
+    void copyCurrentSubtitleToClipboard();
+    // Open the default browser on a Google search URL prefilled with
+    // the current subtitle text. Same guard as copy - only fires when
+    // a cue is on screen.
+    void lookupCurrentSubtitleInBrowser();
+    // Open OpenSubtitles.com search in the default browser, prefilled
+    // with the current file's basename AND the OpenSubtitles movie hash
+    // when the source is a plain local file. Handles the 90% case
+    // (find + download the right subtitle) without needing an API key,
+    // rate limits, or a bundled HTTP client. The user drags the .srt
+    // back onto Banana Player to load - our existing drop handler does the rest.
+    void searchSubtitlesOnline();
+    // Burst-screenshot state (Ctrl+Shift+G). Fires N snapshots at a
+    // fixed interval so a user can build a GIF or manual reaction pack
+    // without repeatedly hitting Ctrl+S. `remaining` counts down each
+    // shot; `next_at` is seconds until the next snapshot (initialised
+    // to 0 so the first shot fires the same frame the user triggered).
+    int   burst_count_    = 10;     // shots per trigger
+    float burst_interval_ = 0.5f;   // seconds between shots
+    int   burst_remaining_ = 0;
+    float burst_next_at_   = 0.0f;
+    void triggerBurstSnapshot();
+    // Subtitle text search (Ctrl+F). A small floating panel accepts a
+    // case-insensitive substring; Enter jumps to the next matching cue
+    // in `subtitles_` (wrap on end). last_hit_idx_ tracks the previous
+    // match so repeated Enter walks through duplicates.
+    bool show_subtitle_search_ = false;
+    char subtitle_search_query_[128] = "";
+    int  subtitle_search_last_hit_ = -1;
+    bool subtitle_search_focus_next_ = false;
+    // First-run onboarding banner. `first_run_hint_pending_` starts true
+    // if no banana.config was found at ctor time, then flips false and
+    // gets persisted to `first_run_done=1` after either (a) the user
+    // dismisses it, or (b) a file has been playing for a few seconds.
+    // Shown only while nothing is loaded (splash screen).
+    bool first_run_hint_pending_ = false;
+    void drawFirstRunHint(int W, int H);
+    // Countdown before auto-advancing to the next playlist item on
+    // natural end. 0 seconds disables (immediate advance = old behavior).
+    // Default 5 s. Persisted as `auto_next_countdown`. `..._active_`
+    // tracks whether a countdown is currently displayed; `..._secs_`
+    // is the live remaining seconds.
+    int   auto_next_countdown_ = 5;
+    bool  auto_next_active_    = false;
+    float auto_next_secs_      = 0.0f;
+    // Single-instance mode. When true, double-clicking a file (or
+    // launching BananaPlayer.exe with a path) while an existing Banana Player window
+    // is open forwards the path to that instance via a named pipe
+    // and the new process exits without showing a second window.
+    // Default false = always launch a new window (historical behavior).
+    // The actual mutex + pipe plumbing lives in main.cpp; this bool is
+    // just the persisted user preference read once at process start.
+    bool single_instance_mode_ = false;
+    void  handleNaturalEndImmediate();
+    void  drawAutoNextOverlay(int W, int H);
+    void  cancelAutoNext();
+    void openSubtitleSearch();
+    void drawSubtitleSearchPanel(int W, int H);
+    void runSubtitleSearchStep(int direction);
+    // Video zoom / pan. Zoom is a multiplier applied to the letterbox
+    // dst rect in main.cpp. Pan is in NORMALIZED window units (so the
+    // offset scales with the window - +/- 0.5 == half a window in that
+    // axis). Per-file transients; reset in loadPath.
+    float video_zoom_  = 1.0f;
+    float video_pan_x_ = 0.0f;
+    float video_pan_y_ = 0.0f;
+    // Panning is triggered by Alt+left-drag. The button-down handler
+    // captures Alt and starts tracking; motion accumulates delta into
+    // video_pan_x_/y_; button-up ends it. The play-pause single-click
+    // handler is suppressed while a pan is in progress.
+    bool  video_panning_    = false;
+    float video_pan_start_x_ = 0.0f;
+    float video_pan_start_y_ = 0.0f;
+    float video_pan_orig_x_  = 0.0f;
+    float video_pan_orig_y_  = 0.0f;
+    // Click-and-drag window move. Plain left-button-down over the video
+    // area records the anchor here; the first MOUSE_MOTION event whose
+    // delta from the anchor exceeds ~4 px flips `window_dragging_`
+    // true, cancels the pending play/pause click, and starts moving
+    // the OS window with SDL_SetWindowPosition. Below the threshold
+    // it stays a click and the existing pause/fullscreen path fires.
+    bool  window_drag_pending_ = false;
+    bool  window_dragging_     = false;
+    float window_drag_mouse_x_ = 0.0f;
+    float window_drag_mouse_y_ = 0.0f;
+    int   window_drag_win_x_   = 0;
+    int   window_drag_win_y_   = 0;
+public:
+    float getVideoZoom() const  { return video_zoom_; }
+    float getVideoPanX() const  { return video_pan_x_; }
+    float getVideoPanY() const  { return video_pan_y_; }
+private:
+    void resetVideoZoomPan();
 
     Playlist playlist_;
     std::vector<std::string> recent_files_;
 
-    // Persistent settings (vela.config next to exe). Load on ctor,
+    // Persistent settings (banana.config next to exe). Load on ctor,
     // save on dtor and after non-trivial state changes (volume snap,
     // subtitle size, always-on-top, repeat/shuffle, av sync).
     void loadConfig();
@@ -135,7 +330,7 @@ private:
     void markConfigDirty() { config_dirty_ = true; }
     // Recent files list (splash + File > Open Recent) and last-session
     // playlist snapshot (Save Playlist on quit, Restore on start) live in
-    // sidecar files, not in vela.config, so a corrupt path in one doesn't
+    // sidecar files, not in banana.config, so a corrupt path in one doesn't
     // wipe the rest of the settings. Format: one absolute path per line.
     void loadRecents();
     void saveRecents();
@@ -143,7 +338,7 @@ private:
     void saveLastPlaylist();
     // Restore the last-known window position + size on startup, and
     // capture the current geometry on shutdown. Called from main.cpp
-    // through public thin wrappers. Sidecar: vela.window (key=val).
+    // through public thin wrappers. Sidecar: banana.window (key=val).
     void applyStoredWindowGeometry();
     void captureWindowGeometry();
 
@@ -245,7 +440,7 @@ private:
     void seekPrevChapter();
     void seekNextChapter();
 
-    // User-set bookmarks (Ctrl+M) - per-file, persisted to a `vela.bookmarks`
+    // User-set bookmarks (Ctrl+M) - per-file, persisted to a `banana.bookmarks`
     // sidecar next to the exe. Same MRU pattern as resume_index_. Rendered
     // as amber diamond ticks below the seek track so they're visually
     // distinct from chapter posts (sky-blue) and A-B loop markers.
@@ -274,6 +469,28 @@ private:
     std::vector<SubtitleCue> subtitles_;
     bool subtitles_enabled_ = true;
     int  subtitle_cache_idx_ = 0;     // cache to skip linear scan every frame
+    // Secondary subtitle track for dual-subtitle display (learn-a-language
+    // workflow: primary in native tongue, secondary in target language).
+    // -1 = no secondary loaded. Rendered below the primary line with a
+    // slightly smaller font and dimmer color so the eye picks the primary
+    // as the main line. All the drawing/timing paths mirror the primary
+    // (offset, size, background) so users don't need parallel controls.
+    std::vector<SubtitleCue> subtitles_secondary_;
+    int  subtitle_secondary_track_active_ = -1;
+    int  subtitle_secondary_cache_idx_ = 0;
+    const SubtitleCue* currentSubtitleSecondary(double t);
+    bool loadSubtitleSidecarSecondary(const std::string& path);
+    // Embedded bitmap (PGS / DVB / DVD) subtitle rendering. Keeps one
+    // cached SDL_Texture for the currently-visible cue, keyed by the
+    // VideoPlayer-assigned cue id, so we don't re-upload the same RGBA
+    // bytes every frame. Torn down when the cue id changes (new cue)
+    // or vanishes (no cue on screen).
+    SDL_Texture* sub_bitmap_tex_ = nullptr;
+    uint64_t     sub_bitmap_tex_id_ = 0;
+    int          sub_bitmap_tex_w_  = 0;
+    int          sub_bitmap_tex_h_  = 0;
+    void freeBitmapSubtitleTexture();
+    void drawBitmapSubtitle(int W, int H);
     SubtitleSize subtitle_size_ = SubtitleSize::Medium;
     // Positive offset displays subs LATER (add to lookup time); negative
     // displays them EARLIER. Persistent across files (many subs from the
@@ -289,10 +506,40 @@ private:
     // when true. Toggled by plain B; persisted. Helps on busy / high-key
     // backgrounds where the outline alone isn't enough.
     bool subtitle_bg_ = false;
+    // Subtitle text color preset. Kept as an enum (not a raw color)
+    // so persisted values stay meaningful across UI restyles and users
+    // can't pick unreadable low-contrast garbage. White is the default;
+    // Yellow matches the classic Korean-TV subtitle look (a common ask
+    // from GomPlayer/PotPlayer users); Cyan/SkyBlue/Pink cover the rest.
+    enum class SubColor { White, Yellow, Cyan, SkyBlue, Pink };
+    SubColor subtitle_color_ = SubColor::White;
+    // Outline (letterbox around each character) thickness. Thin is the
+    // current 1-px 8-neighbor pass; Normal doubles to 2 px so subs stay
+    // legible on bright/busy backgrounds; Thick is 3 px for HDR content
+    // or projectors where even Normal washes out.
+    enum class SubOutline { Thin, Normal, Thick };
+    SubOutline subtitle_outline_ = SubOutline::Thin;
+    // Subtitle font preset. Values map to Style::SubtitleFont enum -
+    // kept as a plain int here to avoid a compile-time dependency on
+    // Style.hpp in a header. drawSubtitles casts on use.
+    int subtitle_font_ = 0;    // 0 = default merged, 1 = MalgunBold, 2 = Gulim, 3 = Batang
     void loadCompanionSubs(const std::string& video_path);
     const SubtitleCue* currentSubtitle(double t);
     void drawSubtitles(int W, int H);
     void cycleSubtitleSize();
+    // Single toggle path for HDR tone mapping - shared by the keyboard
+    // shortcut (Shift+H), the Settings menu item, and the overlay pill.
+    // Handles state flip, player sync, queue flush (so the switch shows
+    // immediately), OSD, and config dirty marking.
+    void toggleHdrToneMap();
+    // Cycle to the next available audio track. Wraps around the last
+    // track back to the first. No-op when only one (or zero) tracks are
+    // present.
+    void cycleAudioTrack();
+    // Cycle to the next external subtitle sidecar (movie.ko.srt ->
+    // movie.en.srt -> ... -> back to first). No-op when 0 or 1 sidecar
+    // tracks were discovered. Bound to J (mpv convention).
+    void cycleSubtitleTrack();
     float subtitleBasePx(int W, int H) const;
     // Shared subtitle-load path used by both the drag-drop handler and
     // the Settings > Subtitles > Load Subtitle... menu item. Returns true
@@ -312,7 +559,7 @@ private:
     void snapWindowToVideo();
 
     // Seek-bar hover thumbnail preview. Off by default; togglable from the
-    // Settings menu and persisted to vela.config. When enabled AND the
+    // Settings menu and persisted to banana.config. When enabled AND the
     // cursor is over the seek bar AND we're not mid-drag, we ask the
     // ThumbnailProvider for a preview and float a small popup above the
     // cursor. The provider owns its own AVFormatContext + worker thread so
@@ -353,8 +600,31 @@ private:
     // click-to-continue. Deferred mutations avoid modifying resume_index_
     // during the ImGui loop.
     bool show_history_  = false;
+    // Settings dialog (Ctrl+,): tabbed configuration surface. Owns the
+    // long-tail preference items (audio latency, HDR half-res, deint,
+    // normalizer, subtitle default styling, snapshot behaviour, etc.)
+    // that used to clutter the main menu. Per-file / per-session
+    // controls (rotation, playlist, audio track, subtitle track pick)
+    // stay in the main menu since they're touched often.
+    bool show_settings_ = false;
+    // Banana Player Pro license entry buffers (About panel). Persisted
+    // via License::activate() on Verify click; the buffers themselves
+    // are session-only. Kept as fixed-size arrays so ImGui::InputText
+    // can write directly without an alloc.
+    char        license_email_buf_[128] = {0};
+    char        license_key_buf_[64]    = {0};
+    std::string license_msg_;   // shown next to Verify: green/red status
+    int  settings_tab_  = 0;   // active tab index across draws
+    // Goto-time dialog (Ctrl+G): tiny modal that takes "H:MM:SS",
+    // "MM:SS", or plain seconds and seeks there. Standard mpv / VLC
+    // convention for jumping to a known timestamp precisely.
+    bool show_goto_time_ = false;
+    bool goto_focus_pending_ = false;
+    char goto_time_buf_[32] = {0};
     void drawShortcutsPanel(int W, int H);
     void drawAboutPanel(int W, int H);
     void drawInfoPanel(int W, int H);
     void drawHistoryPanel(int W, int H);
+    void drawSettingsDialog(int W, int H);
+    void drawGotoTimeDialog(int W, int H);
 };

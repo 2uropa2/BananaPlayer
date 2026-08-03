@@ -10,7 +10,7 @@
 
 namespace {
 
-// Full path of the running Vela.exe's directory, used to look for a
+// Full path of the running BananaPlayer.exe's directory, used to look for a
 // portable yt-dlp.exe dropped next to it.
 std::string appDir() {
     char buf[MAX_PATH];
@@ -140,7 +140,7 @@ std::string probeYtDlpVersion(const std::string& yt_dlp_path) {
 YoutubeResolver::YoutubeResolver() {
     // Ctor stays instant. The locate + version probe (2 child processes,
     // ~500 ms cold) now runs as the first phase of the worker thread so
-    // Vela's startup path - especially the Explorer-double-click case
+    // Banana Player's startup path - especially the Explorer-double-click case
     // where UIController is constructed before the first frame draws -
     // doesn't stall waiting for where.exe + `yt-dlp --version`.
     worker_ = std::thread(&YoutubeResolver::workerLoop, this);
@@ -161,7 +161,7 @@ YoutubeResolver::~YoutubeResolver() {
 }
 
 std::string YoutubeResolver::locateYtDlp() {
-    // 1) Portable drop next to Vela.exe wins - it's what the user
+    // 1) Portable drop next to BananaPlayer.exe wins - it's what the user
     //    consciously placed there.
     std::string portable = appDir() + "\\yt-dlp.exe";
     DWORD attrs = GetFileAttributesA(portable.c_str());

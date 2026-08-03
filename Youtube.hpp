@@ -9,8 +9,8 @@
 // on the yt-dlp child). Old results are discarded by request-id compare so
 // the drain never surfaces a stale URL after the user has moved on.
 //
-// yt-dlp is NOT bundled with Vela. On construction we probe for it via
-// where.exe and also check for a portable yt-dlp.exe next to Vela.exe.
+// yt-dlp is NOT bundled with Banana Player. On construction we probe for it via
+// where.exe and also check for a portable yt-dlp.exe next to BananaPlayer.exe.
 // If neither is found, ytDlpAvailable() returns false and every request
 // completes immediately with a "not installed" failure so the caller can
 // show install guidance in the OSD.
@@ -63,7 +63,7 @@ public:
     // stale results.
     bool tryDrainResult(Result& out);
 
-    // False when neither `where yt-dlp.exe` nor `<vela dir>\yt-dlp.exe`
+    // False when neither `where yt-dlp.exe` nor `<banana dir>\yt-dlp.exe`
     // resolved on construction. The caller uses this to distinguish
     // "install yt-dlp" from a normal resolve failure so the OSD text can
     // be actionable. During the brief probe window at startup this returns
@@ -91,7 +91,7 @@ public:
 private:
     void workerLoop();
 
-    // Locate yt-dlp.exe on PATH (via where.exe) or next to Vela.exe.
+    // Locate yt-dlp.exe on PATH (via where.exe) or next to BananaPlayer.exe.
     // Returns empty string on miss. Called once from the ctor.
     static std::string locateYtDlp();
 
@@ -111,7 +111,7 @@ private:
     std::string yt_dlp_version_;
     // Set once the worker has finished the initial locate+version probe.
     // Ctor stays instant - previously locate + `yt-dlp --version` ran
-    // synchronously and added ~500 ms to Vela startup on cold cache.
+    // synchronously and added ~500 ms to Banana Player startup on cold cache.
     std::atomic<bool> probe_done_{false};
 
     // Producer/consumer queue slot. Only the newest request matters; the

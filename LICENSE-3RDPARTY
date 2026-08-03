@@ -1,0 +1,108 @@
+Third-party components bundled with Vela
+
+Vela is distributed as a Windows binary that dynamically links (via DLLs) to
+the runtime components listed below. Vela's own source code is under the MIT
+license (see LICENSE). The bundled components each carry their own license;
+the summaries and pointers below satisfy the attribution / notice
+requirements for the LGPL and zlib licenses in particular.
+
+For end users: nothing you do with Vela is restricted by these licenses. For
+developers or redistributors: read the actual upstream license texts (each
+project ships one) before repackaging.
+
+--------------------------------------------------------------------------
+1. FFmpeg  (LGPL v2.1 or later)
+   Website: https://ffmpeg.org
+   License: https://ffmpeg.org/legal.html
+
+   Vela links dynamically to the LGPL configuration of FFmpeg. The
+   avcodec / avformat / avfilter / avutil / swscale / swresample DLLs
+   shipped next to Vela.exe are the unmodified upstream builds from the
+   vcpkg registry (https://github.com/microsoft/vcpkg). Under LGPL 2.1,
+   Vela is not required to be LGPL itself as long as (a) users can
+   replace the FFmpeg DLLs with a compatible build (they can - the DLLs
+   sit next to Vela.exe and any ABI-compatible FFmpeg build works), and
+   (b) this notice is included in the distribution.
+
+   The full LGPL v2.1 text is available at:
+     https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt
+
+--------------------------------------------------------------------------
+2. SDL 3  (zlib license)
+   Website: https://libsdl.org
+
+   Copyright (C) 1997-2025 Sam Lantinga <slouken@libsdl.org>
+
+   This software is provided 'as-is', without any express or implied
+   warranty. In no event will the authors be held liable for any damages
+   arising from the use of this software.
+
+   Permission is granted to anyone to use this software for any purpose,
+   including commercial applications, and to alter it and redistribute
+   it freely, subject to the following restrictions:
+
+   1. The origin of this software must not be misrepresented; you must
+      not claim that you wrote the original software. If you use this
+      software in a product, an acknowledgment in the product
+      documentation would be appreciated but is not required.
+   2. Altered source versions must be plainly marked as such, and must
+      not be misrepresented as being the original software.
+   3. This notice may not be removed or altered from any source
+      distribution.
+
+--------------------------------------------------------------------------
+3. Dear ImGui  (MIT)
+   Website: https://github.com/ocornut/imgui
+
+   The MIT License (MIT)
+   Copyright (c) 2014-2025 Omar Cornut
+
+   Permission is hereby granted, free of charge, to any person obtaining
+   a copy of this software and associated documentation files (the
+   "Software"), to deal in the Software without restriction, including
+   without limitation the rights to use, copy, modify, merge, publish,
+   distribute, sublicense, and/or sell copies of the Software, and to
+   permit persons to whom the Software is furnished to do so, subject to
+   the following conditions:
+
+   The above copyright notice and this permission notice shall be
+   included in all copies or substantial portions of the Software.
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+   IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+   CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+   TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+   SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+--------------------------------------------------------------------------
+4. yt-dlp  (The Unlicense / public domain)
+   Website: https://github.com/yt-dlp/yt-dlp
+
+   Vela's YouTube URL playback shells out to a bundled copy of
+   yt-dlp.exe (downloaded from the upstream release page at build time
+   and installed next to Vela.exe). yt-dlp is released under the
+   Unlicense, waiving copyright to the public domain.
+
+--------------------------------------------------------------------------
+5. Microsoft Visual C++ Runtime  (Microsoft EULA)
+   Copyright (C) Microsoft Corporation.
+
+   Vela's installer bundles the standard MSVC 14.x redistributable DLLs
+   (msvcp140.dll, vcruntime140.dll, ...) needed for the compiled binary
+   to run. Redistribution is permitted under the Visual Studio license
+   Vela was built with.
+
+--------------------------------------------------------------------------
+6. doctest  (MIT)  -  test binary only, NOT shipped
+   Website: https://github.com/doctest/doctest
+
+   Used only for the internal vela_tests test binary. The shipped
+   Vela.exe and its installer do not include doctest code.
+
+--------------------------------------------------------------------------
+7. Microsoft Windows fonts  (system-provided)
+   Vela loads Segoe UI, Malgun Gothic, Gulim, Batang, and Malgun Bold
+   from C:\Windows\Fonts at run time. These are provided by the
+   operating system; Vela does not bundle any font files.
