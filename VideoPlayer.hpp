@@ -511,8 +511,12 @@ private:
     // synced long-term without inheriting SDL's chunked-processing
     // jitter frame-to-frame. Video release path calls mediaNow_()
     // for the "current time" it compares frame pts against.
-    double   media_anchor_pts_  = 0.0;
-    uint64_t media_anchor_perf_ = 0;
+    // Mutable so the const mediaNowLocked_() can promote a
+    // seek_pending freeze into a normal ticking clock on timeout
+    // (see mediaNowLocked_ safety-valve comment). Callers always
+    // hold clock_mutex_.
+    mutable double   media_anchor_pts_  = 0.0;
+    mutable uint64_t media_anchor_perf_ = 0;
     bool     media_paused_      = true;
     // When true, the MediaClock is frozen at anchor_pts_ regardless of
     // wall-clock advance. Set immediately after seek / loadFile so that
@@ -522,7 +526,17 @@ private:
     // gap, which also hard-anchors to the true audio position. Without
     // this, video appears to fast-forward for the first 1-5 s after
     // every seek as it chases a MediaClock that got a head start.
-    bool     media_seek_pending_ = false;
+    mutable bool     media_seek_pending_ = false;
+    // Wall-clock timestamp (SDL_GetPerformanceCounter units) marking when
+    // media_seek_pending_ was last set. Used by mediaNowLocked_() as a
+    // safety valve: if the first audio nudge takes longer than
+    // kMediaSeekPendingTimeoutMs (typically because the demuxer emits a
+    // long run of video packets before the first audio packet - e.g. mp4s
+    // with a negative-DTS edit list from Twitter clips), the clock starts
+    // ticking anyway. Prevents the "first frame renders, then video is
+    // frozen forever while time doesn't advance" livelock the freeze
+    // would otherwise produce on such files.
+    mutable uint64_t media_seek_pending_since_perf_ = 0;
     // When true, next audio frame's PTS becomes audio_seek_base_time_.
     // Set on loadFile and after every seek. Without this the seek base
     // is the seek TARGET (e.g. 0.0), but the first actually-decoded
@@ -605,7 +619,66 @@ private:
     int audio_channels_ = 2;
     int audio_frame_bytes_ = 4;
 
-    std::thread decode_thread_;
+    // Three-thread pipeline. Demux thread reads packets and fans them
+    // out to per-stream packet queues. Separate video-decode and
+    // audio-decode threads pull from their queues and produce frames /
+    // audio samples. Necessary because MediaClock is nudged by audio
+    // pushes: coupling audio decode to video decode (single-thread
+    // architecture) causes a livelock on files that emit a long run
+    // of video packets before the first audio packet (Twitter mp4s
+    // with a negative-DTS edit list). The video queue fills, video
+    // decode blocks on queue-full, no more packets get read, audio
+    // never arrives, MediaClock never advances, no video release,
+    // queue never drains. See [[mediaclock-seek-pending-timeout]].
+    std::thread decode_thread_;             // demux-only (was demux+video+audio)
+    std::thread video_decode_thread_;
+    std::thread audio_decode_thread_;
+    void videoDecodeThread();
+    void audioDecodeThread();
+    // Per-stream packet queues. Bounded so a stalled decoder can't
+    // blow memory: the demux thread waits when either queue fills.
+    // Video queue is smaller because packets are large (whole H.264
+    // NAL bundles up to several hundred KB); audio queue can be
+    // larger because AAC packets are ~500 bytes.
+    std::deque<AVPacket*>   video_pkt_queue_;
+    std::mutex              video_pkt_mutex_;
+    std::condition_variable video_pkt_cv_;
+    static constexpr size_t kVideoPktQueueMax = 128;
+    std::deque<AVPacket*>   audio_pkt_queue_;
+    std::mutex              audio_pkt_mutex_;
+    std::condition_variable audio_pkt_cv_;
+    static constexpr size_t kAudioPktQueueMax = 256;
+    // Serializes writes/flushes to audio_dec_ctx_, swr_ctx_,
+    // audio_filter_graph_ (dynaudnorm), and audio_stream_ between
+    // demux (seek flush) and audio decode.
+    std::mutex              audio_ctx_mutex_;
+    // Serializes writes/flushes to video_dec_ctx_, sws_ctx_,
+    // filter_graph_ (deinterlace) between demux (seek flush) and
+    // video decode.
+    std::mutex              video_ctx_mutex_;
+
+    // Sticky "seek flush in progress" flag. Set by the demux thread
+    // AFTER it exchanges seek_requested_ to false, cleared once its
+    // ctx flush + final queue drain complete. Video decode thread
+    // checks this in its inner receive loop and in its queue-wait
+    // predicate so it drops any in-flight stale frame + releases
+    // video_ctx_mutex_ - fixes the follow-up deadlock the old
+    // seek_requested_ check couldn't catch (seek_requested_ is
+    // exchange-cleared before the ctx flush begins).
+    std::atomic<bool>       video_flush_pending_{false};
+
+    // Post-seek audio skip target. Set to seek target by the demux
+    // thread; audio decode thread silently discards any decoded frame
+    // whose pts is more than kAudioSkipToleranceSec BEFORE this value
+    // (does NOT push to SDL, does NOT nudge MediaClock). Cleared to
+    // -infinity once the audio catches up. Fixes the "5 second freeze
+    // after seek on Twitter-mov files" issue: those files' mov chunk
+    // interleaving makes av_seek_frame produce audio packets 3-5 s
+    // BEFORE the video keyframe, and anchoring MediaClock to that
+    // early audio pts blocks video release for the entire catch-up
+    // window. See file analysis in this PR / trace log.
+    std::atomic<double>     audio_skip_to_pts_{-1e18};
+    static constexpr double kAudioSkipToleranceSec = 0.100;
 
     // Most-recently-displayed frame, kept for snapshots.
     std::mutex last_frame_mutex_;

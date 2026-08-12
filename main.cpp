@@ -52,6 +52,11 @@ struct AppRenderCtx {
     SDL_Texture*   video_texture   = nullptr;
     int            tex_w           = 0;
     int            tex_h           = 0;
+    // Snapshot of ui->getTextureGeneration() at the moment
+    // video_texture was created. When the UI bumps its counter (e.g.
+    // Studio-range toggle in Settings), we rebuild the texture even
+    // though dims are unchanged. Sentinel ~0u forces first-time build.
+    unsigned int   tex_generation  = ~0u;
     bool           has_first_frame = false;
 };
 AppRenderCtx g_app;
@@ -69,14 +74,36 @@ void renderOneFrame() {
     if (player.isLoaded()) {
         int vw = player.getOutputWidth();
         int vh = player.getOutputHeight();
+        unsigned int ui_gen = ui.getTextureGeneration();
         if (vw > 0 && vh > 0
-            && (vw != g_app.tex_w || vh != g_app.tex_h || !g_app.video_texture)) {
+            && (vw != g_app.tex_w || vh != g_app.tex_h
+                || !g_app.video_texture
+                || ui_gen != g_app.tex_generation)) {
             if (g_app.video_texture) SDL_DestroyTexture(g_app.video_texture);
-            g_app.video_texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_IYUV,
-                                                    SDL_TEXTUREACCESS_STREAMING, vw, vh);
+            // Property-based creation so we can pin the input
+            // colorspace / range. Default full-range BT.709; the
+            // Studio-range toggle in Settings -> Video switches to
+            // BT.709 LIMITED (16-235). SDL's own default for YUV
+            // textures is BT.601 LIMITED, which is neither what we
+            // want as the default nor what most modern content is.
+            SDL_PropertiesID props = SDL_CreateProperties();
+            SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER,
+                                  SDL_PIXELFORMAT_IYUV);
+            SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER,
+                                  SDL_TEXTUREACCESS_STREAMING);
+            SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, vw);
+            SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, vh);
+            SDL_Colorspace cs = ui.getYuvStudioRange()
+                              ? SDL_COLORSPACE_BT709_LIMITED
+                              : SDL_COLORSPACE_BT709_FULL;
+            SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_COLORSPACE_NUMBER,
+                                  (Sint64)cs);
+            g_app.video_texture = SDL_CreateTextureWithProperties(renderer, props);
+            SDL_DestroyProperties(props);
             if (g_app.video_texture)
                 SDL_SetTextureScaleMode(g_app.video_texture, SDL_SCALEMODE_LINEAR);
             g_app.tex_w = vw; g_app.tex_h = vh;
+            g_app.tex_generation = ui_gen;
             g_app.has_first_frame = false;
         }
     }

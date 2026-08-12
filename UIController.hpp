@@ -78,6 +78,16 @@ public:
     static bool isYoutubeUrl(const std::string& s);
 
     RotationMode getRotation() const { return rotation_; }
+    // YUV colorspace / range readback for main.cpp's texture
+    // creation. Full range (0..255) by default; the toggle in Settings
+    // -> Video switches to studio range (16..235). See member docs.
+    bool getYuvStudioRange() const { return yuv_studio_range_; }
+    // Monotonic counter bumped whenever a texture-affecting Settings
+    // value changes. main.cpp compares this against its last-seen
+    // value and rebuilds the SDL texture when it moves - the create
+    // gate that only looked at width/height would otherwise miss a
+    // colorspace-only change.
+    unsigned int getTextureGeneration() const { return texture_generation_; }
 
     std::function<void()> onExitRequested;
 
@@ -152,6 +162,21 @@ private:
     // can flip it off to send source values straight through the SDR
     // pipeline without our Hable+709 flattening. Persisted in banana.config.
     bool hdr_tonemap_enabled_ = true;
+    // YUV -> RGB input range for SDL_UpdateYUVTexture uploads. Default
+    // false = full range 0..255 (SDL_COLORSPACE_BT709_FULL); when true,
+    // interpret input as studio/broadcast range 16..235 luma / 16..240
+    // chroma (SDL_COLORSPACE_BT709_LIMITED). The default was flipped
+    // from SDL's own default (BT.601 limited) at the user's request:
+    // most web / social / phone content ships as full-range these days
+    // and looked washed out under the limited assumption. Broadcast
+    // masters, DVD / Blu-ray rips, and older H.264 remain limited-range
+    // and need the toggle. Bumps texture_generation_ so main.cpp
+    // recreates the SDL texture with the new colorspace property.
+    bool yuv_studio_range_ = false;
+    // Bump this whenever a texture-affecting setting changes so
+    // main.cpp's texture-creation gate sees "dims same, but token
+    // moved" and rebuilds with the new colorspace property.
+    unsigned int texture_generation_ = 0;
     // Audio output latency in milliseconds. Persisted here; passed to
     // VideoPlayer::setAudioOutputLatencyMs on load and on any change.
     // Default 30 matches typical Windows WASAPI shared mode with wired

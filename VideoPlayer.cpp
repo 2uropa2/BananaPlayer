@@ -4,7 +4,17 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdarg>
 #include <cstring>
+
+static void bpTrace(const char* fmt, ...) {
+    static std::mutex mtx;
+    std::lock_guard<std::mutex> lk(mtx);
+    FILE* f = std::fopen("C:\\work\\Player\\bp_trace.log", "a");
+    if (!f) return;
+    va_list a; va_start(a, fmt); std::vfprintf(f, fmt, a); va_end(a);
+    std::fputc('\n', f); std::fclose(f);
+}
 
 static double ptsToSec(int64_t pts, AVRational tb) {
     if (pts == AV_NOPTS_VALUE) return 0.0;
@@ -166,9 +176,34 @@ void VideoPlayer::unload() {
     playing_ = false;
 
     { std::lock_guard<std::mutex> lk(video_queue_mutex_); video_queue_cv_.notify_all(); }
+    { std::lock_guard<std::mutex> lk(video_pkt_mutex_);   video_pkt_cv_.notify_all(); }
+    { std::lock_guard<std::mutex> lk(audio_pkt_mutex_);   audio_pkt_cv_.notify_all(); }
 
+    // Join in the order that avoids deadlock: demux first (stops
+    // pushing packets), then the two decoders (drain their queues).
     if (decode_thread_.joinable()) decode_thread_.join();
+    if (video_decode_thread_.joinable()) video_decode_thread_.join();
+    if (audio_decode_thread_.joinable()) audio_decode_thread_.join();
     loaded_ = false;
+
+    // Drain leftover packets from either queue - the joined threads
+    // may have left some behind if they woke up on quit_.
+    {
+        std::lock_guard<std::mutex> lk(video_pkt_mutex_);
+        while (!video_pkt_queue_.empty()) {
+            AVPacket* p = video_pkt_queue_.front();
+            av_packet_free(&p);
+            video_pkt_queue_.pop_front();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(audio_pkt_mutex_);
+        while (!audio_pkt_queue_.empty()) {
+            AVPacket* p = audio_pkt_queue_.front();
+            av_packet_free(&p);
+            audio_pkt_queue_.pop_front();
+        }
+    }
 
     if (audio_stream_) {
         SDL_DestroyAudioStream(audio_stream_);
@@ -226,6 +261,7 @@ void VideoPlayer::unload() {
     media_anchor_perf_ = 0;
     media_paused_      = true;
     media_seek_pending_ = false;
+    media_seek_pending_since_perf_ = 0;
     audio_base_needs_capture_ = false;
     playback_rate_ = 1.0f;
     av_sync_offset_ = 0.0;
@@ -470,9 +506,15 @@ bool VideoPlayer::loadFile(const std::string& filename, int preferred_audio_stre
     mediaAnchorLocked_(0.0);
     media_paused_ = true;
     media_seek_pending_ = (audio_stream_idx_ >= 0);
+    media_seek_pending_since_perf_ = media_seek_pending_
+        ? SDL_GetPerformanceCounter() : 0;
     audio_base_needs_capture_ = (audio_stream_idx_ >= 0);
     first_play_needed_ = true;
 
+    video_decode_thread_ = std::thread(&VideoPlayer::videoDecodeThread, this);
+    if (audio_stream_idx_ >= 0 && audio_dec_ctx_ && audio_stream_) {
+        audio_decode_thread_ = std::thread(&VideoPlayer::audioDecodeThread, this);
+    }
     decode_thread_ = std::thread(&VideoPlayer::demuxDecodeThread, this);
     return true;
 }
@@ -556,6 +598,7 @@ void VideoPlayer::play() {
             // by the pts of frames that never actually reached SDL.
             audio_base_needs_capture_ = true;
             media_seek_pending_       = true;
+            media_seek_pending_since_perf_ = SDL_GetPerformanceCounter();
         }
         SDL_PauseAudioStreamDevice(audio_stream_);
         if (need_dance) SDL_Delay(20);   // let SDL's device thread ack the pause
@@ -603,7 +646,20 @@ void VideoPlayer::seekInternal_(double seconds, bool preserve_deferred) {
     // nudge hard-anchors MediaClock there and playback proceeds
     // normally from the keyframe.
     if (!preserve_deferred) {
-        deferred_display_pts_.store(-1.0, std::memory_order_release);
+        // When paused: arm deferred-display at the seek target so
+        // updateTexture silently drains all pre-target frames (from
+        // the previous keyframe up to target) and shows ONLY the
+        // target frame. Matches other players' "seek while paused
+        // = snap to that frame instantly" behavior instead of the
+        // brief GOP-replay-fast-play the user sees otherwise.
+        // When playing: clear deferred; normal release path takes
+        // over so pre-target frames drop as stale and audio-nudged
+        // MediaClock releases target-and-after frames in real time.
+        if (!playing_.load()) {
+            deferred_display_pts_.store(seconds, std::memory_order_release);
+        } else {
+            deferred_display_pts_.store(-1.0, std::memory_order_release);
+        }
     }
     seek_target_ = seconds;
     seek_requested_ = true;
@@ -872,6 +928,7 @@ void VideoPlayer::resetClockLocked(double t) {
         // Freeze MediaClock until first nudge lands (prevents post-
         // seek fast-forward artifact).
         media_seek_pending_ = true;
+        media_seek_pending_since_perf_ = SDL_GetPerformanceCounter();
     } else {
         base_time_ = t;
     }
@@ -897,12 +954,42 @@ double VideoPlayer::mediaNowLocked_() const {
     //   - paused: user-facing pause
     //   - seek_pending: waiting for first audio frame to hard-anchor;
     //     ticking here would let video race ahead during the decode-
-    //     recovery gap, causing the visible fast-forward-after-seek
+    //     recovery gap, causing the visible fast-forward-after-seek.
+    //     Safety valve: if audio hasn't arrived within
+    //     kMediaSeekPendingTimeoutMs (~500 ms) the clock ticks anyway,
+    //     otherwise files that emit a long run of video before the
+    //     first audio packet (mp4s with negative-DTS edit list -
+    //     e.g. Twitter clips) livelock with video pinned to the first
+    //     frame forever, waiting for an audio nudge that can't happen
+    //     until the demuxer moves past all those video packets, which
+    //     it can't because the video queue is full and the decode
+    //     thread is blocked.
     //   - anchor_perf==0: uninitialized (right after loadFile)
-    if (media_paused_ || media_seek_pending_ || media_anchor_perf_ == 0) {
+    if (media_paused_ || media_anchor_perf_ == 0) {
         return media_anchor_pts_;
     }
     uint64_t now = SDL_GetPerformanceCounter();
+    if (media_seek_pending_) {
+        uint64_t since = media_seek_pending_since_perf_;
+        if (since == 0) return media_anchor_pts_;
+        double waited_ms = (double)(now - since) * 1000.0
+                        / (double)SDL_GetPerformanceFrequency();
+        constexpr double kMediaSeekPendingTimeoutMs = 500.0;
+        if (waited_ms < kMediaSeekPendingTimeoutMs) return media_anchor_pts_;
+        // Timed out - promote the freeze into a normal ticking clock.
+        // Advance the anchor to "now" and clear the pending flag so a
+        // late-arriving first audio nudge does a soft 5 % correction
+        // instead of hard-anchoring the clock backward (which would
+        // freeze video for the wall-clock time we ticked past).
+        double elapsed_since_anchor = (double)(now - media_anchor_perf_)
+                                    / (double)SDL_GetPerformanceFrequency();
+        double rate = (double)playback_rate_.load();
+        media_anchor_pts_  += elapsed_since_anchor * rate;
+        media_anchor_perf_  = now;
+        media_seek_pending_ = false;
+        media_seek_pending_since_perf_ = 0;
+        return media_anchor_pts_;
+    }
     double elapsed = (double)(now - media_anchor_perf_)
                    / (double)SDL_GetPerformanceFrequency();
     double rate = (double)playback_rate_.load();
@@ -938,6 +1025,7 @@ void VideoPlayer::mediaNudgeLocked_(double heard_pts) {
         media_anchor_pts_    = heard_pts;
         media_anchor_perf_   = SDL_GetPerformanceCounter();
         media_seek_pending_  = false;
+        media_seek_pending_since_perf_ = 0;
         return;
     }
     double my_now = mediaNowLocked_();
@@ -2511,238 +2599,195 @@ bool VideoPlayer::exportSegmentAsGif(const std::string& src, const std::string& 
     return ok;
 }
 
+// Helper: push a packet clone to a bounded per-stream packet queue.
+// Waits (up to shutdown/seek) if the queue is full. Returns true if
+// the clone was queued, false if we bailed on quit/seek.
+static bool enqueuePacketClone(AVPacket* src,
+                               std::deque<AVPacket*>& q,
+                               std::mutex& m,
+                               std::condition_variable& cv,
+                               size_t cap,
+                               std::atomic<bool>& quit,
+                               std::atomic<bool>& seek_req) {
+    AVPacket* clone = av_packet_alloc();
+    if (!clone) return false;
+    if (av_packet_ref(clone, src) != 0) { av_packet_free(&clone); return false; }
+    std::unique_lock<std::mutex> lk(m);
+    cv.wait(lk, [&]() { return q.size() < cap || quit || seek_req; });
+    if (quit || seek_req) { av_packet_free(&clone); return false; }
+    q.push_back(clone);
+    cv.notify_one();
+    return true;
+}
+
+// Demux thread: reads packets from the AVFormatContext and fans them
+// out to per-stream packet queues (video / audio) plus inline
+// subtitle handling. Does NO decoding. Decoupling demux from decode
+// is required because the audio push path is what nudges MediaClock,
+// and MediaClock is what releases video frames - so any coupling
+// that lets a full video-frame queue block audio processing creates a
+// livelock. See [[mediaclock-seek-pending-timeout]].
 void VideoPlayer::demuxDecodeThread() {
     AVPacket* packet = av_packet_alloc();
-    AVFrame* dec_frame = av_frame_alloc();
 
     while (!quit_) {
         // Atomic exchange claims the request. If the UI sets seek_requested_
         // back to true DURING our seek work (drag-spam or a new arrow-key
         // press mid-recovery), the next loop iteration will pick it up
-        // with the freshest seek_target_. Naive `if (seek_requested_) ...
-        // seek_requested_ = false` at the end lost the second request
-        // when the write clobbered the UI's set.
+        // with the freshest seek_target_.
         if (seek_requested_.exchange(false)) {
+            video_flush_pending_.store(true);
             double target = seek_target_.load();
+            // Arm audio-skip. Audio decode thread will silently discard
+            // any decoded frame whose pts is more than 100 ms BEFORE
+            // this. Prevents mov chunk-interleaving artifacts from
+            // anchoring MediaClock several seconds before the seek
+            // target. Cleared inside audio decode when it catches up.
+            audio_skip_to_pts_.store(target);
             int64_t ts = (int64_t)(target * AV_TIME_BASE);
             av_seek_frame(fmt_ctx_, -1, ts, AVSEEK_FLAG_BACKWARD);
-            avcodec_flush_buffers(video_dec_ctx_);
-            if (audio_dec_ctx_) avcodec_flush_buffers(audio_dec_ctx_);
-            flushQueues();
-            // Yadif holds a one-frame reference internally; a seek jumps
-            // to a discontinuous position so that reference is stale.
-            // Force a graph rebuild so the next frame doesn't get
-            // blended with a leftover from another scene.
+            // Discard queued packets on BOTH streams, then flush the
+            // decoders under their respective ctx mutexes so the
+            // decode threads don't race with the flush.
+            {
+                std::lock_guard<std::mutex> lk(video_pkt_mutex_);
+                while (!video_pkt_queue_.empty()) {
+                    AVPacket* p = video_pkt_queue_.front();
+                    av_packet_free(&p);
+                    video_pkt_queue_.pop_front();
+                }
+                video_pkt_cv_.notify_all();
+            }
+            {
+                std::lock_guard<std::mutex> lk(audio_pkt_mutex_);
+                while (!audio_pkt_queue_.empty()) {
+                    AVPacket* p = audio_pkt_queue_.front();
+                    av_packet_free(&p);
+                    audio_pkt_queue_.pop_front();
+                }
+                audio_pkt_cv_.notify_all();
+            }
+            // Drain video output queue BEFORE trying to acquire
+            // video_ctx_mutex_. Without this, if the video decode thread
+            // is currently blocked in video_queue_cv_.wait (queue full)
+            // WHILE holding video_ctx_mutex_, we deadlock: our exchange
+            // already cleared seek_requested_ so the decode thread's
+            // wait predicate won't fire on it, and updateTexture won't
+            // drain the queue while MediaClock is frozen at the seek
+            // target. Freeing the queue here gives the decode thread's
+            // wait predicate `size < MAX` a true reading, so it wakes,
+            // pushes its held frame, and releases the ctx mutex.
+            {
+                std::lock_guard<std::mutex> lk(video_queue_mutex_);
+                while (!video_queue_.empty()) {
+                    AVFrame* f = video_queue_.front().frame;
+                    av_frame_free(&f);
+                    video_queue_.pop_front();
+                }
+                video_queue_cv_.notify_all();
+            }
+            {
+                std::lock_guard<std::mutex> lk(video_ctx_mutex_);
+                if (video_dec_ctx_) avcodec_flush_buffers(video_dec_ctx_);
+            }
+            {
+                std::lock_guard<std::mutex> lk(audio_ctx_mutex_);
+                if (audio_dec_ctx_) avcodec_flush_buffers(audio_dec_ctx_);
+                if (audio_stream_) {
+                    // Same rationale as the first-play dance in play():
+                    // on some Windows / SDL3 configurations, once the
+                    // device thread has stalled (queued keeps equaling
+                    // pushed - SDL playing but not consuming), a plain
+                    // SDL_ClearAudioStream leaves it in the same stuck
+                    // state after the clear. The user hears silence,
+                    // and every audio push nudges MediaClock to the
+                    // freshly-captured base pts (== seek target),
+                    // pinning video frames until ~5 s of audio piles
+                    // up in the stream and demux back-pressure finally
+                    // stops the nudge stream (then MediaClock ticks
+                    // wall-clock and video moves again). Do the same
+                    // Pause -> Delay -> Resume state-edge to force
+                    // the device thread to re-latch on our resumed
+                    // stream so playback (and audio drain) actually
+                    // continue immediately after seek.
+                    SDL_ClearAudioStream(audio_stream_);
+                    SDL_PauseAudioStreamDevice(audio_stream_);
+                    SDL_Delay(20);
+                    SDL_ResumeAudioStreamDevice(audio_stream_);
+                }
+            }
+            // Second video-output drain: catches any stale frames the
+            // video decode thread pushed between the first drain
+            // (queue empty) and the avcodec_flush_buffers above
+            // (decoder's internal buffer emptied). Those frames are
+            // from before the seek and must not reach updateTexture.
+            //
+            // NOTE: intentionally NOT calling flushQueues() here even
+            // though it would do the same drain - flushQueues() also
+            // calls SDL_ClearAudioStream, which would UNDO the Pause+
+            // Delay+Resume state edge we just performed above and
+            // re-stall the device thread. Video-only drain is what
+            // this step needs.
+            {
+                std::lock_guard<std::mutex> lk(video_queue_mutex_);
+                while (!video_queue_.empty()) {
+                    AVFrame* f = video_queue_.front().frame;
+                    av_frame_free(&f);
+                    video_queue_.pop_front();
+                }
+                video_queue_cv_.notify_all();
+            }
+            // Yadif holds a one-frame reference internally; a seek
+            // makes it stale. Force a graph rebuild.
             deinterlace_rebuild_.store(true);
-            // Subtitle cues before the seek target are still valid;
-            // cues AFTER it will be re-decoded once we play through
-            // that region again. We do NOT clear all cues (that would
-            // wipe already-decoded subs the user wants back on a
-            // rewind). The linear scan in getEmbeddedSubtitleAt is
-            // O(n) anyway - dupes past ~8k get trimmed there.
             {
                 std::lock_guard<std::mutex> lk(clock_mutex_);
                 resetClockLocked(target);
             }
             eof_ = false;
             ended_signaled_ = false;
-            // Do NOT write seek_requested_ = false here - we already
-            // exchanged it to false at the top. Writing it again would
-            // clobber any UI-side re-request that landed during this
-            // iteration's seek work.
+            // Clear the sticky flush flag AFTER all state is settled
+            // so the decode thread's next receive_frame loop starts
+            // fresh on the flushed decoder. Notify so the decode
+            // thread's queue-wait predicate (which included this flag)
+            // re-checks - not strictly required now that the queue is
+            // empty, but harmless.
+            video_flush_pending_.store(false);
+            { std::lock_guard<std::mutex> lk(video_queue_mutex_); video_queue_cv_.notify_all(); }
             continue;
         }
 
-        {
-            std::unique_lock<std::mutex> lk(video_queue_mutex_);
-            if (video_queue_.size() >= VIDEO_QUEUE_MAX) {
-                video_queue_cv_.wait_for(lk, std::chrono::milliseconds(15));
-                continue;
-            }
-        }
+        // Back-pressure: sleep only if audio queue is genuinely full.
+        // We do NOT gate on video packet queue size the same way -
+        // even if video is backed up, we still want to keep pushing
+        // audio packets through so MediaClock keeps getting nudged.
+        // The per-stream enqueue below waits if its own queue is
+        // full, so memory stays bounded either way.
         if (audio_stream_
             && SDL_GetAudioStreamQueued(audio_stream_) > AUDIO_QUEUE_MAX_BYTES) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
 
-        // Local helper: convert a decoded frame (possibly HW-backed) into
-        // a YUV420P frame at video_width_ x video_height_. Returns nullptr
-        // on failure. `dec_frame` is left in the caller's care.
-        auto materializeYUV = [&](AVFrame* src_in) -> AVFrame* {
-            // HDR sources go through the CPU tone-map path. The toggle
-            // (Shift+H in the UI) lets a user with an HDR monitor skip
-            // the map so raw source values reach the display. Failure
-            // (unsupported source pixel format) also falls through.
-            if (hdr_kind_ != HdrKind::None
-                && hdr_tonemap_enabled_.load(std::memory_order_relaxed)) {
-                if (AVFrame* mapped = materializeHdrToneMap_(src_in)) {
-                    return mapped;
-                }
-            }
-            AVFrame* tmp_sw = nullptr;
-            AVFrame* src = src_in;
-            if (hw_active_ && src_in->format == hw_pix_fmt_) {
-                tmp_sw = av_frame_alloc();
-                if (!tmp_sw || av_hwframe_transfer_data(tmp_sw, src_in, 0) < 0) {
-                    if (tmp_sw) av_frame_free(&tmp_sw);
-                    return nullptr;
-                }
-                src = tmp_sw;
-            }
-            AVFrame* out = av_frame_alloc();
-            if (!out) { if (tmp_sw) av_frame_free(&tmp_sw); return nullptr; }
-            out->format = AV_PIX_FMT_YUV420P;
-            out->width  = video_width_;
-            out->height = video_height_;
-            if (av_frame_get_buffer(out, 32) != 0) {
-                av_frame_free(&out);
-                if (tmp_sw) av_frame_free(&tmp_sw);
-                return nullptr;
-            }
-            sws_ctx_ = sws_getCachedContext(sws_ctx_,
-                src->width, src->height, (AVPixelFormat)src->format,
-                video_width_, video_height_, AV_PIX_FMT_YUV420P,
-                SWS_BILINEAR, nullptr, nullptr, nullptr);
-            if (!sws_ctx_) {
-                av_frame_free(&out);
-                if (tmp_sw) av_frame_free(&tmp_sw);
-                return nullptr;
-            }
-            sws_scale(sws_ctx_, src->data, src->linesize, 0,
-                      src->height, out->data, out->linesize);
-            if (tmp_sw) av_frame_free(&tmp_sw);
-            return out;
-        };
-
-        // Wrap materializeYUV with an optional yadif pass. Yadif requires
-        // SW input, so HW-decoded frames skip the filter (HW pipelines
-        // typically deliver progressive-equivalent output already). When
-        // the user turns the mode Off, or on Auto against a progressive
-        // source, we bypass the filter entirely.
-        //
-        // IMPORTANT: yadif is a delay-1 filter. When it's active, the
-        // frame you get out corresponds to the PREVIOUS input's pts,
-        // not the current one. So the wrapper also returns the pts to
-        // use - the caller must NOT pull pts from dec_frame when the
-        // filter fired, or audio and video will drift by ~one frame.
-        auto materializeWithDeinterlace = [&](AVFrame* in_frame,
-                                              double& out_pts) -> AVFrame* {
-            out_pts = ptsToSec(in_frame->best_effort_timestamp,
-                               video_time_base_);
-            DeinterlaceMode dm = deinterlace_mode_.load(std::memory_order_relaxed);
-            bool want = (dm == DeinterlaceMode::On)
-                     || (dm == DeinterlaceMode::Auto && source_interlaced_);
-            bool is_hw = hw_active_ && in_frame->format == hw_pix_fmt_;
-            if (!want || is_hw) return materializeYUV(in_frame);
-
-            AVPixelFormat fmt = (AVPixelFormat)in_frame->format;
-            bool rebuild = deinterlace_rebuild_.exchange(false);
-            if (!filter_graph_
-                || filter_in_fmt_ != fmt
-                || filter_in_w_   != in_frame->width
-                || filter_in_h_   != in_frame->height
-                || rebuild) {
-                if (!buildDeinterlaceGraph_(fmt, in_frame->width,
-                                            in_frame->height,
-                                            video_time_base_)) {
-                    return materializeYUV(in_frame);
-                }
-            }
-            if (av_buffersrc_add_frame(buffersrc_, in_frame) < 0) {
-                return materializeYUV(in_frame);
-            }
-            AVFrame* filt = av_frame_alloc();
-            if (!filt) return materializeYUV(in_frame);
-            AVFrame* out = nullptr;
-            int fret = av_buffersink_get_frame(buffersink_, filt);
-            if (fret >= 0) {
-                out = materializeYUV(filt);
-                // Use the FILTERED frame's own pts - yadif rewrites it
-                // to match whichever input the output actually
-                // corresponds to. Using dec_frame's pts here is the
-                // one-frame drift bug that appeared as A/V desync.
-                out_pts = ptsToSec(filt->best_effort_timestamp,
-                                   video_time_base_);
-                av_frame_unref(filt);
-            }
-            av_frame_free(&filt);
-            // First frame after a fresh graph: yadif needs one prior
-            // reference to produce output, so it swallows the frame and
-            // returns EAGAIN. Fall back to the raw input so playback
-            // doesn't lose a frame at the start / after a seek. pts
-            // already set to in_frame's above.
-            if (!out) out = materializeYUV(in_frame);
-            return out;
-        };
-
         int ret = av_read_frame(fmt_ctx_, packet);
         if (ret == AVERROR_EOF || ret == AVERROR(EIO)) {
-            avcodec_send_packet(video_dec_ctx_, nullptr);
-            while (!quit_ && avcodec_receive_frame(video_dec_ctx_, dec_frame) == 0) {
-                double pts = 0.0;
-                AVFrame* out = materializeWithDeinterlace(dec_frame, pts);
-                if (out) {
-                    std::lock_guard<std::mutex> lk(video_queue_mutex_);
-                    video_queue_.push_back({out, pts});
+            // Push flush sentinels (null-data packets) to both decode
+            // threads so they drain their internal buffers.
+            if (video_dec_ctx_) {
+                AVPacket* eos = av_packet_alloc();
+                if (eos) {
+                    std::lock_guard<std::mutex> lk(video_pkt_mutex_);
+                    video_pkt_queue_.push_back(eos);
+                    video_pkt_cv_.notify_one();
                 }
-                av_frame_unref(dec_frame);
             }
             if (audio_dec_ctx_ && audio_stream_) {
-                avcodec_send_packet(audio_dec_ctx_, nullptr);
-                while (!quit_ && avcodec_receive_frame(audio_dec_ctx_, dec_frame) == 0) {
-                    int in_samples = dec_frame->nb_samples;
-                    int64_t delay = swr_get_delay(swr_ctx_, audio_dec_ctx_->sample_rate);
-                    int out_samples = (int)av_rescale_rnd(delay + in_samples,
-                                                          audio_sample_rate_,
-                                                          audio_dec_ctx_->sample_rate,
-                                                          AV_ROUND_UP);
-                    std::vector<uint8_t> tmp((size_t)out_samples * audio_frame_bytes_);
-                    uint8_t* out_ptr[1] = { tmp.data() };
-                    int converted = swr_convert(swr_ctx_, out_ptr, out_samples,
-                                                (const uint8_t**)dec_frame->extended_data,
-                                                in_samples);
-                    if (converted > 0) {
-                        int bytes = converted * audio_frame_bytes_;
-                        // Capture actual frame pts BEFORE pushing so we
-                        // can seed audio_seek_base_time_ with what the
-                        // decoder actually produced (accounts for AAC
-                        // encoder-delay padding, container start_time,
-                        // etc). Falls back to previous value on NOPTS.
-                        double frame_pts_sec = -1.0;
-                        if (dec_frame->pts != AV_NOPTS_VALUE) {
-                            frame_pts_sec = ptsToSec(dec_frame->pts,
-                                                     audio_time_base_);
-                        }
-                        samplePeak_((const int16_t*)tmp.data(), bytes);
-                        SDL_PutAudioStreamData(audio_stream_, tmp.data(), bytes);
-                        std::lock_guard<std::mutex> lk(clock_mutex_);
-                        if (audio_base_needs_capture_ && frame_pts_sec >= 0.0) {
-                            // First frame after loadFile / seek: reseat
-                            // the byte-counting base to the true audio
-                            // pts so heard-position math has zero bias.
-                            audio_seek_base_time_ = frame_pts_sec;
-                            audio_pushed_bytes_ = 0;   // this push is byte 0
-                            audio_base_needs_capture_ = false;
-                        }
-                        audio_pushed_bytes_ += (uint64_t)bytes;
-                        // Nudge MediaClock toward "what the user is hearing
-                        // right now" = seek_base + played/bps - latency.
-                        // dead-zoned + rate-limited inside the nudge itself.
-                        int queued = (int)SDL_GetAudioStreamQueued(audio_stream_);
-                        int64_t played = (int64_t)audio_pushed_bytes_ - queued;
-                        if (played < 0) played = 0;
-                        double bps = (double)(audio_frame_bytes_ * audio_sample_rate_);
-                        if (bps > 0.0) {
-                            double heard = audio_seek_base_time_
-                                         + (double)played / bps
-                                         - (double)audio_out_latency_ms_.load() * 0.001;
-                            mediaNudgeLocked_(heard);
-                        }
-                    }
-                    av_frame_unref(dec_frame);
+                AVPacket* eos = av_packet_alloc();
+                if (eos) {
+                    std::lock_guard<std::mutex> lk(audio_pkt_mutex_);
+                    audio_pkt_queue_.push_back(eos);
+                    audio_pkt_cv_.notify_one();
                 }
-                SDL_FlushAudioStream(audio_stream_);
             }
             eof_ = true;
             while (!quit_ && !seek_requested_ && eof_) {
@@ -2757,135 +2802,14 @@ void VideoPlayer::demuxDecodeThread() {
         }
 
         if (packet->stream_index == video_stream_idx_) {
-            if (avcodec_send_packet(video_dec_ctx_, packet) >= 0) {
-                while (!quit_ && !seek_requested_
-                       && avcodec_receive_frame(video_dec_ctx_, dec_frame) >= 0) {
-                    double pts = 0.0;
-                    AVFrame* out = materializeWithDeinterlace(dec_frame, pts);
-                    if (!out) { av_frame_unref(dec_frame); continue; }
-                    std::unique_lock<std::mutex> lk(video_queue_mutex_);
-                    video_queue_cv_.wait(lk, [this]() {
-                        return video_queue_.size() < VIDEO_QUEUE_MAX
-                               || quit_ || seek_requested_;
-                    });
-                    if (quit_ || seek_requested_) {
-                        av_frame_free(&out);
-                        av_frame_unref(dec_frame);
-                        break;
-                    }
-                    video_queue_.push_back({out, pts});
-                    av_frame_unref(dec_frame);
-                }
-            }
+            enqueuePacketClone(packet, video_pkt_queue_,
+                               video_pkt_mutex_, video_pkt_cv_,
+                               kVideoPktQueueMax, quit_, seek_requested_);
         } else if (packet->stream_index == audio_stream_idx_
                    && audio_dec_ctx_ && swr_ctx_ && audio_stream_) {
-            if (avcodec_send_packet(audio_dec_ctx_, packet) >= 0) {
-                while (!quit_ && !seek_requested_
-                       && avcodec_receive_frame(audio_dec_ctx_, dec_frame) >= 0) {
-                    // Loudness normalize: route dec_frame through the
-                    // dynaudnorm graph before swresample. Yields zero,
-                    // one, or occasionally multiple output frames.
-                    // Filtered frames replace dec_frame for the rest
-                    // of this iteration; ownership stays local.
-                    AVFrame* audio_src = dec_frame;
-                    AVFrame* filtered  = nullptr;
-                    bool want_loud = loudness_normalize_.load();
-                    if (loudness_rebuild_.exchange(false)) {
-                        if (!want_loud) freeLoudnessGraph_();
-                        loudness_build_failed_ = false;   // user toggled; retry allowed
-                    }
-                    if (want_loud && !loudness_build_failed_) {
-                        bool need_rebuild = !audio_filter_graph_
-                            || audio_filter_rate_ != dec_frame->sample_rate
-                            || audio_filter_fmt_  != (AVSampleFormat)dec_frame->format
-                            || audio_filter_ch_hash_ !=
-                               ((uint64_t)dec_frame->ch_layout.nb_channels
-                                | ((uint64_t)dec_frame->ch_layout.order << 8));
-                        if (need_rebuild) {
-                            loudness_build_failed_ = !buildLoudnessGraph_(
-                                dec_frame->sample_rate,
-                                (AVSampleFormat)dec_frame->format,
-                                dec_frame->ch_layout);
-                        }
-                        if (audio_filter_graph_
-                            && av_buffersrc_add_frame_flags(audio_buffersrc_,
-                                    dec_frame, AV_BUFFERSRC_FLAG_KEEP_REF) >= 0) {
-                            // Simple push+pull. dynaudnorm with our params
-                            // (f=200, g=15) has ~3 s of internal buffer
-                            // and we push+pull 1:1 every iteration, so the
-                            // buffer never fills - EAGAIN on push is
-                            // essentially impossible with this filter.
-                            // Priming phase produces no output for the
-                            // first ~15 frames; we fall through to raw
-                            // dec_frame for those, which sounds like
-                            // a fraction of a second of un-normalized
-                            // audio at play start - acceptable.
-                            filtered = av_frame_alloc();
-                            if (filtered) {
-                                int fret = av_buffersink_get_frame(audio_buffersink_,
-                                                                   filtered);
-                                if (fret >= 0) {
-                                    audio_src = filtered;
-                                } else {
-                                    av_frame_free(&filtered);
-                                    filtered = nullptr;
-                                }
-                            }
-                        }
-                    }
-                    int in_samples = audio_src->nb_samples;
-                    int64_t delay = swr_get_delay(swr_ctx_, audio_dec_ctx_->sample_rate);
-                    int out_samples = (int)av_rescale_rnd(delay + in_samples,
-                                                          audio_sample_rate_,
-                                                          audio_dec_ctx_->sample_rate,
-                                                          AV_ROUND_UP);
-                    std::vector<uint8_t> tmp((size_t)out_samples * audio_frame_bytes_);
-                    uint8_t* out_ptr[1] = { tmp.data() };
-                    int converted = swr_convert(swr_ctx_, out_ptr, out_samples,
-                                                (const uint8_t**)audio_src->extended_data,
-                                                in_samples);
-                    if (converted > 0) {
-                        int bytes = converted * audio_frame_bytes_;
-                        // Capture actual frame pts BEFORE pushing so we
-                        // can seed audio_seek_base_time_ with what the
-                        // decoder actually produced (accounts for AAC
-                        // encoder-delay padding, container start_time,
-                        // etc). Falls back to previous value on NOPTS.
-                        double frame_pts_sec = -1.0;
-                        if (dec_frame->pts != AV_NOPTS_VALUE) {
-                            frame_pts_sec = ptsToSec(dec_frame->pts,
-                                                     audio_time_base_);
-                        }
-                        samplePeak_((const int16_t*)tmp.data(), bytes);
-                        SDL_PutAudioStreamData(audio_stream_, tmp.data(), bytes);
-                        std::lock_guard<std::mutex> lk(clock_mutex_);
-                        if (audio_base_needs_capture_ && frame_pts_sec >= 0.0) {
-                            // First frame after loadFile / seek: reseat
-                            // the byte-counting base to the true audio
-                            // pts so heard-position math has zero bias.
-                            audio_seek_base_time_ = frame_pts_sec;
-                            audio_pushed_bytes_ = 0;   // this push is byte 0
-                            audio_base_needs_capture_ = false;
-                        }
-                        audio_pushed_bytes_ += (uint64_t)bytes;
-                        // Nudge MediaClock toward "what the user is hearing
-                        // right now" = seek_base + played/bps - latency.
-                        // dead-zoned + rate-limited inside the nudge itself.
-                        int queued = (int)SDL_GetAudioStreamQueued(audio_stream_);
-                        int64_t played = (int64_t)audio_pushed_bytes_ - queued;
-                        if (played < 0) played = 0;
-                        double bps = (double)(audio_frame_bytes_ * audio_sample_rate_);
-                        if (bps > 0.0) {
-                            double heard = audio_seek_base_time_
-                                         + (double)played / bps
-                                         - (double)audio_out_latency_ms_.load() * 0.001;
-                            mediaNudgeLocked_(heard);
-                        }
-                    }
-                    if (filtered) av_frame_free(&filtered);
-                    av_frame_unref(dec_frame);
-                }
-            }
+            enqueuePacketClone(packet, audio_pkt_queue_,
+                               audio_pkt_mutex_, audio_pkt_cv_,
+                               kAudioPktQueueMax, quit_, seek_requested_);
         } else if (embedded_sub_stream_idx_ >= 0
                    && packet->stream_index == embedded_sub_stream_idx_
                    && sub_dec_ctx_) {
@@ -2894,8 +2818,321 @@ void VideoPlayer::demuxDecodeThread() {
         av_packet_unref(packet);
     }
 
-    av_frame_free(&dec_frame);
     av_packet_free(&packet);
+}
+
+// Video decode thread: pulls encoded packets from video_pkt_queue_,
+// runs them through the decoder + optional HDR tone-map + optional
+// yadif deinterlace, and pushes YUV420P frames to the output
+// video_queue_ that updateTexture reads.
+void VideoPlayer::videoDecodeThread() {
+    AVPacket* pkt = nullptr;
+    AVFrame* dec_frame = av_frame_alloc();
+
+    // Local YUV materialization + deinterlace helpers - copied from
+    // the old inline code, unchanged semantically. Access to
+    // sws_ctx_, filter_graph_, and friends is serialized against
+    // demux seek-flush via video_ctx_mutex_.
+    auto materializeYUV = [&](AVFrame* src_in) -> AVFrame* {
+        if (hdr_kind_ != HdrKind::None
+            && hdr_tonemap_enabled_.load(std::memory_order_relaxed)) {
+            if (AVFrame* mapped = materializeHdrToneMap_(src_in)) {
+                return mapped;
+            }
+        }
+        AVFrame* tmp_sw = nullptr;
+        AVFrame* src = src_in;
+        if (hw_active_ && src_in->format == hw_pix_fmt_) {
+            tmp_sw = av_frame_alloc();
+            if (!tmp_sw || av_hwframe_transfer_data(tmp_sw, src_in, 0) < 0) {
+                if (tmp_sw) av_frame_free(&tmp_sw);
+                return nullptr;
+            }
+            src = tmp_sw;
+        }
+        AVFrame* out = av_frame_alloc();
+        if (!out) { if (tmp_sw) av_frame_free(&tmp_sw); return nullptr; }
+        out->format = AV_PIX_FMT_YUV420P;
+        out->width  = video_width_;
+        out->height = video_height_;
+        if (av_frame_get_buffer(out, 32) != 0) {
+            av_frame_free(&out);
+            if (tmp_sw) av_frame_free(&tmp_sw);
+            return nullptr;
+        }
+        sws_ctx_ = sws_getCachedContext(sws_ctx_,
+            src->width, src->height, (AVPixelFormat)src->format,
+            video_width_, video_height_, AV_PIX_FMT_YUV420P,
+            SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (!sws_ctx_) {
+            av_frame_free(&out);
+            if (tmp_sw) av_frame_free(&tmp_sw);
+            return nullptr;
+        }
+        sws_scale(sws_ctx_, src->data, src->linesize, 0,
+                  src->height, out->data, out->linesize);
+        if (tmp_sw) av_frame_free(&tmp_sw);
+        return out;
+    };
+    auto materializeWithDeinterlace = [&](AVFrame* in_frame,
+                                          double& out_pts) -> AVFrame* {
+        out_pts = ptsToSec(in_frame->best_effort_timestamp, video_time_base_);
+        DeinterlaceMode dm = deinterlace_mode_.load(std::memory_order_relaxed);
+        bool want = (dm == DeinterlaceMode::On)
+                 || (dm == DeinterlaceMode::Auto && source_interlaced_);
+        bool is_hw = hw_active_ && in_frame->format == hw_pix_fmt_;
+        if (!want || is_hw) return materializeYUV(in_frame);
+        AVPixelFormat fmt = (AVPixelFormat)in_frame->format;
+        bool rebuild = deinterlace_rebuild_.exchange(false);
+        if (!filter_graph_
+            || filter_in_fmt_ != fmt
+            || filter_in_w_   != in_frame->width
+            || filter_in_h_   != in_frame->height
+            || rebuild) {
+            if (!buildDeinterlaceGraph_(fmt, in_frame->width,
+                                        in_frame->height,
+                                        video_time_base_)) {
+                return materializeYUV(in_frame);
+            }
+        }
+        if (av_buffersrc_add_frame(buffersrc_, in_frame) < 0) {
+            return materializeYUV(in_frame);
+        }
+        AVFrame* filt = av_frame_alloc();
+        if (!filt) return materializeYUV(in_frame);
+        AVFrame* out = nullptr;
+        int fret = av_buffersink_get_frame(buffersink_, filt);
+        if (fret >= 0) {
+            out = materializeYUV(filt);
+            out_pts = ptsToSec(filt->best_effort_timestamp, video_time_base_);
+            av_frame_unref(filt);
+        }
+        av_frame_free(&filt);
+        if (!out) out = materializeYUV(in_frame);
+        return out;
+    };
+
+    while (!quit_) {
+        {
+            std::unique_lock<std::mutex> lk(video_pkt_mutex_);
+            video_pkt_cv_.wait(lk, [this]() {
+                return !video_pkt_queue_.empty() || quit_;
+            });
+            if (quit_) break;
+            pkt = video_pkt_queue_.front();
+            video_pkt_queue_.pop_front();
+            video_pkt_cv_.notify_one();
+        }
+        bool is_flush = (pkt->data == nullptr && pkt->size == 0);
+        {
+            std::lock_guard<std::mutex> lk(video_ctx_mutex_);
+            if (!video_dec_ctx_) { av_packet_free(&pkt); continue; }
+            if (avcodec_send_packet(video_dec_ctx_,
+                                    is_flush ? nullptr : pkt) >= 0) {
+                while (!quit_ && !video_flush_pending_.load()
+                       && avcodec_receive_frame(video_dec_ctx_, dec_frame) >= 0) {
+                    double pts = 0.0;
+                    AVFrame* out = materializeWithDeinterlace(dec_frame, pts);
+                    av_frame_unref(dec_frame);
+                    if (!out) continue;
+                    std::unique_lock<std::mutex> qlk(video_queue_mutex_);
+                    // Wait for room, but exit fast on quit / seek / flush
+                    // so the demux thread's seek-flush isn't blocked
+                    // waiting for us to unstick. seek_requested_ alone
+                    // is insufficient because the demux thread's
+                    // exchange(false) clears it before starting the
+                    // flush - video_flush_pending_ stays sticky through
+                    // the whole flush window.
+                    video_queue_cv_.wait(qlk, [this]() {
+                        return video_queue_.size() < VIDEO_QUEUE_MAX
+                            || quit_ || seek_requested_
+                            || video_flush_pending_.load();
+                    });
+                    if (quit_ || seek_requested_ || video_flush_pending_.load()) {
+                        av_frame_free(&out);
+                        break;
+                    }
+                    video_queue_.push_back({out, pts});
+                }
+            }
+        }
+        av_packet_free(&pkt);
+    }
+    av_frame_free(&dec_frame);
+}
+
+// Audio decode + push runs on its own thread so a full video queue
+// cannot starve audio processing. See the audio_pkt_queue_ /
+// [[mediaclock-seek-pending-timeout]] discussion for why this
+// separation matters: the audio push path is what nudges MediaClock,
+// and MediaClock is what releases video frames from the queue.
+// Coupling audio decode to the demux thread (which blocks on
+// video-queue-full) causes a deadlock/livelock on any file whose
+// demuxer emits a long run of video packets before the first audio
+// packet.
+void VideoPlayer::audioDecodeThread() {
+    AVFrame* dec_frame = av_frame_alloc();
+    while (!quit_) {
+        AVPacket* pkt = nullptr;
+        {
+            std::unique_lock<std::mutex> lk(audio_pkt_mutex_);
+            audio_pkt_cv_.wait(lk, [this]() {
+                return !audio_pkt_queue_.empty() || quit_;
+            });
+            if (quit_) break;
+            pkt = audio_pkt_queue_.front();
+            audio_pkt_queue_.pop_front();
+            audio_pkt_cv_.notify_one();
+        }
+        bool is_flush = (pkt->data == nullptr && pkt->size == 0);
+        {
+            std::lock_guard<std::mutex> lk(audio_ctx_mutex_);
+            if (!audio_dec_ctx_ || !swr_ctx_ || !audio_stream_) {
+                av_packet_free(&pkt);
+                continue;
+            }
+            int sret = avcodec_send_packet(audio_dec_ctx_,
+                                           is_flush ? nullptr : pkt);
+            if (sret < 0 && !is_flush) {
+                av_packet_free(&pkt);
+                continue;
+            }
+            // Resample + push one audio frame to SDL, run post-seek skip
+            // check, and nudge MediaClock. Used for BOTH raw dec_frame
+            // (normalizer off) and each filter-output frame from
+            // dynaudnorm's buffersink (normalizer on). Extracting this
+            // is what fixes the "chik chik" glitch: dynaudnorm buffers
+            // ~200 ms of input before emitting each output frame, so
+            // pushing dec_frame ALSO on every iteration produced ~2x
+            // the audio SDL expected and sounded shredded.
+            auto processAndPush = [&](AVFrame* frame) {
+                int in_samples = frame->nb_samples;
+                int64_t delay = swr_get_delay(swr_ctx_, audio_dec_ctx_->sample_rate);
+                int out_samples = (int)av_rescale_rnd(delay + in_samples,
+                                                      audio_sample_rate_,
+                                                      audio_dec_ctx_->sample_rate,
+                                                      AV_ROUND_UP);
+                std::vector<uint8_t> tmp((size_t)out_samples * audio_frame_bytes_);
+                uint8_t* out_ptr[1] = { tmp.data() };
+                int converted = swr_convert(swr_ctx_, out_ptr, out_samples,
+                                            (const uint8_t**)frame->extended_data,
+                                            in_samples);
+                if (converted <= 0) return;
+                int bytes = converted * audio_frame_bytes_;
+                {
+                    const int16_t* p = (const int16_t*)tmp.data();
+                    int nsamp = bytes / 2;
+                    int32_t peak = 0;
+                    int64_t sqsum = 0;
+                    for (int i = 0; i < nsamp; ++i) {
+                        int32_t v = p[i]; if (v < 0) v = -v;
+                        if (v > peak) peak = v;
+                        sqsum += (int64_t)p[i] * (int64_t)p[i];
+                    }
+                    double rms = nsamp ? std::sqrt((double)sqsum / (double)nsamp) : 0.0;
+                    static int pc = 0; ++pc;
+                    if (pc <= 40 || pc % 50 == 0) {
+                        bool loud_on = loudness_normalize_.load();
+                        bpTrace("[push] #%d loud=%d nb=%d bytes=%d peak=%d rms=%.1f fmt=%d fpts=%.3f",
+                                pc, (int)loud_on, in_samples, bytes, peak, rms,
+                                (int)frame->format, ptsToSec(frame->pts, audio_time_base_));
+                    }
+                }
+                double frame_pts_sec = -1.0;
+                if (frame->pts != AV_NOPTS_VALUE) {
+                    frame_pts_sec = ptsToSec(frame->pts, audio_time_base_);
+                }
+                // Post-seek audio skip: silently drop frames that
+                // land significantly before the seek target. Fixes
+                // mov chunk-interleaving pathology where av_seek_frame
+                // produces audio packets 3-5 s before the video
+                // keyframe (Twitter mp4 with edit list is the
+                // canonical case).
+                double skip_to = audio_skip_to_pts_.load(std::memory_order_relaxed);
+                if (frame_pts_sec >= 0.0
+                    && skip_to > -1e17
+                    && frame_pts_sec < skip_to - kAudioSkipToleranceSec) {
+                    return;
+                }
+                if (skip_to > -1e17) {
+                    audio_skip_to_pts_.store(-1e18, std::memory_order_relaxed);
+                }
+                samplePeak_((const int16_t*)tmp.data(), bytes);
+                SDL_PutAudioStreamData(audio_stream_, tmp.data(), bytes);
+                std::lock_guard<std::mutex> lk2(clock_mutex_);
+                if (audio_base_needs_capture_ && frame_pts_sec >= 0.0) {
+                    audio_seek_base_time_ = frame_pts_sec;
+                    audio_pushed_bytes_ = 0;
+                    audio_base_needs_capture_ = false;
+                }
+                audio_pushed_bytes_ += (uint64_t)bytes;
+                int queued = (int)SDL_GetAudioStreamQueued(audio_stream_);
+                int64_t played = (int64_t)audio_pushed_bytes_ - queued;
+                if (played < 0) played = 0;
+                double bps = (double)(audio_frame_bytes_ * audio_sample_rate_);
+                if (bps > 0.0) {
+                    double heard = audio_seek_base_time_
+                                 + (double)played / bps
+                                 - (double)audio_out_latency_ms_.load() * 0.001;
+                    mediaNudgeLocked_(heard);
+                }
+            };
+
+            while (!quit_
+                   && avcodec_receive_frame(audio_dec_ctx_, dec_frame) >= 0) {
+                bool want_loud = loudness_normalize_.load();
+                if (loudness_rebuild_.exchange(false)) {
+                    if (!want_loud) freeLoudnessGraph_();
+                    loudness_build_failed_ = false;
+                }
+                bool use_filter = false;
+                if (want_loud && !loudness_build_failed_) {
+                    bool need_rebuild = !audio_filter_graph_
+                        || audio_filter_rate_ != dec_frame->sample_rate
+                        || audio_filter_fmt_  != (AVSampleFormat)dec_frame->format
+                        || audio_filter_ch_hash_ !=
+                           ((uint64_t)dec_frame->ch_layout.nb_channels
+                            | ((uint64_t)dec_frame->ch_layout.order << 8));
+                    if (need_rebuild) {
+                        loudness_build_failed_ = !buildLoudnessGraph_(
+                            dec_frame->sample_rate,
+                            (AVSampleFormat)dec_frame->format,
+                            dec_frame->ch_layout);
+                    }
+                    use_filter = (audio_filter_graph_ != nullptr);
+                }
+
+                if (use_filter) {
+                    // Feed the input, then drain ALL currently-available
+                    // output frames. dynaudnorm's f=200 ms internal frame
+                    // means it buffers ~6 input frames (32 ms E-AC3 each)
+                    // before emitting one 9600-sample output. Pulling
+                    // only one output per input meant we pushed 6 raw +
+                    // 1 filtered per 200 ms of source = ~2x SDL feed
+                    // rate = shredded/glitched audio. Now: raw NEVER
+                    // reaches SDL when the filter is on; only filter
+                    // outputs do.
+                    if (av_buffersrc_add_frame_flags(audio_buffersrc_,
+                            dec_frame, AV_BUFFERSRC_FLAG_KEEP_REF) >= 0) {
+                        AVFrame* out = av_frame_alloc();
+                        while (out && !quit_) {
+                            int fret = av_buffersink_get_frame(audio_buffersink_, out);
+                            if (fret < 0) break;
+                            processAndPush(out);
+                            av_frame_unref(out);
+                        }
+                        if (out) av_frame_free(&out);
+                    }
+                } else {
+                    processAndPush(dec_frame);
+                }
+                av_frame_unref(dec_frame);
+            }
+            if (is_flush && audio_stream_) SDL_FlushAudioStream(audio_stream_);
+        }
+        av_packet_free(&pkt);
+    }
+    av_frame_free(&dec_frame);
 }
 
 bool VideoPlayer::updateTexture(SDL_Texture* texture) {

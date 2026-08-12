@@ -2215,6 +2215,7 @@ void UIController::drawShortcutsPanel(int W, int H) {
             { "+  /  -",         "Same as Up / Down" },
             { "Mouse wheel",     "Volume (over video)" },
             { "M",               "Mute" },
+            { "Shift + N",       "Normalizer toggle (loudness)" },
         }},
         { "Speed", {
             { "[",               "Slower" },
@@ -3238,6 +3239,15 @@ void UIController::drawSettingsDialog(int W, int H) {
                     toggleHdrToneMap();
                 }
                 ImGui::Spacing();
+                bool studio = yuv_studio_range_;
+                if (ImGui::Checkbox("Studio YUV range (16-235)  -  off = full range (0-255) default",
+                                    &studio)) {
+                    yuv_studio_range_ = studio;
+                    ++texture_generation_;
+                    markConfigDirty();
+                }
+                ImGui::TextDisabled("Off suits web/social/phone footage. Turn on for DVD/Blu-ray/broadcast rips.");
+                ImGui::Spacing();
                 radio_group("HDR half-resolution (perf lever for 4K HDR)",
                             hdr_half_res_mode_,
                             {{"Off  (full quality)", 0},
@@ -3297,7 +3307,7 @@ void UIController::drawSettingsDialog(int W, int H) {
                                 player_->setNormalizeMode(nn);
                             });
                 bool ln = player_->isLoudnessNormalize();
-                if (ImGui::Checkbox("Loudness normalize (dynamic, dynaudnorm)",
+                if (ImGui::Checkbox("Normalizer (loudness, dynaudnorm) (Shift+N)",
                                     &ln)) {
                     player_->setLoudnessNormalize(ln);
                     loudness_normalize_ = ln;
@@ -6888,11 +6898,29 @@ void UIController::handleEvent(const SDL_Event& event) {
             }
             return;
         }
+        // Audio normalizer toggle (Shift+N). Ties to loudness_normalize
+        // (dynaudnorm in the audio decode graph) - the "make quiet
+        // dialogue louder without clipping loud action" one. Peak-based
+        // Volume normalize stays in Settings only. Checked BEFORE the
+        // plain-N next-in-playlist branch below.
+        if (sc == SDL_SCANCODE_N
+            && (mod & SDL_KMOD_SHIFT)
+            && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT))) {
+            if (player_) {
+                bool nowOn = !player_->isLoudnessNormalize();
+                player_->setLoudnessNormalize(nowOn);
+                loudness_normalize_ = nowOn;
+                showOsd(nowOn ? "Normalizer on" : "Normalizer off");
+                markConfigDirty();
+            }
+            return;
+        }
         // Playlist next/prev. Ctrl+N/Ctrl+B kept for muscle memory; plain N
         // is the shorter standard-player binding when no letter conflicts.
         if (key == SDLK_N && (mod & SDL_KMOD_CTRL))         { playNextInPlaylist(); return; }
         if (key == SDLK_B && (mod & SDL_KMOD_CTRL))         { playPrevInPlaylist(); return; }
-        if (sc == SDL_SCANCODE_N && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT))) {
+        if (sc == SDL_SCANCODE_N
+            && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_SHIFT))) {
             playNextInPlaylist(); return;
         }
         // Playback speed: [ slower, ] faster, \ reset. Step 0.25x, clamp 0.25-3.0.
@@ -7365,6 +7393,7 @@ void UIController::loadConfig() {
         else if (std::strcmp(k, "subtitles_enabled") == 0) subtitles_enabled_ = std::atoi(v) != 0;
         else if (std::strcmp(k, "always_on_top") == 0)   always_on_top_ = std::atoi(v) != 0;
         else if (std::strcmp(k, "hdr_tonemap") == 0)     hdr_tonemap_enabled_ = std::atoi(v) != 0;
+        else if (std::strcmp(k, "yuv_studio_range") == 0) yuv_studio_range_ = std::atoi(v) != 0;
         else if (std::strcmp(k, "audio_out_latency_ms") == 0) {
             int i = std::atoi(v);
             if (i < 0) i = 0; else if (i > 500) i = 500;
@@ -7474,6 +7503,7 @@ void UIController::saveConfig() {
     std::fprintf(fp, "subtitles_enabled=%d\n",  subtitles_enabled_ ? 1 : 0);
     std::fprintf(fp, "always_on_top=%d\n",      always_on_top_ ? 1 : 0);
     std::fprintf(fp, "hdr_tonemap=%d\n",        hdr_tonemap_enabled_ ? 1 : 0);
+    std::fprintf(fp, "yuv_studio_range=%d\n",   yuv_studio_range_ ? 1 : 0);
     std::fprintf(fp, "audio_out_latency_ms=%d\n", audio_out_latency_ms_);
     std::fprintf(fp, "time_display_mode=%d\n",  time_display_mode_);
     std::fprintf(fp, "loudness_normalize=%d\n",   loudness_normalize_ ? 1 : 0);
