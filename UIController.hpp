@@ -93,6 +93,11 @@ public:
 
 private:
     void drawSplash(int W, int H);
+    // Fills the empty video area when the loaded file is audio-only (.m4a
+    // / .mp3 / voice memos): centered filename + "AUDIO ONLY" label on a
+    // dark background, so the window doesn't just look like a hung player
+    // while audio plays through the normal seek/volume/OSD stack.
+    void drawAudioOnlyPlaceholder(int W, int H);
     void drawTopOverlay(int W, int H, float alpha);
     void drawBottomOverlay(int W, int H, float alpha);
     void drawPlaylistPanel(int W, int H, float alpha);
@@ -187,6 +192,9 @@ private:
     // Loudness normalize (dynaudnorm). Off default - engages a filter
     // in the audio decode path. Persists across files.
     bool loudness_normalize_ = false;
+    // Voice boost. Cross-forum "explosions loud, dialogue quiet" fix.
+    // Off by default so the audio graph stays inert on load.
+    bool voice_boost_ = false;
     // Half-res-HDR user preference. Auto is default and turns half-
     // res on for 4K+ HDR (keeps 4K HDR playback smooth without a
     // config trip). Stored here just to persist to banana.config; the
@@ -202,6 +210,19 @@ private:
     // manual pause survives the focus event unchanged.
     bool pause_on_focus_loss_ = false;
     bool paused_by_focus_loss_ = false;   // runtime flag, not persisted
+    // Latched true once we've shown the "playback stalled" OSD for the
+    // current file, so the toast doesn't spam every frame. Reset in
+    // loadPath alongside other per-file state.
+    bool     decoder_stuck_notified_ = false;
+    // Timestamp (SDL_GetTicks) when the decoder-stuck watchdog first
+    // fired for this file. We wait ~1.2 s before actually complaining so
+    // the "short file + repeat-one + decoder warmup" livelock has time
+    // to self-heal once repeat-One is suppressed (the moment the flag
+    // is set, handleNaturalEndImmediate stops re-triggering seek(0),
+    // the decode thread drains, and frames start flowing). Only true
+    // codec failures (HEVC 12-bit against a build without Rext, etc.)
+    // sit at 0 frames past the grace window.
+    Uint64   decoder_stuck_since_ms_ = 0;
     // Picture-in-picture mode: shrinks the window to a compact size in
     // a screen corner and forces always-on-top. Toggle via Shift+P.
     // The captured geometry / always-on-top state is restored on exit.
@@ -375,6 +396,11 @@ private:
     void savePlaylistM3U(const std::string& path);
     void loadPlaylistM3U(const std::string& path);
     static bool isVideoFile(const std::string& path);
+    // Enumerate video files directly under `dir` (non-recursive), returned
+    // sorted by file size descending. Dropping a folder onto Banana Player
+    // usually means "watch the main video" - the biggest file - not the
+    // alphabetically-first thumbnail / sample / behind-the-scenes clip.
+    static std::vector<std::string> scanFolderVideosBySize(const std::string& dir);
 
     // Per-file resume position, VLC-style. Loaded on startup, updated on file
     // switch / natural end / quit, and flushed to disk when dirty.
@@ -428,6 +454,11 @@ private:
     float  seek_pending_val_ = 0.0f;
     Uint64 seek_last_issue_ticks_ = 0;
     float  seek_last_issued_val_ = -1.0f;
+    // Anchor for shift-slow-scrub. Snapshotted at drag-start so the target
+    // is a proportional offset from the drag origin, not the raw slider
+    // value. Result: holding Shift while dragging maps mouse motion to
+    // ~1/5 of a normal drag, letting the user land on an exact frame.
+    float  seek_drag_anchor_val_ = 0.0f;
 
     // Screen-space rect of the SeekBar last frame, so the wheel handler
     // can seek (instead of adjusting volume) when the cursor is over the
@@ -590,7 +621,12 @@ private:
     // cursor. The provider owns its own AVFormatContext + worker thread so
     // it never contends with the primary decode pipeline.
     std::unique_ptr<ThumbnailProvider> thumb_provider_;
-    bool thumbnail_preview_enabled_ = false;
+    // Default on. This is the single most-requested seekbar feature
+    // across the VLC/mpv/PotPlayer forums (thumbfast, mpv_thumbnail_script,
+    // the perennial "why doesn't VLC do this" threads). The provider
+    // runs on its own thread + AVFormatContext so first-hover is a cheap
+    // decode miss, not a decode-pipeline hitch.
+    bool thumbnail_preview_enabled_ = true;
     void drawSeekBarThumbnail(int W, int H, float duration);
 
     // Background yt-dlp resolver for pasted YouTube URLs. Owns its own

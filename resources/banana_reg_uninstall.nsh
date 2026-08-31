@@ -27,5 +27,12 @@ DeleteRegKey HKCR ".bmp\OpenWithList\BananaPlayer.exe"
 DeleteRegKey HKCR ".webp\OpenWithList\BananaPlayer.exe"
 DeleteRegKey HKCR ".tif\OpenWithList\BananaPlayer.exe"
 DeleteRegKey HKCR ".tiff\OpenWithList\BananaPlayer.exe"
+DeleteRegKey HKCR ".m4a\OpenWithList\BananaPlayer.exe"
+DeleteRegKey HKCR ".mp3\OpenWithList\BananaPlayer.exe"
+DeleteRegKey HKCR ".flac\OpenWithList\BananaPlayer.exe"
+DeleteRegKey HKCR ".wav\OpenWithList\BananaPlayer.exe"
+DeleteRegKey HKCR ".aac\OpenWithList\BananaPlayer.exe"
+DeleteRegKey HKCR ".opus\OpenWithList\BananaPlayer.exe"
+DeleteRegKey HKCR ".ogg\OpenWithList\BananaPlayer.exe"
 
 System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, i 0, i 0)'

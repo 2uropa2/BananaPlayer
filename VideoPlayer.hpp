@@ -54,6 +54,23 @@ public:
     bool isLoaded() const { return loaded_.load(); }
     bool isEndOfFile() const { return eof_.load(); }
     bool hasAudio() const { return audio_stream_idx_ >= 0; }
+    // True when the loaded file has no video stream (audio-only container:
+    // .m4a / .mp3 / .flac / voice memos, etc.). loadFile still succeeds in
+    // that case as long as there's an audio stream. Renderers use this to
+    // skip texture upload and draw a placeholder instead.
+    bool hasVideo() const { return video_stream_idx_ >= 0; }
+    bool isAudioOnly() const { return video_stream_idx_ < 0 && audio_stream_idx_ >= 0; }
+    // True once the video decode thread has fed >kDecoderStuckThreshold
+    // packets without receiving a single frame back. Signals that the
+    // installed decoder cannot actually decode this stream (e.g. HEVC 12-bit
+    // Rext against an FFmpeg build without Rext support). UI checks this
+    // to show a clear OSD and to suppress the repeat-One replay livelock
+    // where handleNaturalEnd would seek(0)+play() endlessly.
+    bool isDecoderStuck() const { return decoder_stuck_.load(); }
+    // Counters used by UI logic to distinguish "codec genuinely broken"
+    // from "decoder needed a moment to warm up".
+    int  getFramesPushed()    const { return video_frames_pushed_.load(); }
+    int  getFramesDisplayed() const { return video_frames_displayed_.load(); }
     // True when the current video stream is decoded on the GPU (D3D11VA /
     // DXVA2). Falls back to false when SW decode is in use.
     bool isHardwareDecoding() const { return hw_active_; }
@@ -169,6 +186,30 @@ public:
     // Persisted in banana.config as `loudness_normalize`.
     void setLoudnessNormalize(bool on);
     bool isLoudnessNormalize() const { return loudness_normalize_.load(); }
+
+    // Voice boost. Off (default) leaves audio untouched. On inserts an
+    // FFmpeg `equalizer` filter into the same graph as dynaudnorm (see
+    // buildLoudnessGraph_) with +6 dB centered around 2.5 kHz, which
+    // is the "presence" band where consonants and dialogue clarity
+    // live. Cheap - one biquad per channel. Solves the perennial
+    // "explosions are loud, whispers are inaudible" cross-forum
+    // complaint that dynaudnorm alone doesn't address (dynaudnorm just
+    // compresses dynamic range; it doesn't emphasize the voice band).
+    // Persisted in banana.config as `voice_boost`.
+    void setVoiceBoost(bool on);
+    bool isVoiceBoost() const { return voice_boost_.load(); }
+
+    // Scrub hint. Set true while the UI is in an active drag on the
+    // seek bar; false for one-shot seeks (arrow keys, click on the
+    // bar, chapter jump, etc.). Affects only the paused-seek preview
+    // policy: during scrub every drain tick's closest-to-target frame
+    // is uploaded so the user gets live feedback tracking the drag;
+    // for one-shot seeks the picture stays still until a frame within
+    // ~500 ms of the target is available, so the user doesn't see the
+    // decoder walking from the seek-keyframe up to the target
+    // (perceived as brief playback = the "flash" bug). Default false.
+    void setScrubbing(bool on) { scrubbing_.store(on); }
+    bool isScrubbing() const   { return scrubbing_.load(); }
 
     // Per-file audio auto-normalization. When enabled, the decode
     // thread samples the peak sample magnitude across the first few
@@ -344,6 +385,19 @@ private:
     bool           hw_active_     = false;
     const char*    hw_name_       = "software";
 
+    // Probe trace: latched true after the first decoded video frame is
+    // pushed to the display queue. Only used by BP_PROBE_TRACE=1 test
+    // harnesses to correlate "loadFile ok" against actual frame delivery.
+    // Reset in loadFile before the decode thread starts.
+    bool               first_video_frame_probed_ = false;
+    std::atomic<int>   video_frames_pushed_{0};
+    std::atomic<int>   video_frames_displayed_{0};
+    std::atomic<int>   video_packet_send_errors_{0};
+    std::atomic<int>   demux_video_packets_{0};
+    std::atomic<int>   video_recv_frame_errors_{0};
+    std::atomic<int>   video_packets_sent_{0};
+    std::atomic<bool>  decoder_stuck_{false};
+
     // HDR tone-map pipeline state. `hdr_kind_` is set in loadFile from
     // the stream's color_trc; when non-None, materializeYUV routes
     // decoded frames through materializeHdrToneMap_. The RGB->YUV sws
@@ -386,6 +440,13 @@ private:
     // decode iteration tears down / rebuilds.
     std::atomic<bool>            loudness_normalize_{false};
     std::atomic<bool>            loudness_rebuild_{false};
+    // Voice boost. Same graph as loudness_normalize_ (see
+    // buildLoudnessGraph_) - a change to either flag flips
+    // loudness_rebuild_ so the decode thread reconstructs the chain.
+    std::atomic<bool>            voice_boost_{false};
+    // Scrub hint set by the UI while the user drags the seek bar.
+    // Read-only from the decode + updateTexture paths.
+    std::atomic<bool>            scrubbing_{false};
     // Set true when a graph build attempt failed for the current audio
     // configuration. Prevents the decode thread from spinning on
     // buildLoudnessGraph_() every frame. Cleared on toggle-off / on
@@ -679,6 +740,28 @@ private:
     // window. See file analysis in this PR / trace log.
     std::atomic<double>     audio_skip_to_pts_{-1e18};
     static constexpr double kAudioSkipToleranceSec = 0.100;
+
+    // Post-seek video skip target. Set to seek target by the demux thread;
+    // updateTexture silently drops any queued video frame whose pts is
+    // more than kVideoSkipToleranceSec BEFORE this value. Cleared once a
+    // frame at/after the target has been released for display.
+    //
+    // Fixes the "video plays fast for ~400 ms after every seek" artifact.
+    // Root cause: av_seek_frame with AVSEEK_FLAG_BACKWARD lands the
+    // decoder at the previous keyframe (up to ~1 s before target on high-
+    // bitrate H.264/WEB-DL sources). Every intermediate frame from
+    // keyframe->target enters the queue. The steady-state drop policy
+    // only trims frames >200 ms behind the master clock (a grace window
+    // for audio-clock jitter during normal playback), so the intermediate
+    // frames stay queued. updateTexture then releases them one per vsync
+    // (~16 ms each) while the master clock ticks at wall speed - the eye
+    // perceives roughly 2x playback until the queue catches up.
+    // 200 ms grace stays for steady-state playback; the target skip is
+    // ONLY active during the brief seek-recovery window so we don't
+    // reintroduce the mid-flight-drop stutter that the 200 ms comment
+    // warns against.
+    std::atomic<double>     video_skip_to_pts_{-1e18};
+    static constexpr double kVideoSkipToleranceSec = 0.005;
 
     // Most-recently-displayed frame, kept for snapshots.
     std::mutex last_frame_mutex_;

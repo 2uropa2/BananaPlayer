@@ -214,14 +214,54 @@ std::string openFileDialogWin() {
     ofn.lpstrFilter =
         "Media Files\0"
         "*.mp4;*.mkv;*.avi;*.mov;*.webm;*.wmv;*.flv;*.m4v;*.mpg;*.mpeg;*.ts;*.3gp;"
-        "*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.tif;*.tiff\0"
+        "*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.tif;*.tiff;"
+        "*.m4a;*.mp3;*.flac;*.wav;*.aac;*.opus;*.ogg\0"
         "Video Files\0*.mp4;*.mkv;*.avi;*.mov;*.webm;*.wmv;*.flv;*.m4v;*.mpg;*.mpeg;*.ts;*.3gp\0"
+        "Audio Files\0*.m4a;*.mp3;*.flac;*.wav;*.aac;*.opus;*.ogg\0"
         "Image Files\0*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.tif;*.tiff\0"
         "All Files\0*.*\0";
     ofn.nFilterIndex = 1;
     ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
     if (GetOpenFileNameA(&ofn)) return std::string(szFile);
     return {};
+}
+
+// Map iso639-2/3 language codes (and a couple of iso639-1 two-letter
+// aliases FFmpeg produces from webm/mkv `Language` tags) to human-
+// readable English names. Cross-forum request: "why does this player
+// show me 'kor' / 'jpn' instead of 'Korean' / 'Japanese' in the
+// subtitle picker". Not exhaustive - covers the languages typical for
+// Korean-market users plus the top ~15 world-language codes seen in
+// mainstream WEB-DL / BluRay rips. Unknown codes pass through unchanged.
+const char* prettyLangName(const std::string& code) {
+    if (code.empty()) return nullptr;
+    struct M { const char* code; const char* name; };
+    static const M kMap[] = {
+        {"kor", "Korean"},   {"ko",  "Korean"},
+        {"eng", "English"},  {"en",  "English"},
+        {"jpn", "Japanese"}, {"ja",  "Japanese"},
+        {"chi", "Chinese"},  {"zho", "Chinese"}, {"zh", "Chinese"},
+        {"spa", "Spanish"},  {"es",  "Spanish"},
+        {"fra", "French"},   {"fre", "French"},  {"fr", "French"},
+        {"ger", "German"},   {"deu", "German"},  {"de", "German"},
+        {"ita", "Italian"},  {"it",  "Italian"},
+        {"por", "Portuguese"}, {"pt", "Portuguese"},
+        {"rus", "Russian"},  {"ru",  "Russian"},
+        {"ara", "Arabic"},   {"ar",  "Arabic"},
+        {"hin", "Hindi"},    {"hi",  "Hindi"},
+        {"vie", "Vietnamese"},{"vi", "Vietnamese"},
+        {"tha", "Thai"},     {"th",  "Thai"},
+        {"ind", "Indonesian"},{"id", "Indonesian"},
+        {"tur", "Turkish"},  {"tr",  "Turkish"},
+        {"pol", "Polish"},   {"pl",  "Polish"},
+        {"nld", "Dutch"},    {"dut", "Dutch"},   {"nl", "Dutch"},
+        {"swe", "Swedish"},  {"sv",  "Swedish"},
+        {"dan", "Danish"},   {"da",  "Danish"},
+        {"fin", "Finnish"},  {"fi",  "Finnish"},
+        {"nor", "Norwegian"},{"no",  "Norwegian"},
+    };
+    for (const auto& m : kMap) if (code == m.code) return m.name;
+    return nullptr;
 }
 
 } // namespace
@@ -641,6 +681,11 @@ bool UIController::loadPath(const std::string& path) {
     // Chapter announcer resets so the FIRST chapter of the new file
     // gets a "Chapter: X" toast when playback settles on it.
     last_chapter_announced_ = -1;
+    // New file, new chance for the decoder to make good. Clear the
+    // stuck-decoder OSD gate so the message can fire once per file if
+    // the codec is genuinely unplayable.
+    decoder_stuck_notified_ = false;
+    decoder_stuck_since_ms_ = 0;
     // Attempt to auto-load companion .srt / .smi.
     loadCompanionSubs(path);
 
@@ -724,10 +769,11 @@ bool UIController::loadPath(const std::string& path) {
                     const auto& t = etracks[pick];
                     char m[192];
                     if (!t.language.empty()) {
+                        const char* p = prettyLangName(t.language);
                         std::snprintf(m, sizeof(m),
                                       "Embedded subs: %s (%s)",
                                       t.codec_name.c_str(),
-                                      t.language.c_str());
+                                      p ? p : t.language.c_str());
                     } else {
                         std::snprintf(m, sizeof(m),
                                       "Embedded subs: %s",
@@ -794,19 +840,7 @@ void UIController::enqueuePaths(const std::vector<std::string>& paths, bool play
     for (const auto& p : paths) {
         DWORD attrs = GetFileAttributesA(p.c_str());
         if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-            WIN32_FIND_DATAA fd{};
-            std::string pattern = p + "\\*";
-            HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
-            std::vector<std::string> found;
-            if (h != INVALID_HANDLE_VALUE) {
-                do {
-                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-                    std::string full = p + "\\" + fd.cFileName;
-                    if (isVideoFile(full)) found.push_back(full);
-                } while (FindNextFileA(h, &fd));
-                FindClose(h);
-            }
-            std::sort(found.begin(), found.end());
+            auto found = scanFolderVideosBySize(p);
             expanded.insert(expanded.end(), found.begin(), found.end());
         } else {
             expanded.push_back(p);
@@ -949,6 +983,23 @@ void UIController::openAny(const std::string& path) {
         pending_yt_source_url_ = path;
         return;
     }
+    // Folder: expand to a size-desc playlist just like a folder-drop or
+    // CLI folder arg. Without this branch a forwarded folder from
+    // single-instance IPC would fall into loadPath which fails on a
+    // directory, and the user's drag would silently no-op.
+    DWORD attrs = GetFileAttributesA(path.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        auto found = scanFolderVideosBySize(path);
+        if (found.empty()) {
+            showOsd("No videos in that folder");
+        } else {
+            enqueuePaths(found, /*play_first=*/true);
+            char buf[64]; std::snprintf(buf, sizeof(buf),
+                                        "Loaded  %zu  videos", found.size());
+            showOsd(buf);
+        }
+        return;
+    }
     loadPath(path);
 }
 
@@ -995,6 +1046,12 @@ void UIController::nudgeVisible() {
 
 void UIController::takeSnapshot() {
     if (!player_->isLoaded()) return;
+    // Audio-only files have no frame to snapshot. Silently no-op instead
+    // of writing a 0-byte / empty PNG.
+    if (player_->isAudioOnly()) {
+        showOsd("No video to snapshot");
+        return;
+    }
     // Default location: dataDir() (usually %APPDATA%\BananaPlayer\). Was
     // appDir() historically but that's Program Files under a normal
     // install and non-admin writes get dropped. Users who preferred
@@ -2675,63 +2732,67 @@ void UIController::drawInfoPanel(int W, int H) {
         row("Bit rate", bbuf);
 
         // ---- VIDEO ----
-        section("VIDEO");
-        const char* vc = player_->getVideoCodecName();
-        row("Codec", (vc && *vc) ? std::string(vc) : std::string("-"));
+        // Skipped for audio-only files (.m4a / .mp3 / voice memos) - every
+        // row below reads from the video stream and would show all-dashes.
+        if (player_->hasVideo()) {
+            section("VIDEO");
+            const char* vc = player_->getVideoCodecName();
+            row("Codec", (vc && *vc) ? std::string(vc) : std::string("-"));
 
-        char resbuf[96];
-        int vw = player_->getVideoWidth();
-        int vh = player_->getVideoHeight();
-        if (vw > 0 && vh > 0) {
-            // Simple aspect: reduce vw:vh by gcd.
-            auto gcd = [](int a, int b){ while (b){ a %= b; std::swap(a, b); } return a; };
-            int g = gcd(vw, vh);
-            std::snprintf(resbuf, sizeof(resbuf), "%d x %d  (%d:%d)",
-                          vw, vh, vw / g, vh / g);
-        } else {
-            std::snprintf(resbuf, sizeof(resbuf), "-");
-        }
-        row("Resolution", resbuf);
-
-        double fps = player_->getVideoFrameRate();
-        char fbuf[48];
-        if (fps > 0.0) std::snprintf(fbuf, sizeof(fbuf), "%.3f fps", fps);
-        else           std::snprintf(fbuf, sizeof(fbuf), "-");
-        row("Frame rate", fbuf);
-
-        std::string dec = player_->isHardwareDecoding()
-                            ? (std::string("Hardware  (") + player_->getHardwareDecoderName() + ")")
-                            : std::string("Software");
-        row("Decoder", dec);
-
-        {
-            auto k = player_->getHdrKind();
-            const bool on = player_->isHdrToneMapEnabled();
-            std::string hdr_label;
-            if (k == VideoPlayer::HdrKind::PQ) {
-                hdr_label = on ? "PQ (SMPTE ST 2084) - tone-mapped to SDR BT.709"
-                               : "PQ (SMPTE ST 2084) - native passthrough (Shift+H)";
-            } else if (k == VideoPlayer::HdrKind::HLG) {
-                hdr_label = on ? "HLG (ARIB STD-B67) - tone-mapped to SDR BT.709"
-                               : "HLG (ARIB STD-B67) - native passthrough (Shift+H)";
+            char resbuf[96];
+            int vw = player_->getVideoWidth();
+            int vh = player_->getVideoHeight();
+            if (vw > 0 && vh > 0) {
+                // Simple aspect: reduce vw:vh by gcd.
+                auto gcd = [](int a, int b){ while (b){ a %= b; std::swap(a, b); } return a; };
+                int g = gcd(vw, vh);
+                std::snprintf(resbuf, sizeof(resbuf), "%d x %d  (%d:%d)",
+                              vw, vh, vw / g, vh / g);
             } else {
-                hdr_label = "SDR";
+                std::snprintf(resbuf, sizeof(resbuf), "-");
             }
-            if (on && k != VideoPlayer::HdrKind::None
-                && player_->isHdrHalfResActive()) {
-                hdr_label += "  [half-res]";
-            }
-            row("Dynamic range", hdr_label);
-        }
+            row("Resolution", resbuf);
 
-        int rot_intrinsic = player_->getIntrinsicRotation();
-        char rbuf[48];
-        std::snprintf(rbuf, sizeof(rbuf),
-                      "%d deg  (container %d + user %d, mod 360)",
-                      (rot_intrinsic + ((int)rotation_) * 90) % 360,
-                      rot_intrinsic,
-                      ((int)rotation_) * 90);
-        row("Rotation", rbuf);
+            double fps = player_->getVideoFrameRate();
+            char fbuf[48];
+            if (fps > 0.0) std::snprintf(fbuf, sizeof(fbuf), "%.3f fps", fps);
+            else           std::snprintf(fbuf, sizeof(fbuf), "-");
+            row("Frame rate", fbuf);
+
+            std::string dec = player_->isHardwareDecoding()
+                                ? (std::string("Hardware  (") + player_->getHardwareDecoderName() + ")")
+                                : std::string("Software");
+            row("Decoder", dec);
+
+            {
+                auto k = player_->getHdrKind();
+                const bool on = player_->isHdrToneMapEnabled();
+                std::string hdr_label;
+                if (k == VideoPlayer::HdrKind::PQ) {
+                    hdr_label = on ? "PQ (SMPTE ST 2084) - tone-mapped to SDR BT.709"
+                                   : "PQ (SMPTE ST 2084) - native passthrough (Shift+H)";
+                } else if (k == VideoPlayer::HdrKind::HLG) {
+                    hdr_label = on ? "HLG (ARIB STD-B67) - tone-mapped to SDR BT.709"
+                                   : "HLG (ARIB STD-B67) - native passthrough (Shift+H)";
+                } else {
+                    hdr_label = "SDR";
+                }
+                if (on && k != VideoPlayer::HdrKind::None
+                    && player_->isHdrHalfResActive()) {
+                    hdr_label += "  [half-res]";
+                }
+                row("Dynamic range", hdr_label);
+            }
+
+            int rot_intrinsic = player_->getIntrinsicRotation();
+            char rbuf[48];
+            std::snprintf(rbuf, sizeof(rbuf),
+                          "%d deg  (container %d + user %d, mod 360)",
+                          (rot_intrinsic + ((int)rotation_) * 90) % 360,
+                          rot_intrinsic,
+                          ((int)rotation_) * 90);
+            row("Rotation", rbuf);
+        }
 
         // ---- AUDIO ----
         section("AUDIO");
@@ -3314,6 +3375,15 @@ void UIController::drawSettingsDialog(int W, int H) {
                     markConfigDirty();
                 }
                 ImGui::TextDisabled("Boost quiet dialogue without clipping loud action.");
+                bool vb = player_->isVoiceBoost();
+                if (ImGui::Checkbox("Voice boost (+6 dB @ 2.5 kHz presence band)",
+                                    &vb)) {
+                    player_->setVoiceBoost(vb);
+                    voice_boost_ = vb;
+                    markConfigDirty();
+                }
+                ImGui::TextDisabled("Emphasises consonants + dialogue clarity. "
+                                    "Composes with the normalizer.");
                 ImGui::Spacing();
                 radio_group("Audio output latency (ms)  -  video shift to match ear",
                             audio_out_latency_ms_,
@@ -3788,8 +3858,22 @@ void UIController::handleNaturalEnd() {
 }
 
 void UIController::handleNaturalEndImmediate() {
-    // Repeat One: replay the same file.
-    if (playlist_.repeatMode() == Playlist::RepeatMode::One) {
+    // Repeat One: replay the same file - UNLESS this playthrough never
+    // put a single frame on the screen. Two ways that happens:
+    //   (a) codec profile the shipped libavcodec cannot decode (HEVC
+    //       Rext 12-bit, etc.) - replaying would spin the demuxer
+    //       forever with no visible output.
+    //   (b) short-file + decoder-warmup livelock: EOF fires and repeat
+    //       tries to seek(0)+play() before the decoder has emitted its
+    //       first frame; every seek flushes the warmup, and no frame
+    //       ever reaches the queue. Suppressing repeat here lets the
+    //       decode thread finally push its buffered frames and the
+    //       user sees playback (single-shot, since no repeat).
+    // The gate is "has ANY frame ever been displayed for this file?" -
+    // once we've shown a frame, we know the pipeline is healthy and it's
+    // safe to loop.
+    if (playlist_.repeatMode() == Playlist::RepeatMode::One
+        && player_->getFramesDisplayed() > 0) {
         player_->seek(0.0);
         player_->play();
         return;
@@ -3861,6 +3945,39 @@ void UIController::render(int W, int H) {
     }
 
     bool loaded = player_->isLoaded();
+
+    // Decoder-stuck watchdog reaction. Fires when VideoPlayer has sent a
+    // batch of packets without receiving a single frame back. Root cause
+    // is usually one of:
+    //   (a) codec profile the shipped libavcodec cannot decode (HEVC
+    //       Rext 12-bit, some HEVC Main 10 profiles on old builds);
+    //   (b) short file + repeat-One livelock, where every seek(0)+play()
+    //       cycle flushes the decoder before its warmup-buffered frames
+    //       reach the display queue.
+    // The `isDecoderStuck` flag is a per-file latch. Setting it also
+    // suppresses repeat-One replay (see handleNaturalEndImmediate), which
+    // by itself breaks case (b) - the decoder then produces its warmup
+    // frames within a couple hundred ms and playback proceeds normally.
+    // So we wait ~1.2 s after the flag fires and ONLY complain if frames
+    // still haven't appeared, avoiding a false "codec unsupported" toast
+    // on files that actually play fine.
+    if (loaded && player_->isDecoderStuck()) {
+        if (decoder_stuck_since_ms_ == 0) decoder_stuck_since_ms_ = SDL_GetTicks();
+        int shown = player_->getFramesDisplayed();
+        Uint64 elapsed = SDL_GetTicks() - decoder_stuck_since_ms_;
+        if (!decoder_stuck_notified_ && shown == 0 && elapsed > 1200) {
+            decoder_stuck_notified_ = true;
+            char m[256];
+            const char* vcodec = player_->getVideoCodecName();
+            std::snprintf(m, sizeof(m),
+                          "Cannot decode: %s (%s) - codec profile unsupported",
+                          vcodec ? vcodec : "?",
+                          player_->isHardwareDecoding()
+                              ? player_->getHardwareDecoderName() : "software");
+            showOsd(m, 4.0f);
+            if (player_->isPlaying()) player_->pause();
+        }
+    }
 
     // A-B loop: if the play head crossed the B mark, jump back to A. Runs
     // regardless of overlay state so the loop keeps working while hidden.
@@ -4018,6 +4135,10 @@ void UIController::render(int W, int H) {
     if (!loaded) {
         drawSplash(W, H);
     } else {
+        // Audio-only files (no video stream) get a filename placeholder
+        // in the empty video area BEFORE the normal overlays so the
+        // seek bar / play button still float on top of it.
+        if (player_->isAudioOnly()) drawAudioOnlyPlaceholder(W, H);
         if (overlay_alpha_ > 0.01f) {
             drawTopOverlay(W, H, overlay_alpha_);
             drawBottomOverlay(W, H, overlay_alpha_);
@@ -4415,14 +4536,47 @@ void UIController::drawSplash(int W, int H) {
             ImGui::PushID((int)i);
             bool clicked = ImGui::Selectable(baseName(f.c_str()), false, 0,
                                              ImVec2(sel_w, row_h));
+            ImVec2 rmin = ImGui::GetItemRectMin();
+            ImVec2 rmax = ImGui::GetItemRectMax();
             // Accent left-tab on hover so the row telegraphs which item is
             // about to launch.
             if (ImGui::IsItemHovered()) {
-                ImVec2 rmin = ImGui::GetItemRectMin();
-                ImVec2 rmax = ImGui::GetItemRectMax();
                 dl->AddRectFilled(ImVec2(rmin.x - 6.0f, rmin.y + 3.0f),
                                   ImVec2(rmin.x - 3.0f, rmax.y - 3.0f),
                                   IM_COL32(255, 201, 58, 230), 1.5f);
+            }
+            // Resume progress annotation on the RIGHT edge of the row -
+            // "12:34 / 1:52:07" with a thin progress bar underneath. Shows
+            // the user at a glance whether a given RECENT entry still has
+            // a meaningful watch state or was played through. Adapted from
+            // the CONTINUE WATCHING hero card but per-row, so all 6 slots
+            // benefit.
+            const ResumeEntry* rentry = nullptr;
+            for (const auto& e : resume_index_) {
+                if (e.path == f) { rentry = &e; break; }
+            }
+            if (rentry && rentry->duration > 20.0
+                && rentry->pos > 5.0
+                && rentry->pos < rentry->duration - 10.0) {
+                std::string ts = formatTime(rentry->pos) + " / "
+                               + formatTime(rentry->duration);
+                float ts_size = 11.0f;
+                ImVec2 tsd = font->CalcTextSizeA(ts_size, FLT_MAX, 0.0f, ts.c_str());
+                float ts_x = rmax.x - 8.0f - tsd.x;
+                float ts_y = rmin.y + (row_h - tsd.y) * 0.5f - 1.0f;
+                dl->AddText(font, ts_size, ImVec2(ts_x, ts_y),
+                            IM_COL32(180, 170, 140, 200), ts.c_str());
+                float bar_y  = rmax.y - 3.0f;
+                float bar_l  = rmin.x + 4.0f;
+                float bar_r  = rmax.x - 4.0f;
+                dl->AddRectFilled(ImVec2(bar_l, bar_y),
+                                  ImVec2(bar_r, bar_y + 1.5f),
+                                  IM_COL32(70, 60, 42, 140));
+                double frac = std::clamp(rentry->pos / rentry->duration, 0.0, 1.0);
+                dl->AddRectFilled(
+                    ImVec2(bar_l, bar_y),
+                    ImVec2(bar_l + (float)((bar_r - bar_l) * frac), bar_y + 1.5f),
+                    IM_COL32(255, 201, 58, 200));
             }
             if (clicked) loadPath(f);
             ImGui::PopID();
@@ -4497,6 +4651,61 @@ void UIController::drawSplash(int W, int H) {
                 IM_COL32(132, 120,  90, 220), stack);
 
     ImGui::End();
+}
+
+void UIController::drawAudioOnlyPlaceholder(int W, int H) {
+    // Full-window transparent host - we draw into the background draw
+    // list so the normal top/bottom overlays composite over us cleanly.
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+
+    // Warm dark backdrop matching the splash palette so the transition
+    // from splash -> audio-only file doesn't jump in tone. Solid fill
+    // (not gradient) since the video area is genuinely empty here.
+    dl->AddRectFilled(ImVec2(0.0f, 0.0f), ImVec2((float)W, (float)H),
+                      IM_COL32(18, 15, 11, 255));
+
+    // Filename (basename only). Truncated with an ellipsis if it can't
+    // fit at ~70 % of window width - keeps 640-wide layouts readable.
+    std::string name = player_->getFilename();
+    {
+        size_t slash = name.find_last_of("/\\");
+        if (slash != std::string::npos) name = name.substr(slash + 1);
+    }
+    if (name.empty()) name = "Audio";
+
+    ImFont* font = ImGui::GetFont();
+
+    // Big centered filename. Scale similar to the splash wordmark rules.
+    float ts_by_h = std::clamp((float)H * 0.06f, 22.0f, 42.0f);
+    float ts_by_w = std::clamp((float)W * 0.05f, 22.0f, 42.0f);
+    float ts = std::min(ts_by_h, ts_by_w);
+
+    // Truncate to ~70 % of window width if needed.
+    float max_w = (float)W * 0.70f;
+    std::string shown = name;
+    ImVec2 td = font->CalcTextSizeA(ts, FLT_MAX, 0.0f, shown.c_str());
+    if (td.x > max_w && shown.size() > 3) {
+        while (shown.size() > 3) {
+            shown.pop_back();
+            std::string trial = shown + "...";
+            td = font->CalcTextSizeA(ts, FLT_MAX, 0.0f, trial.c_str());
+            if (td.x <= max_w) { shown = trial; break; }
+        }
+    }
+    td = font->CalcTextSizeA(ts, FLT_MAX, 0.0f, shown.c_str());
+
+    float cx = W * 0.5f;
+    float cy = H * 0.5f;
+    dl->AddText(font, ts, ImVec2(cx - td.x * 0.5f, cy - td.y * 0.5f),
+                IM_COL32(240, 232, 210, 240), shown.c_str());
+
+    // "AUDIO ONLY" subtitle underneath, in banana-yellow so the eye
+    // parks somewhere on the empty video plane.
+    const char* label = "AUDIO ONLY";
+    float ls = ts * 0.42f;
+    ImVec2 ld = font->CalcTextSizeA(ls, FLT_MAX, 0.0f, label);
+    dl->AddText(font, ls, ImVec2(cx - ld.x * 0.5f, cy + td.y * 0.5f + ts * 0.35f),
+                IM_COL32(255, 201, 58, 220), label);
 }
 
 void UIController::drawTopOverlay(int W, int H, float alpha) {
@@ -4944,7 +5153,12 @@ void UIController::drawBottomOverlay(int W, int H, float alpha) {
         seek_dragging_ = true;
         seek_resume_on_release_ = player_->isPlaying();
         if (seek_resume_on_release_) player_->pause();
+        // Signal the player: use the "responsive" pretarget-preview path
+        // so the picture tracks the drag position live. Cleared on drag
+        // release so subsequent arrow-key jumps still land cleanly.
+        player_->setScrubbing(true);
         seek_pending_val_ = seek_val;
+        seek_drag_anchor_val_ = (float)player_->getCurrentTime();
         seek_last_issue_ticks_ = 0;   // force first issue below to happen immediately
         seek_last_issued_val_ = -1.0f;
     }
@@ -4953,7 +5167,18 @@ void UIController::drawBottomOverlay(int W, int H, float alpha) {
         // only actually call player_->seek() every ~120 ms of wallclock.
         // This keeps a live-preview feel without letting the demux thread
         // flush + re-decode the pipeline on every mouse pixel.
-        if (seek_changed) seek_pending_val_ = seek_val;
+        // Shift-drag: compress the delta 5x so the scrub becomes
+        // frame-precise. Anchor is the playhead pts at drag-start, target
+        // is anchor + (raw_slider - anchor) / 5. Snapshot on button-down
+        // so the user doesn't have to hold shift for the whole gesture.
+        if (seek_changed) {
+            if (ImGui::GetIO().KeyShift) {
+                seek_pending_val_ = seek_drag_anchor_val_
+                    + (seek_val - seek_drag_anchor_val_) * 0.2f;
+            } else {
+                seek_pending_val_ = seek_val;
+            }
+        }
         Uint64 now_ticks = SDL_GetTicks();
         bool first_issue = (seek_last_issue_ticks_ == 0);
         bool time_ok     = (now_ticks - seek_last_issue_ticks_) >= 120;
@@ -4977,6 +5202,10 @@ void UIController::drawBottomOverlay(int W, int H, float alpha) {
             player_->seek(seek_pending_val_);
         }
         seek_dragging_ = false;
+        // Turn scrub mode OFF so the final commit above (and any
+        // subsequent arrow-key seek) uses the clean-snap policy instead
+        // of surfacing pretarget preview frames.
+        player_->setScrubbing(false);
         if (seek_resume_on_release_) player_->play();
         seek_resume_on_release_ = false;
     }
@@ -5710,14 +5939,20 @@ void UIController::drawMainMenuContents() {
                     }
                     for (size_t i = 0; i < tracks.size(); ++i) {
                         const auto& t = tracks[i];
+                        // Prefer the human-readable name when we know it;
+                        // fall back to whatever code the container used.
+                        const char* lang_pretty = prettyLangName(t.language);
+                        const char* lang_str = lang_pretty ? lang_pretty
+                                             : (t.language.empty() ? "" : t.language.c_str());
                         char label[256];
                         std::snprintf(label, sizeof(label),
-                                      "#%d  %s%s%s%s  [%s]%s",
+                                      "#%d  %s%s%s%s%s  [%s]%s",
                                       t.stream_idx,
                                       t.title.empty() ? "" : t.title.c_str(),
                                       t.title.empty() ? "" : "  ",
-                                      t.language.empty() ? "" : "(",
-                                      t.language.empty() ? "" : t.language.c_str(),
+                                      lang_str[0] ? "(" : "",
+                                      lang_str,
+                                      lang_str[0] ? ")" : "",
                                       t.codec_name.c_str(),
                                       t.selectable ? "" : "  (unsupported)");
                         bool active = ((int)i == cur);
@@ -7039,19 +7274,7 @@ void UIController::handleEvent(const SDL_Event& event) {
             DWORD attrs = GetFileAttributesA(p.c_str());
             if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
                 // Dropped a folder - scan it exactly like Ctrl+Shift+O.
-                WIN32_FIND_DATAA fd{};
-                std::string pattern = p + "\\*";
-                HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
-                std::vector<std::string> found;
-                if (h != INVALID_HANDLE_VALUE) {
-                    do {
-                        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-                        std::string full = p + "\\" + fd.cFileName;
-                        if (isVideoFile(full)) found.push_back(full);
-                    } while (FindNextFileA(h, &fd));
-                    FindClose(h);
-                }
-                std::sort(found.begin(), found.end());
+                auto found = scanFolderVideosBySize(p);
                 if (found.empty()) {
                     showOsd("No videos in that folder");
                 } else {
@@ -7312,13 +7535,48 @@ bool UIController::isSubtitleFile(const std::string& path) {
     return false;
 }
 
+std::vector<std::string> UIController::scanFolderVideosBySize(const std::string& dir) {
+    // Non-recursive scan of `dir` returning video files sorted by size
+    // descending. Behavior chosen for the "drag a folder onto the exe"
+    // case where the main feature is typically the largest file and
+    // everything else is thumbnails / samples / behind-the-scenes.
+    struct SizedPath { std::string path; uint64_t size; };
+    std::vector<SizedPath> vids;
+    WIN32_FIND_DATAA fd{};
+    std::string pattern = dir + "\\*";
+    HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            std::string full = dir + "\\" + fd.cFileName;
+            if (!isVideoFile(full)) continue;
+            uint64_t sz = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            vids.push_back({std::move(full), sz});
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    std::sort(vids.begin(), vids.end(),
+              [](const SizedPath& a, const SizedPath& b) {
+                  if (a.size != b.size) return a.size > b.size;
+                  return a.path < b.path;
+              });
+    std::vector<std::string> out;
+    out.reserve(vids.size());
+    for (auto& v : vids) out.push_back(std::move(v.path));
+    return out;
+}
+
 bool UIController::isVideoFile(const std::string& path) {
     // Every extension Banana Player will pick up during a folder scan or
-    // Open Folder. Videos AND stills - FFmpeg's image2 demuxer handles
-    // PNG / JPEG / BMP / TIFF / WebP as single-frame "videos" and
-    // VideoPlayer flags them via isStillImage() so they don't auto-advance
-    // in a playlist. Keep in sync with the openFileDialogWin() filter
-    // below and the OpenWithList block in resources/banana_reg_install.nsh.
+    // Open Folder. Videos, still images, AND audio-only containers.
+    // - FFmpeg's image2 demuxer handles PNG / JPEG / BMP / TIFF / WebP
+    //   as single-frame "videos"; VideoPlayer flags them via isStillImage()
+    //   so they don't auto-advance in a playlist.
+    // - Audio-only files (.m4a / .mp3 / .flac / .wav / voice memos)
+    //   load into VideoPlayer without a video stream; VideoPlayer::isAudioOnly()
+    //   guides the render path to a filename placeholder in the video area.
+    // Keep in sync with the openFileDialogWin() filter below and the
+    // OpenWithList block in resources/banana_reg_install.nsh.
     static const char* kExts[] = {
         // Video
         ".mp4", ".mkv", ".avi", ".mov", ".webm", ".wmv",
@@ -7326,6 +7584,8 @@ bool UIController::isVideoFile(const std::string& path) {
         // Still images
         ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
         ".tif", ".tiff",
+        // Audio-only
+        ".m4a", ".mp3", ".flac", ".wav", ".aac", ".opus", ".ogg",
     };
     size_t dot = path.find_last_of('.');
     if (dot == std::string::npos) return false;
@@ -7401,6 +7661,9 @@ void UIController::loadConfig() {
         }
         else if (std::strcmp(k, "loudness_normalize") == 0) {
             loudness_normalize_ = std::atoi(v) != 0;
+        }
+        else if (std::strcmp(k, "voice_boost") == 0) {
+            voice_boost_ = std::atoi(v) != 0;
         }
         else if (std::strcmp(k, "time_display_mode") == 0) {
             int i = std::atoi(v);
@@ -7485,6 +7748,7 @@ void UIController::loadConfig() {
         player_->setHdrHalfResMode(m);
         player_->setAudioOutputLatencyMs(audio_out_latency_ms_);
         player_->setLoudnessNormalize(loudness_normalize_);
+        player_->setVoiceBoost(voice_boost_);
     }
 }
 
@@ -7507,6 +7771,7 @@ void UIController::saveConfig() {
     std::fprintf(fp, "audio_out_latency_ms=%d\n", audio_out_latency_ms_);
     std::fprintf(fp, "time_display_mode=%d\n",  time_display_mode_);
     std::fprintf(fp, "loudness_normalize=%d\n",   loudness_normalize_ ? 1 : 0);
+    std::fprintf(fp, "voice_boost=%d\n",          voice_boost_ ? 1 : 0);
     std::fprintf(fp, "hdr_half_res=%d\n",       hdr_half_res_mode_);
     std::fprintf(fp, "pause_on_focus_loss=%d\n", pause_on_focus_loss_ ? 1 : 0);
     std::fprintf(fp, "auto_next_countdown=%d\n", auto_next_countdown_);
@@ -7774,21 +8039,7 @@ std::string UIController::openPlaylistDialog() {
 void UIController::openFolderAsPlaylist() {
     std::string dir = openFolderDialog();
     if (dir.empty()) return;
-    WIN32_FIND_DATAA fd{};
-    std::string pattern = dir + "\\*";
-    HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) {
-        showOsd("Folder scan failed");
-        return;
-    }
-    std::vector<std::string> found;
-    do {
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        std::string full = dir + "\\" + fd.cFileName;
-        if (isVideoFile(full)) found.push_back(full);
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
-    std::sort(found.begin(), found.end());
+    auto found = scanFolderVideosBySize(dir);
     if (found.empty()) {
         showOsd("No videos in that folder");
         return;

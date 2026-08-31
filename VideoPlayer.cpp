@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 
 static void bpTrace(const char* fmt, ...) {
@@ -12,6 +13,30 @@ static void bpTrace(const char* fmt, ...) {
     std::lock_guard<std::mutex> lk(mtx);
     FILE* f = std::fopen("C:\\work\\Player\\bp_trace.log", "a");
     if (!f) return;
+    va_list a; va_start(a, fmt); std::vfprintf(f, fmt, a); va_end(a);
+    std::fputc('\n', f); std::fclose(f);
+}
+
+// Probe trace: enabled only when BP_PROBE_TRACE=1 in the environment.
+// Emits high-signal, low-frequency events (loadFile begin/end, first
+// video frame delivered, natural end, unload) to bp_probe.log next to
+// the exe so external test harnesses can correlate per-file outcomes
+// without wading through the [push] noise.
+static bool bpProbeEnabled() {
+    static int cached = -1;
+    if (cached == -1) {
+        const char* v = std::getenv("BP_PROBE_TRACE");
+        cached = (v && v[0] == '1') ? 1 : 0;
+    }
+    return cached != 0;
+}
+static void bpProbe(const char* fmt, ...) {
+    if (!bpProbeEnabled()) return;
+    static std::mutex mtx;
+    std::lock_guard<std::mutex> lk(mtx);
+    FILE* f = std::fopen("C:\\work\\Player\\bp_probe.log", "a");
+    if (!f) return;
+    std::fprintf(f, "%llu ", (unsigned long long)SDL_GetTicks());
     va_list a; va_start(a, fmt); std::vfprintf(f, fmt, a); va_end(a);
     std::fputc('\n', f); std::fclose(f);
 }
@@ -134,6 +159,10 @@ AVPixelFormat VideoPlayer::pickHwPixFormat(AVCodecContext* ctx,
 }
 
 bool VideoPlayer::tryInitHwDecode(AVCodecContext* codec_ctx, const AVCodec* codec) {
+    // Escape hatch for testing / triage: BP_NO_HW=1 disables hardware
+    // decode entirely so the SW path is exercised. Useful when a driver
+    // silently accepts a codec/profile combo but produces zero frames.
+    if (const char* v = std::getenv("BP_NO_HW"); v && v[0] == '1') return false;
     // Preference order: D3D11VA (modern, minimal quirks) then DXVA2. Anything
     // else on Windows tends to be vendor-specific and we want a universal
     // default, so those two cover most GPUs.
@@ -263,6 +292,8 @@ void VideoPlayer::unload() {
     media_seek_pending_ = false;
     media_seek_pending_since_perf_ = 0;
     audio_base_needs_capture_ = false;
+    audio_skip_to_pts_.store(-1e18, std::memory_order_relaxed);
+    video_skip_to_pts_.store(-1e18, std::memory_order_relaxed);
     playback_rate_ = 1.0f;
     av_sync_offset_ = 0.0;
     hw_pix_fmt_ = AV_PIX_FMT_NONE;
@@ -273,6 +304,7 @@ void VideoPlayer::unload() {
 bool VideoPlayer::loadFile(const std::string& filename, int preferred_audio_stream) {
     unload();
     filename_ = filename;
+    bpProbe("loadFile begin path=\"%s\"", filename.c_str());
 
     // Wall-clock deadline for the open+probe path so a stalled network
     // share, a spun-down drive, or a slow URL doesn't freeze the main
@@ -299,11 +331,14 @@ bool VideoPlayer::loadFile(const std::string& filename, int preferred_audio_stre
 
     if (avformat_open_input(&fmt_ctx_, filename.c_str(), nullptr, &io_opts) < 0) {
         av_dict_free(&io_opts);
+        bpProbe("loadFile fail stage=avformat_open_input");
         unload();
         return false;
     }
     av_dict_free(&io_opts);
     if (avformat_find_stream_info(fmt_ctx_, nullptr) < 0) {
+        bpProbe("loadFile fail stage=find_stream_info fmt=%s",
+                fmt_ctx_->iformat ? fmt_ctx_->iformat->name : "?");
         unload();
         return false;
     }
@@ -317,7 +352,6 @@ bool VideoPlayer::loadFile(const std::string& filename, int preferred_audio_stre
             video_stream_idx_ = (int)i;
         }
     }
-    if (video_stream_idx_ < 0) { unload(); return false; }
 
     // Choose audio stream: either user-preferred, or first available.
     if (preferred_audio_stream >= 0
@@ -333,14 +367,31 @@ bool VideoPlayer::loadFile(const std::string& filename, int preferred_audio_stre
         }
     }
 
-    // Video decoder
-    {
+    // Audio-only containers (.m4a / .mp3 / .flac / voice memos) are
+    // supported: skip video setup when there's no video stream but audio
+    // is present. Callers use isAudioOnly() to decide whether to draw a
+    // placeholder in the video area. Fail only when neither stream exists.
+    if (video_stream_idx_ < 0 && audio_stream_idx_ < 0) {
+        bpProbe("loadFile fail stage=no_playable_stream fmt=%s nb_streams=%u",
+                fmt_ctx_->iformat ? fmt_ctx_->iformat->name : "?",
+                fmt_ctx_->nb_streams);
+        unload();
+        return false;
+    }
+
+    // Video decoder (skipped for audio-only files)
+    if (video_stream_idx_ >= 0) {
         AVCodecParameters* par = fmt_ctx_->streams[video_stream_idx_]->codecpar;
         const AVCodec* codec = avcodec_find_decoder(par->codec_id);
-        if (!codec) { unload(); return false; }
+        if (!codec) {
+            bpProbe("loadFile fail stage=no_video_decoder codec_id=%d", (int)par->codec_id);
+            unload(); return false;
+        }
         video_dec_ctx_ = avcodec_alloc_context3(codec);
-        if (!video_dec_ctx_) { unload(); return false; }
-        if (avcodec_parameters_to_context(video_dec_ctx_, par) < 0) { unload(); return false; }
+        if (!video_dec_ctx_) { bpProbe("loadFile fail stage=alloc_video_ctx"); unload(); return false; }
+        if (avcodec_parameters_to_context(video_dec_ctx_, par) < 0) {
+            bpProbe("loadFile fail stage=params_to_ctx"); unload(); return false;
+        }
         video_dec_ctx_->thread_count = 0;
 
         // Attempt HW decode BEFORE avcodec_open2 - the codec picks its path
@@ -362,6 +413,7 @@ bool VideoPlayer::loadFile(const std::string& filename, int preferred_audio_stre
             hw_active_ = false;
             hw_name_   = "software";
             if (avcodec_open2(video_dec_ctx_, codec, nullptr) < 0) {
+                bpProbe("loadFile fail stage=avcodec_open2 codec=%s", codec->name);
                 unload(); return false;
             }
         }
@@ -445,6 +497,17 @@ bool VideoPlayer::loadFile(const std::string& filename, int preferred_audio_stre
         }
     }
 
+    // Audio-only files with a broken audio decoder (e.g. HE-AAC v2 in an
+    // FFmpeg build without SBR+21 support) would otherwise "succeed" with
+    // nothing playable at all. Fail cleanly so UIController surfaces the
+    // usual "Cannot open" toast instead of a silent zombie load.
+    if (video_stream_idx_ < 0 && audio_stream_idx_ < 0) {
+        bpProbe("loadFile fail stage=audio_decoder_open fmt=%s",
+                fmt_ctx_->iformat ? fmt_ctx_->iformat->name : "?");
+        unload();
+        return false;
+    }
+
     // Note: sws_ctx_ is now created lazily during decode via
     // sws_getCachedContext because HW decode paths produce different pixel
     // formats than video_dec_ctx_->pix_fmt (typically NV12 after transfer).
@@ -497,6 +560,14 @@ bool VideoPlayer::loadFile(const std::string& filename, int preferred_audio_stre
     quit_ = false;
     eof_ = false;
     ended_signaled_ = false;
+    first_video_frame_probed_ = false;
+    video_frames_pushed_.store(0);
+    video_frames_displayed_.store(0);
+    video_packet_send_errors_.store(0);
+    demux_video_packets_.store(0);
+    video_recv_frame_errors_.store(0);
+    video_packets_sent_.store(0);
+    decoder_stuck_.store(false);
     audio_pushed_bytes_ = 0;
     audio_seek_base_time_ = 0.0;
     base_time_ = 0.0;
@@ -511,11 +582,27 @@ bool VideoPlayer::loadFile(const std::string& filename, int preferred_audio_stre
     audio_base_needs_capture_ = (audio_stream_idx_ >= 0);
     first_play_needed_ = true;
 
-    video_decode_thread_ = std::thread(&VideoPlayer::videoDecodeThread, this);
+    if (video_stream_idx_ >= 0) {
+        video_decode_thread_ = std::thread(&VideoPlayer::videoDecodeThread, this);
+    }
     if (audio_stream_idx_ >= 0 && audio_dec_ctx_ && audio_stream_) {
         audio_decode_thread_ = std::thread(&VideoPlayer::audioDecodeThread, this);
     }
     decode_thread_ = std::thread(&VideoPlayer::demuxDecodeThread, this);
+    bpProbe("loadFile ok fmt=%s vcodec=%s vwh=%dx%d pix=%d trc=%d "
+            "acodec=%s asr=%d ach=%d hw=%s dur=%.3f nb_streams=%u",
+            fmt_ctx_->iformat ? fmt_ctx_->iformat->name : "?",
+            video_dec_ctx_ && video_dec_ctx_->codec ? video_dec_ctx_->codec->name : "?",
+            video_width_, video_height_,
+            video_dec_ctx_ ? (int)video_dec_ctx_->pix_fmt : -1,
+            video_dec_ctx_ ? (int)video_dec_ctx_->color_trc : -1,
+            audio_dec_ctx_ && audio_dec_ctx_->codec ? audio_dec_ctx_->codec->name : "-",
+            audio_dec_ctx_ ? audio_dec_ctx_->sample_rate : 0,
+            audio_dec_ctx_ ? audio_dec_ctx_->ch_layout.nb_channels : 0,
+            hw_name_ ? hw_name_ : "?",
+            fmt_ctx_ && fmt_ctx_->duration != AV_NOPTS_VALUE
+                ? (double)fmt_ctx_->duration / (double)AV_TIME_BASE : -1.0,
+            fmt_ctx_ ? fmt_ctx_->nb_streams : 0);
     return true;
 }
 
@@ -1167,6 +1254,14 @@ void VideoPlayer::setLoudnessNormalize(bool on) {
     }
 }
 
+void VideoPlayer::setVoiceBoost(bool on) {
+    if (voice_boost_.exchange(on) != on) {
+        // Shares the audio filter graph with dynaudnorm - a change to
+        // either flag triggers a rebuild.
+        loudness_rebuild_.store(true);
+    }
+}
+
 void VideoPlayer::freeLoudnessGraph_() {
     if (audio_filter_graph_) {
         avfilter_graph_free(&audio_filter_graph_);
@@ -1211,23 +1306,54 @@ bool VideoPlayer::buildLoudnessGraph_(int rate, AVSampleFormat fmt,
         freeLoudnessGraph_(); return false;
     }
 
-    // dynaudnorm parameters:
-    //   f=200  - frame length ms (default 500; 200 = snappier response)
-    //   g=15   - gaussian window frames (default 31; 15 = still smooth
-    //            but reacts faster to loudness swings)
-    //   p=0.90 - target peak (default 0.95; leave headroom)
-    // No lookahead - suitable for real-time playback without adding
-    // A/V sync latency.
-    const AVFilter* dyn = avfilter_get_by_name("dynaudnorm");
-    if (!dyn) { freeLoudnessGraph_(); return false; }
-    AVFilterContext* dyn_ctx = nullptr;
-    if (avfilter_graph_create_filter(&dyn_ctx, dyn, "dynaudnorm",
-                                     "f=200:g=15:p=0.90",
-                                     nullptr, audio_filter_graph_) < 0) {
-        freeLoudnessGraph_(); return false;
+    // Chain composition: buffersrc -> [equalizer if voice_boost_] ->
+    // [dynaudnorm if loudness_normalize_] -> buffersink. Either or both
+    // may be on; caller guarantees at least one (otherwise the whole
+    // graph is bypassed by the decode thread and this function isn't
+    // called at all).
+    AVFilterContext* prev = audio_buffersrc_;
+    if (voice_boost_.load(std::memory_order_relaxed)) {
+        // "Presence" band boost: single biquad centered on 2.5 kHz with
+        // a wide Q so the lift covers ~1.5-4 kHz where consonants and
+        // dialogue clarity live. +6 dB is enough to make whispers
+        // audible over ambient music without pumping vocals in normal
+        // scenes. Uses the built-in `equalizer` filter (one biquad per
+        // channel, near-zero CPU on modern hardware).
+        const AVFilter* eq = avfilter_get_by_name("equalizer");
+        if (!eq) { freeLoudnessGraph_(); return false; }
+        AVFilterContext* eq_ctx = nullptr;
+        if (avfilter_graph_create_filter(&eq_ctx, eq, "voiceboost",
+                                         "f=2500:width_type=q:width=1.0:gain=6",
+                                         nullptr, audio_filter_graph_) < 0) {
+            freeLoudnessGraph_(); return false;
+        }
+        if (avfilter_link(prev, 0, eq_ctx, 0) < 0) {
+            freeLoudnessGraph_(); return false;
+        }
+        prev = eq_ctx;
     }
-    if (avfilter_link(audio_buffersrc_, 0, dyn_ctx, 0) < 0
-        || avfilter_link(dyn_ctx, 0, audio_buffersink_, 0) < 0) {
+    if (loudness_normalize_.load(std::memory_order_relaxed)) {
+        // dynaudnorm parameters:
+        //   f=200  - frame length ms (default 500; 200 = snappier response)
+        //   g=15   - gaussian window frames (default 31; 15 = still smooth
+        //            but reacts faster to loudness swings)
+        //   p=0.90 - target peak (default 0.95; leave headroom)
+        // No lookahead - suitable for real-time playback without adding
+        // A/V sync latency.
+        const AVFilter* dyn = avfilter_get_by_name("dynaudnorm");
+        if (!dyn) { freeLoudnessGraph_(); return false; }
+        AVFilterContext* dyn_ctx = nullptr;
+        if (avfilter_graph_create_filter(&dyn_ctx, dyn, "dynaudnorm",
+                                         "f=200:g=15:p=0.90",
+                                         nullptr, audio_filter_graph_) < 0) {
+            freeLoudnessGraph_(); return false;
+        }
+        if (avfilter_link(prev, 0, dyn_ctx, 0) < 0) {
+            freeLoudnessGraph_(); return false;
+        }
+        prev = dyn_ctx;
+    }
+    if (avfilter_link(prev, 0, audio_buffersink_, 0) < 0) {
         freeLoudnessGraph_(); return false;
     }
     if (avfilter_graph_config(audio_filter_graph_, nullptr) < 0) {
@@ -2644,6 +2770,12 @@ void VideoPlayer::demuxDecodeThread() {
             // anchoring MediaClock several seconds before the seek
             // target. Cleared inside audio decode when it catches up.
             audio_skip_to_pts_.store(target);
+            // Arm video-skip. updateTexture drains any queued frame with
+            // pts BEFORE the target instead of releasing it - eliminates
+            // the post-seek fast-forward that used to burn the
+            // keyframe->target GOP frames at wall-vsync rate. Cleared
+            // once a frame at or after target reaches display.
+            video_skip_to_pts_.store(target);
             int64_t ts = (int64_t)(target * AV_TIME_BASE);
             av_seek_frame(fmt_ctx_, -1, ts, AVSEEK_FLAG_BACKWARD);
             // Discard queued packets on BOTH streams, then flush the
@@ -2714,6 +2846,17 @@ void VideoPlayer::demuxDecodeThread() {
                     SDL_PauseAudioStreamDevice(audio_stream_);
                     SDL_Delay(20);
                     SDL_ResumeAudioStreamDevice(audio_stream_);
+                    // If the user is currently PAUSED (they scrubbed with
+                    // the seek bar or pressed Left/Right while paused),
+                    // the device is now in the "playing" state and will
+                    // consume the fresh audio packets that the decode
+                    // thread is about to push - so a short burst of audio
+                    // leaks out even though the picture is frozen at the
+                    // seek target. Re-pause the device to end the dance
+                    // in the state the user actually wants.
+                    if (!playing_.load()) {
+                        SDL_PauseAudioStreamDevice(audio_stream_);
+                    }
                 }
             }
             // Second video-output drain: catches any stale frames the
@@ -2805,6 +2948,7 @@ void VideoPlayer::demuxDecodeThread() {
             enqueuePacketClone(packet, video_pkt_queue_,
                                video_pkt_mutex_, video_pkt_cv_,
                                kVideoPktQueueMax, quit_, seek_requested_);
+            demux_video_packets_.fetch_add(1, std::memory_order_relaxed);
         } else if (packet->stream_index == audio_stream_idx_
                    && audio_dec_ctx_ && swr_ctx_ && audio_stream_) {
             enqueuePacketClone(packet, audio_pkt_queue_,
@@ -2927,10 +3071,38 @@ void VideoPlayer::videoDecodeThread() {
         {
             std::lock_guard<std::mutex> lk(video_ctx_mutex_);
             if (!video_dec_ctx_) { av_packet_free(&pkt); continue; }
-            if (avcodec_send_packet(video_dec_ctx_,
-                                    is_flush ? nullptr : pkt) >= 0) {
+            int send_ret = avcodec_send_packet(video_dec_ctx_,
+                                    is_flush ? nullptr : pkt);
+            video_packets_sent_.fetch_add(1, std::memory_order_relaxed);
+            if (send_ret < 0) {
+                video_packet_send_errors_.fetch_add(1, std::memory_order_relaxed);
+            }
+            // Watchdog: if we've been fed a lot of packets and produced
+            // ZERO frames, the installed decoder cannot handle this stream
+            // (e.g. HEVC Rext / 12-bit against a build without Rext).
+            // Latch a flag so:
+            //   - UI can show a clear "codec unsupported" OSD
+            //   - handleNaturalEnd suppresses the repeat-One replay so we
+            //     don't infinite-loop demuxing a file we can't display
+            {
+                constexpr int kDecoderStuckThreshold = 30;
+                int sent = video_packets_sent_.load(std::memory_order_relaxed);
+                int made = video_frames_pushed_.load(std::memory_order_relaxed);
+                if (sent >= kDecoderStuckThreshold && made == 0
+                    && !decoder_stuck_.load(std::memory_order_relaxed)) {
+                    decoder_stuck_.store(true, std::memory_order_release);
+                    bpProbe("decoder_stuck sent=%d made=0 codec=%s pix=%d hw=%s",
+                            sent,
+                            video_dec_ctx_ && video_dec_ctx_->codec
+                                ? video_dec_ctx_->codec->name : "?",
+                            video_dec_ctx_ ? (int)video_dec_ctx_->pix_fmt : -1,
+                            hw_name_ ? hw_name_ : "?");
+                }
+            }
+            if (send_ret >= 0) {
+                int rframe_ret = 0;
                 while (!quit_ && !video_flush_pending_.load()
-                       && avcodec_receive_frame(video_dec_ctx_, dec_frame) >= 0) {
+                       && (rframe_ret = avcodec_receive_frame(video_dec_ctx_, dec_frame)) >= 0) {
                     double pts = 0.0;
                     AVFrame* out = materializeWithDeinterlace(dec_frame, pts);
                     av_frame_unref(dec_frame);
@@ -2953,6 +3125,21 @@ void VideoPlayer::videoDecodeThread() {
                         break;
                     }
                     video_queue_.push_back({out, pts});
+                    if (!first_video_frame_probed_) {
+                        first_video_frame_probed_ = true;
+                        bpProbe("first_video_frame pts=%.3f q=%zu", pts, video_queue_.size());
+                    }
+                    video_frames_pushed_.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (bpProbeEnabled() && rframe_ret < 0
+                    && rframe_ret != AVERROR(EAGAIN) && rframe_ret != AVERROR_EOF) {
+                    int rerrs = video_recv_frame_errors_.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (rerrs == 1 || rerrs == 5 || rerrs == 30) {
+                        char eb[128] = {};
+                        av_strerror(rframe_ret, eb, sizeof(eb));
+                        bpProbe("recv_frame err count=%d ret=%d err=\"%s\"",
+                                rerrs, rframe_ret, eb);
+                    }
                 }
             }
         }
@@ -3080,13 +3267,18 @@ void VideoPlayer::audioDecodeThread() {
 
             while (!quit_
                    && avcodec_receive_frame(audio_dec_ctx_, dec_frame) >= 0) {
-                bool want_loud = loudness_normalize_.load();
+                // The audio filter graph now hosts EITHER dynaudnorm,
+                // voice-boost equalizer, or both. `want_filter` is true
+                // when at least one is on; the rebuild flag is shared.
+                bool want_loud   = loudness_normalize_.load();
+                bool want_voice  = voice_boost_.load();
+                bool want_filter = want_loud || want_voice;
                 if (loudness_rebuild_.exchange(false)) {
-                    if (!want_loud) freeLoudnessGraph_();
+                    if (!want_filter) freeLoudnessGraph_();
                     loudness_build_failed_ = false;
                 }
                 bool use_filter = false;
-                if (want_loud && !loudness_build_failed_) {
+                if (want_filter && !loudness_build_failed_) {
                     bool need_rebuild = !audio_filter_graph_
                         || audio_filter_rate_ != dec_frame->sample_rate
                         || audio_filter_fmt_  != (AVSampleFormat)dec_frame->format
@@ -3197,6 +3389,24 @@ bool VideoPlayer::updateTexture(SDL_Texture* texture) {
             av_frame_free(&f);
             video_queue_.pop_front();
         }
+        // Post-seek pre-target drain. Silently drops keyframe->target
+        // frames the decoder produced to reach the seek point so the
+        // release stage below doesn't spend its per-vsync budget on
+        // frames the user never asked to see. See kVideoSkipToleranceSec
+        // doc for the "fast forward after seek" symptom this closes.
+        // Cleared once a target-or-later frame is released (below).
+        {
+            double vskip = video_skip_to_pts_.load(std::memory_order_relaxed);
+            if (vskip > -1e17) {
+                while (!video_queue_.empty()
+                       && video_queue_.front().pts < vskip - kVideoSkipToleranceSec) {
+                    AVFrame* f = video_queue_.front().frame;
+                    av_frame_free(&f);
+                    video_queue_.pop_front();
+                    video_queue_cv_.notify_one();
+                }
+            }
+        }
         if (deferred >= 0.0) {
             // Drain toward target. Free all pre-target frames EXCEPT the
             // closest one to target - that one gets displayed as a
@@ -3246,14 +3456,48 @@ bool VideoPlayer::updateTexture(SDL_Texture* texture) {
                 video_queue_cv_.notify_one();
             }
             // If we didn't reach target this call but did drain some
-            // pre-target frames, display the closest one as preview.
-            // Keep deferred set so subsequent ticks continue draining
-            // until a true target frame arrives.
+            // pre-target frames, decide whether to display the closest
+            // one as a preview. Keep deferred set so subsequent ticks
+            // continue draining until a true target frame arrives.
+            //
+            // While PLAYING: always show the preview - covers the
+            // ~100-500 ms of decoder catch-up on long-GOP 4K so audio
+            // doesn't race ahead of visibly-stale video.
+            //
+            // While PAUSED: only show a preview when it's ALREADY close
+            // to the target (within kPausedPreviewWindowSec). This kills
+            // the "flash of playback from the seek keyframe up to target"
+            // that the user perceives as brief playback, while still
+            // giving visual feedback for drag-scrub (where each drag
+            // call sets a fresh target that the decoder catches up to
+            // quickly, so the pretarget IS near the target and IS shown)
+            // AND for the final settle when decoder converges near
+            // target after an arrow-key seek. The picture stays on the
+            // pre-seek frame during the early drain (frames far from
+            // target discarded silently), then updates once for the
+            // "almost there" preview, then again for the actual target.
             if (!best && pretarget_best) {
-                best = pretarget_best;
-                best_pts = pretarget_best_pts;
-                // Note: deferred stays set - the drain loop above only
-                // clears it when the actual target is hit.
+                bool show = playing_.load(std::memory_order_relaxed)
+                         || scrubbing_.load(std::memory_order_relaxed);
+                if (!show) {
+                    // Paused + not scrubbing (arrow-key jump, chapter
+                    // click, etc.): keep the picture still during the
+                    // early drain, only surface the closest-to-target
+                    // frame in the final settle window. Stops the
+                    // decoder walk from being visible as a brief burst
+                    // of playback ("flash").
+                    constexpr double kPausedPreviewWindowSec = 0.5;
+                    show = (deferred - pretarget_best_pts)
+                            <= kPausedPreviewWindowSec;
+                }
+                if (show) {
+                    best = pretarget_best;
+                    best_pts = pretarget_best_pts;
+                    // Note: deferred stays set - the drain loop above only
+                    // clears it when the actual target is hit.
+                } else {
+                    av_frame_free(&pretarget_best);
+                }
             }
             // If we didn't reach the target this call (queue empty),
             // wait for more frames next tick. Previous frame stays on
@@ -3284,6 +3528,17 @@ bool VideoPlayer::updateTexture(SDL_Texture* texture) {
                 video_queue_cv_.notify_one();
             }
         }
+        // Disarm the post-seek video-skip once a target-or-later frame
+        // has actually been released. From here the steady-state release
+        // policy takes over. Applies to both the deferred and normal
+        // branches - either way, `best_pts` here is at/past vskip because
+        // the drop loop above already trimmed everything behind it.
+        if (best) {
+            double vskip = video_skip_to_pts_.load(std::memory_order_relaxed);
+            if (vskip > -1e17 && best_pts >= vskip - kVideoSkipToleranceSec) {
+                video_skip_to_pts_.store(-1e18, std::memory_order_relaxed);
+            }
+        }
         video_empty = video_queue_.empty();
     }
 
@@ -3297,9 +3552,28 @@ bool VideoPlayer::updateTexture(SDL_Texture* texture) {
         // we still own the source data. pushHistory_ does the clone +
         // byte-budget trim internally.
         pushHistory_(best, best_pts);
+        int nd = video_frames_displayed_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (bpProbeEnabled() && (nd == 1 || nd == 5 || nd == 30 || nd % 60 == 0)) {
+            bpProbe("displayed n=%d pts=%.3f clock=%.3f q_after=%zu pushed=%d play=%d",
+                    nd, best_pts, now_time,
+                    (size_t)video_queue_.size(),
+                    video_frames_pushed_.load(std::memory_order_relaxed),
+                    playing_ ? 1 : 0);
+        }
         std::lock_guard<std::mutex> lk(last_frame_mutex_);
         if (last_frame_) av_frame_free(&last_frame_);
         last_frame_ = best;
+    } else if (bpProbeEnabled()) {
+        // Every ~1s of no-frame calls, log clock+queue so we can see stalls.
+        static thread_local int calls_since_last = 0;
+        if (++calls_since_last >= 60) {
+            calls_since_last = 0;
+            int pushed = video_frames_pushed_.load(std::memory_order_relaxed);
+            int shown  = video_frames_displayed_.load(std::memory_order_relaxed);
+            bpProbe("stall clock=%.3f q_size=?%s pushed=%d shown=%d play=%d",
+                    now_time, video_empty ? "empty" : "nonempty",
+                    pushed, shown, playing_ ? 1 : 0);
+        }
     }
 
     // Detect natural end and dispatch the callback (outside all locks).

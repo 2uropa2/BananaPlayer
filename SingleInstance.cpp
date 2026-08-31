@@ -245,6 +245,18 @@ bool peekPolicyFromConfig() {
 
 bool forwardPathToPrimary(const std::string& path) {
 #ifdef _WIN32
+    // Grant "any process" the right to steal foreground so the primary
+    // can raise its window when it handles this forwarded path.
+    // Without this, SetForegroundWindow / SDL_RaiseWindow in the primary
+    // silently degrades to a taskbar flash on Windows 10+ - the user
+    // double-clicks a file and playback starts *behind* the current
+    // foreground window.
+    //
+    // AllowSetForegroundWindow only takes effect for the process that
+    // currently has foreground (that's us - Explorer just launched us),
+    // and lasts until the next user input event, so it must be called
+    // right before the pipe write.
+    AllowSetForegroundWindow(ASFW_ANY);
     for (int attempt = 0; attempt < 20; ++attempt) {
         HANDLE hp = CreateFileA(kPipeName, GENERIC_WRITE, 0, nullptr,
                                 OPEN_EXISTING, 0, nullptr);

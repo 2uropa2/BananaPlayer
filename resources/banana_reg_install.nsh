@@ -69,5 +69,25 @@ WriteRegStr HKCR "Applications\BananaPlayer.exe\SupportedTypes" ".tif" ""
 WriteRegStr HKCR ".tiff\OpenWithList\BananaPlayer.exe" "" ""
 WriteRegStr HKCR "Applications\BananaPlayer.exe\SupportedTypes" ".tiff" ""
 
+; Audio-only containers: same OpenWithList + SupportedTypes registration
+; as videos. VideoPlayer::loadFile succeeds without a video stream and
+; UIController::drawAudioOnlyPlaceholder fills the empty video area with
+; the filename, so voice memos and music files play through the normal
+; seek/volume/OSD stack.
+WriteRegStr HKCR ".m4a\OpenWithList\BananaPlayer.exe" "" ""
+WriteRegStr HKCR "Applications\BananaPlayer.exe\SupportedTypes" ".m4a" ""
+WriteRegStr HKCR ".mp3\OpenWithList\BananaPlayer.exe" "" ""
+WriteRegStr HKCR "Applications\BananaPlayer.exe\SupportedTypes" ".mp3" ""
+WriteRegStr HKCR ".flac\OpenWithList\BananaPlayer.exe" "" ""
+WriteRegStr HKCR "Applications\BananaPlayer.exe\SupportedTypes" ".flac" ""
+WriteRegStr HKCR ".wav\OpenWithList\BananaPlayer.exe" "" ""
+WriteRegStr HKCR "Applications\BananaPlayer.exe\SupportedTypes" ".wav" ""
+WriteRegStr HKCR ".aac\OpenWithList\BananaPlayer.exe" "" ""
+WriteRegStr HKCR "Applications\BananaPlayer.exe\SupportedTypes" ".aac" ""
+WriteRegStr HKCR ".opus\OpenWithList\BananaPlayer.exe" "" ""
+WriteRegStr HKCR "Applications\BananaPlayer.exe\SupportedTypes" ".opus" ""
+WriteRegStr HKCR ".ogg\OpenWithList\BananaPlayer.exe" "" ""
+WriteRegStr HKCR "Applications\BananaPlayer.exe\SupportedTypes" ".ogg" ""
+
 ; Poke Explorer so the change appears without a reboot.
 System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, i 0, i 0)'

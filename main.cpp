@@ -71,7 +71,10 @@ void renderOneFrame() {
     // Ensure texture matches the output dims (not necessarily source
     // dims - HDR half-res mode ships a downscaled tone-map). SDL
     // upscales during SDL_RenderTexture so the aspect stays right.
-    if (player.isLoaded()) {
+    // Audio-only files have no video stream: skip texture management
+    // entirely so the placeholder in UIController::drawAudioOnlyPlaceholder
+    // fills the video area instead of a stale prior-file texture.
+    if (player.isLoaded() && !player.isAudioOnly()) {
         int vw = player.getOutputWidth();
         int vh = player.getOutputHeight();
         unsigned int ui_gen = ui.getTextureGeneration();
@@ -106,12 +109,21 @@ void renderOneFrame() {
             g_app.tex_generation = ui_gen;
             g_app.has_first_frame = false;
         }
+    } else if (player.isLoaded() && player.isAudioOnly() && g_app.video_texture) {
+        // Switched from a video file to an audio-only file: drop the
+        // previous file's texture so its last frame doesn't linger under
+        // the audio-only placeholder.
+        SDL_DestroyTexture(g_app.video_texture);
+        g_app.video_texture   = nullptr;
+        g_app.tex_w           = 0;
+        g_app.tex_h           = 0;
+        g_app.has_first_frame = false;
     }
-    if (g_app.video_texture) {
+    if (g_app.video_texture && !player.isAudioOnly()) {
         if (player.updateTexture(g_app.video_texture)) g_app.has_first_frame = true;
     }
 
-    SDL_SetRenderDrawColor(renderer, 6, 8, 14, 255);
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
     SDL_RenderClear(renderer);
 
     int ww = 0, wh = 0;
@@ -398,9 +410,30 @@ int main(int argc, char* argv[]) {
                 // the named pipe. Bring our window to the front so the
                 // user sees the file open instead of wondering where
                 // Explorer's double-click went.
+                //
+                // The secondary process called AllowSetForegroundWindow(ASFW_ANY)
+                // right before the pipe write so SetForegroundWindow below
+                // actually promotes us to foreground instead of just
+                // flashing the taskbar entry.
                 auto* p = static_cast<std::string*>(event.user.data1);
                 if (p) {
+                    // Restore first if minimized - otherwise Raise/SetForeground
+                    // just brings the taskbar entry forward, not the actual
+                    // window pixels.
+                    SDL_WindowFlags flags = SDL_GetWindowFlags(window);
+                    if (flags & SDL_WINDOW_MINIMIZED) SDL_RestoreWindow(window);
                     SDL_RaiseWindow(window);
+                    SDL_PropertiesID props = SDL_GetWindowProperties(window);
+                    HWND hwnd = (HWND)SDL_GetPointerProperty(props,
+                        SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+                    if (hwnd) {
+                        // Belt + suspenders. SDL_RaiseWindow already calls
+                        // SetForegroundWindow but the sequence + BringWindowToTop
+                        // is what actually pulls the window pixels over the
+                        // previous foreground app on Windows 10/11.
+                        BringWindowToTop(hwnd);
+                        SetForegroundWindow(hwnd);
+                    }
                     ui.openAny(*p);
                     delete p;
                 }
