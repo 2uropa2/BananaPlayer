@@ -93,6 +93,8 @@ public:
 
 private:
     void drawSplash(int W, int H);
+    void drawExportProgress(int W, int H);
+    ExportJob export_job_;
     // Fills the empty video area when the loaded file is audio-only (.m4a
     // / .mp3 / voice memos): centered filename + "AUDIO ONLY" label on a
     // dark background, so the window doesn't just look like a hung player
@@ -107,6 +109,11 @@ private:
 
     void showOsd(const std::string& text, float duration = 1.6f);
     void takeSnapshot();
+    // Same as takeSnapshot() but pops a Windows Save As dialog first so
+    // the user picks the destination. Bound to Ctrl+S. Cancelling the
+    // dialog is a silent no-op. Burst snapshots stay on takeSnapshot()
+    // because you can't dialog 10 times in a row.
+    void takeSnapshotAskPath();
     void playNextInPlaylist();
     void playPrevInPlaylist();
     void handleNaturalEnd();
@@ -203,6 +210,12 @@ private:
     // maps to ForceOn - no explicit-Off value from the old bool, so
     // opt-out is a fresh action for those users.
     int hdr_half_res_mode_ = 0;   // 0 Auto, 1 ForceOn, 2 Off
+    // High-res SDR source downscale mode (matches VideoPlayer::HighResDownscaleMode
+    // integer values: 0 Off, 1 Auto, 2 ForceOn). Default Auto so 8K
+    // sources on typical desktops don't stutter out of the box. See the
+    // VideoPlayer::setHighResDownscaleMode doc for the underlying
+    // rationale (~150 MB/frame memory bandwidth on the 8K round-trip).
+    int hires_downscale_mode_ = 1;   // 0 Off, 1 Auto, 2 ForceOn
     // When true, playback auto-pauses when the window loses focus and
     // auto-resumes when it regains focus. Default off - lots of viewers
     // background their video on purpose while doing something else. The
@@ -614,6 +627,13 @@ private:
     // or the window is fullscreen; un-maximizes first if maximized.
     void snapWindowToVideo();
 
+    // Resize the window so its client area matches (scale * native video
+    // pixels), post-rotation. scale = 0.5 / 1.0 / 2.0 are the 1/2/3 hotkeys.
+    // Clamps to the display's usable bounds and the 640x400 minimum. Also
+    // resets video_zoom_ / pan so the video fills the new client area
+    // edge-to-edge rather than being letterboxed inside a scaled view.
+    void snapWindowToVideoScale(float scale);
+
     // Seek-bar hover thumbnail preview. Off by default; togglable from the
     // Settings menu and persisted to banana.config. When enabled AND the
     // cursor is over the seek bar AND we're not mid-drag, we ask the
@@ -656,6 +676,12 @@ private:
     bool show_shortcuts_ = false;
     bool show_about_    = false;
     bool show_info_     = false;
+    // Quick file-info overlay toggled by Tab (PotPlayer convention).
+    // Compact card in the top-left with the essentials: filename,
+    // codecs, resolution, fps, bitrate, keyframe interval, path.
+    // Tab again or Esc closes. Independent of `show_info_` (the
+    // detailed panel opened by I / F1).
+    bool show_quick_info_ = false;
     // Playback history modal (Ctrl+H): scrollable list of previously-watched
     // files from resume_index_ and recent_files_, with progress bars and
     // click-to-continue. Deferred mutations avoid modifying resume_index_
@@ -673,7 +699,7 @@ private:
     // are session-only. Kept as fixed-size arrays so ImGui::InputText
     // can write directly without an alloc.
     char        license_email_buf_[128] = {0};
-    char        license_key_buf_[64]    = {0};
+    char        license_key_buf_[128]    = {0};
     std::string license_msg_;   // shown next to Verify: green/red status
     int  settings_tab_  = 0;   // active tab index across draws
     // Goto-time dialog (Ctrl+G): tiny modal that takes "H:MM:SS",
@@ -685,6 +711,7 @@ private:
     void drawShortcutsPanel(int W, int H);
     void drawAboutPanel(int W, int H);
     void drawInfoPanel(int W, int H);
+    void drawQuickInfoOverlay(int W, int H);
     void drawHistoryPanel(int W, int H);
     void drawSettingsDialog(int W, int H);
     void drawGotoTimeDialog(int W, int H);

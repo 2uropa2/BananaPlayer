@@ -1,3 +1,4 @@
+#include "FileIO.hpp"
 #include "SingleInstance.hpp"
 
 #include <atomic>
@@ -198,7 +199,7 @@ void deactivate() {
 bool peekPolicyFromConfig() {
 #ifdef _WIN32
     std::vector<std::string> candidates;
-    if (const char* appdata = std::getenv("APPDATA")) {
+    if (const auto appdata = FileIO::environment("APPDATA"); !appdata.empty()) {
         std::string p(appdata);
         while (!p.empty() && (p.back() == '\\' || p.back() == '/')) p.pop_back();
         candidates.push_back(p + "\\BananaPlayer\\banana.config");
@@ -207,19 +208,11 @@ bool peekPolicyFromConfig() {
         candidates.push_back(p + "\\Vela\\vela.config");
     }
     {
-        char exe[MAX_PATH];
-        DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
-        if (n > 0 && n < MAX_PATH) {
-            std::string s(exe, n);
-            size_t p = s.find_last_of("\\/");
-            candidates.push_back((p == std::string::npos)
-                                    ? std::string("banana.config")
-                                    : s.substr(0, p) + "\\banana.config");
-        }
+        candidates.push_back(FileIO::executableDirectory() + "\\banana.config");
     }
     for (const std::string& cfg : candidates) {
         FILE* fp = nullptr;
-        if (fopen_s(&fp, cfg.c_str(), "rb") != 0 || !fp) continue;
+        if (FileIO::open(&fp, cfg.c_str(), "rb") != 0 || !fp) continue;
         char line[256];
         bool found_key = false;
         bool result = false;

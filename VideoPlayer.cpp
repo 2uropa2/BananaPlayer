@@ -1,3 +1,4 @@
+#include "FileIO.hpp"
 #include "VideoPlayer.hpp"
 
 #include <algorithm>
@@ -11,7 +12,7 @@
 static void bpTrace(const char* fmt, ...) {
     static std::mutex mtx;
     std::lock_guard<std::mutex> lk(mtx);
-    FILE* f = std::fopen("C:\\work\\Player\\bp_trace.log", "a");
+    FILE* f = FileIO::open("C:\\work\\Player\\bp_trace.log", "a");
     if (!f) return;
     va_list a; va_start(a, fmt); std::vfprintf(f, fmt, a); va_end(a);
     std::fputc('\n', f); std::fclose(f);
@@ -34,7 +35,7 @@ static void bpProbe(const char* fmt, ...) {
     if (!bpProbeEnabled()) return;
     static std::mutex mtx;
     std::lock_guard<std::mutex> lk(mtx);
-    FILE* f = std::fopen("C:\\work\\Player\\bp_probe.log", "a");
+    FILE* f = FileIO::open("C:\\work\\Player\\bp_probe.log", "a");
     if (!f) return;
     std::fprintf(f, "%llu ", (unsigned long long)SDL_GetTicks());
     va_list a; va_start(a, fmt); std::vfprintf(f, fmt, a); va_end(a);
@@ -276,6 +277,7 @@ void VideoPlayer::unload() {
     audio_stream_idx_ = -1;
     video_width_ = 0;
     video_height_ = 0;
+    video_sar_ = {1, 1};
     duration_ = 0.0;
     filename_.clear();
     quit_ = false;
@@ -420,6 +422,17 @@ bool VideoPlayer::loadFile(const std::string& filename, int preferred_audio_stre
         video_width_ = video_dec_ctx_->width;
         video_height_ = video_dec_ctx_->height;
         video_time_base_ = fmt_ctx_->streams[video_stream_idx_]->time_base;
+        // Capture SAR up front so the render path can display anamorphic
+        // sources (e.g. 1920x1080 tagged 607:1920) at the intended aspect
+        // instead of squishing them to 16:9. codecpar SAR beats the decoder
+        // ctx one because the container-side value is set even before the
+        // first frame decodes.
+        {
+            AVRational s = fmt_ctx_->streams[video_stream_idx_]
+                                ->codecpar->sample_aspect_ratio;
+            if (s.num <= 0 || s.den <= 0) s = {1, 1};
+            video_sar_ = s;
+        }
 
         // HDR classification is informational only until we have a real
         // tone-map pipeline (see HdrKind doc in the header).
@@ -439,6 +452,33 @@ bool VideoPlayer::loadFile(const std::string& filename, int preferred_audio_stre
         bool want_half = (m == HdrHalfResMode::ForceOn)
                       || (m == HdrHalfResMode::Auto && video_width_ >= 3840);
         hdr_half_res_active_ = want_half && hdr_kind_ != HdrKind::None;
+        // High-res SDR downscale. Only for the SDR path - HDR uses its
+        // own half-res axis above. Auto engages when either:
+        //   1) source > 3840 wide (5K/6K/8K); or
+        //   2) pixel-rate (W*H*fps) > 300 Mpx/s, which catches 4K/60 but
+        //      leaves 4K/30 and 1440p60 alone. Rationale: at 4K/60 the
+        //      HW-decode -> CPU download -> sws -> upload round-trip is
+        //      ~750 MB/s of memory bandwidth, and on some systems that
+        //      pressure starves the SDL audio device thread just enough
+        //      to cause repeated 'tick-tick' underruns. Halving output
+        //      dims quarters the bandwidth and typically eliminates it,
+        //      at a cost most viewers can't see on a 1080p/1440p display.
+        //   ForceOn overrides for any size, Off disables. See setter doc
+        //   in the header for rationale.
+        HighResDownscaleMode hd = hires_downscale_mode_.load();
+        double src_fps = 0.0;
+        {
+            AVRational fr = fmt_ctx_->streams[video_stream_idx_]->r_frame_rate;
+            if (fr.num == 0 || fr.den == 0) {
+                fr = fmt_ctx_->streams[video_stream_idx_]->avg_frame_rate;
+            }
+            if (fr.num > 0 && fr.den > 0) src_fps = av_q2d(fr);
+        }
+        double pix_rate = (double)video_width_ * (double)video_height_ * src_fps;
+        bool want_hires_down = (hd == HighResDownscaleMode::ForceOn)
+                            || (hd == HighResDownscaleMode::Auto
+                                && (video_width_ > 3840 || pix_rate > 300e6));
+        hires_downscale_active_ = want_hires_down && hdr_kind_ == HdrKind::None;
         // Interlaced source detection. Uses the codec's field_order tag
         // (AV_FIELD_TT/BB/TB/BT). Progressive and unknown are treated as
         // non-interlaced so we don't gratuitously smear progressive
@@ -902,8 +942,10 @@ double VideoPlayer::getCurrentTime() const {
 
 int VideoPlayer::openInterruptCb(void* opaque) {
     auto* self = static_cast<VideoPlayer*>(opaque);
-    if (!self || self->open_deadline_ == 0) return 0;
-    return (SDL_GetTicks() >= self->open_deadline_) ? 1 : 0;
+    if (!self) return 0;
+    if (self->quit_.load() || self->seek_requested_.load()) return 1;
+    const auto deadline = self->open_deadline_.load();
+    return deadline && SDL_GetTicks() >= deadline;
 }
 
 const char* VideoPlayer::getVideoCodecName() const {
@@ -933,6 +975,211 @@ double VideoPlayer::getVideoFrameRate() const {
 int64_t VideoPlayer::getFileBitrate() const {
     if (!fmt_ctx_) return 0;
     return fmt_ctx_->bit_rate;
+}
+
+// Pull a metadata tag from an AVStream (returns "" when absent).
+static std::string streamTag(AVStream* st, const char* key) {
+    if (!st || !st->metadata) return std::string();
+    AVDictionaryEntry* e = av_dict_get(st->metadata, key, nullptr, 0);
+    return (e && e->value) ? std::string(e->value) : std::string();
+}
+
+// Convert an FFmpeg channel layout to a human-readable name like
+// "stereo" or "5.1(side)". Returns "" when the layout is invalid.
+static std::string channelLayoutName(const AVChannelLayout& layout) {
+    char buf[128] = {0};
+    int n = av_channel_layout_describe(&layout, buf, sizeof(buf));
+    if (n <= 0) return std::string();
+    return std::string(buf);
+}
+
+VideoPlayer::MediaDetail VideoPlayer::getMediaDetail() const {
+    MediaDetail d;
+    if (!fmt_ctx_) return d;
+
+    // ---- Container ----
+    if (fmt_ctx_->iformat) {
+        d.container_short = fmt_ctx_->iformat->name ? fmt_ctx_->iformat->name : "";
+        d.container_long  = fmt_ctx_->iformat->long_name ? fmt_ctx_->iformat->long_name : "";
+    }
+    d.num_streams    = fmt_ctx_->nb_streams;
+    d.num_programs   = fmt_ctx_->nb_programs;
+    d.format_bitrate = fmt_ctx_->bit_rate;
+    d.probe_score    = fmt_ctx_->probe_score;
+    d.start_time_us  = fmt_ctx_->start_time;
+
+    // ---- Video (active stream) ----
+    if (video_stream_idx_ >= 0
+        && video_stream_idx_ < (int)fmt_ctx_->nb_streams) {
+        AVStream* vst = fmt_ctx_->streams[video_stream_idx_];
+        AVCodecParameters* p = vst->codecpar;
+        d.has_video = true;
+
+        d.video_codec_short = avcodec_get_name(p->codec_id) ? avcodec_get_name(p->codec_id) : "";
+        {
+            const AVCodecDescriptor* cd = avcodec_descriptor_get(p->codec_id);
+            if (cd && cd->long_name) d.video_codec_long = cd->long_name;
+        }
+        // Profile name via avcodec_profile_name (needs the codec, not just id).
+        {
+            const AVCodec* c = avcodec_find_decoder(p->codec_id);
+            if (c) {
+                const char* pn = av_get_profile_name(c, p->profile);
+                if (pn) d.video_profile = pn;
+            }
+            if (d.video_profile.empty() && p->profile > 0) {
+                d.video_profile = std::to_string(p->profile);
+            }
+        }
+        d.video_level  = p->level;
+        d.video_width  = p->width;
+        d.video_height = p->height;
+        d.video_bits_per_component = p->bits_per_raw_sample > 0
+                                   ? p->bits_per_raw_sample
+                                   : p->bits_per_coded_sample;
+
+        AVPixelFormat pf = (AVPixelFormat)p->format;
+        if (pf != AV_PIX_FMT_NONE) {
+            const char* n = av_get_pix_fmt_name(pf);
+            if (n) d.video_pix_fmt = n;
+        }
+
+        auto safeName = [](const char* n) { return n ? std::string(n) : std::string(); };
+        d.video_color_space     = safeName(av_color_space_name(p->color_space));
+        d.video_color_range     = safeName(av_color_range_name(p->color_range));
+        d.video_color_primaries = safeName(av_color_primaries_name(p->color_primaries));
+        d.video_color_transfer  = safeName(av_color_transfer_name(p->color_trc));
+        d.video_chroma_location = safeName(av_chroma_location_name(p->chroma_location));
+
+        switch (p->field_order) {
+            case AV_FIELD_PROGRESSIVE: d.video_field_order = "Progressive"; break;
+            case AV_FIELD_TT: d.video_field_order = "Interlaced TFF"; break;
+            case AV_FIELD_BB: d.video_field_order = "Interlaced BFF"; break;
+            case AV_FIELD_TB: d.video_field_order = "Interlaced TB";  break;
+            case AV_FIELD_BT: d.video_field_order = "Interlaced BT";  break;
+            default:          d.video_field_order = "Unknown";        break;
+        }
+
+        // SAR from codecpar (may be 0/1). DAR = SAR * (W/H).
+        d.video_sar = p->sample_aspect_ratio;
+        if (d.video_sar.num == 0 || d.video_sar.den == 0) {
+            d.video_sar.num = 1; d.video_sar.den = 1;
+        }
+        if (p->width > 0 && p->height > 0) {
+            AVRational src_ratio{ p->width, p->height };
+            AVRational dar = av_mul_q(d.video_sar, src_ratio);
+            av_reduce(&d.video_dar.num, &d.video_dar.den, dar.num, dar.den, 1024 * 1024);
+        }
+
+        AVRational rfr = vst->r_frame_rate;
+        AVRational afr = vst->avg_frame_rate;
+        d.video_fps     = (rfr.num > 0 && rfr.den > 0) ? av_q2d(rfr) : 0.0;
+        d.video_avg_fps = (afr.num > 0 && afr.den > 0) ? av_q2d(afr) : 0.0;
+        d.video_bitrate = p->bit_rate;
+        d.video_nb_frames = vst->nb_frames;
+        if (hw_active_) d.hw_decoder = hw_name_ ? hw_name_ : "";
+
+        d.video_language = streamTag(vst, "language");
+        d.video_title    = streamTag(vst, "title");
+
+        // Keyframe interval: walk the container's index and average the
+        // distance between adjacent AVINDEX_KEYFRAME entries. Works for
+        // MP4/MOV/MKV/FLV (which all populate the index during
+        // avformat_find_stream_info). Falls back to 0.0 when the format
+        // demuxer doesn't build an index (raw H.264 elementary streams,
+        // live HLS, ...). Sample the first ~200 keyframes so a 3h movie
+        // doesn't cost a full-index walk. Time base is video_time_base_
+        // populated in loadFile.
+        int nb = avformat_index_get_entries_count(vst);
+        if (nb > 1) {
+            const int cap = 200;
+            int keyframes = 0;
+            int64_t first_ts = AV_NOPTS_VALUE, last_ts = AV_NOPTS_VALUE;
+            for (int i = 0; i < nb && keyframes < cap; ++i) {
+                const AVIndexEntry* e = avformat_index_get_entry(vst, i);
+                if (!e) continue;
+                if (e->flags & AVINDEX_KEYFRAME) {
+                    if (first_ts == AV_NOPTS_VALUE) first_ts = e->timestamp;
+                    last_ts = e->timestamp;
+                    keyframes++;
+                }
+            }
+            d.keyframe_count = keyframes;
+            if (keyframes > 1 && last_ts != AV_NOPTS_VALUE
+                && first_ts != AV_NOPTS_VALUE) {
+                double span = (last_ts - first_ts) * av_q2d(vst->time_base);
+                d.keyframe_interval_sec = span / (double)(keyframes - 1);
+            }
+        }
+    }
+
+    // ---- Audio (active track) ----
+    if (audio_stream_idx_ >= 0
+        && audio_stream_idx_ < (int)fmt_ctx_->nb_streams) {
+        AVStream* ast = fmt_ctx_->streams[audio_stream_idx_];
+        AVCodecParameters* p = ast->codecpar;
+        d.has_audio = true;
+
+        d.audio_codec_short = avcodec_get_name(p->codec_id) ? avcodec_get_name(p->codec_id) : "";
+        {
+            const AVCodecDescriptor* cd = avcodec_descriptor_get(p->codec_id);
+            if (cd && cd->long_name) d.audio_codec_long = cd->long_name;
+        }
+        {
+            const AVCodec* c = avcodec_find_decoder(p->codec_id);
+            if (c) {
+                const char* pn = av_get_profile_name(c, p->profile);
+                if (pn) d.audio_profile = pn;
+            }
+            if (d.audio_profile.empty() && p->profile > 0) {
+                d.audio_profile = std::to_string(p->profile);
+            }
+        }
+        d.audio_sample_rate = p->sample_rate;
+        d.audio_channels    = p->ch_layout.nb_channels;
+        d.audio_channel_layout = channelLayoutName(p->ch_layout);
+        AVSampleFormat sf = (AVSampleFormat)p->format;
+        if (sf != AV_SAMPLE_FMT_NONE) {
+            const char* n = av_get_sample_fmt_name(sf);
+            if (n) d.audio_sample_fmt = n;
+        }
+        d.audio_bits_per_sample = p->bits_per_raw_sample > 0
+                                ? p->bits_per_raw_sample
+                                : p->bits_per_coded_sample;
+        d.audio_bitrate  = p->bit_rate;
+        d.audio_language = streamTag(ast, "language");
+        d.audio_title    = streamTag(ast, "title");
+    }
+
+    // ---- Subtitle streams ----
+    for (unsigned i = 0; i < fmt_ctx_->nb_streams; ++i) {
+        AVStream* st = fmt_ctx_->streams[i];
+        if (!st || !st->codecpar) continue;
+        if (st->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) continue;
+        MediaDetail::SubStreamInfo info;
+        info.codec_short = avcodec_get_name(st->codecpar->codec_id)
+                        ? avcodec_get_name(st->codecpar->codec_id) : "";
+        info.language = streamTag(st, "language");
+        info.title    = streamTag(st, "title");
+        AVCodecID cid = st->codecpar->codec_id;
+        info.selectable = (cid == AV_CODEC_ID_SUBRIP
+                        || cid == AV_CODEC_ID_ASS
+                        || cid == AV_CODEC_ID_SSA
+                        || cid == AV_CODEC_ID_TEXT
+                        || cid == AV_CODEC_ID_MOV_TEXT);
+        d.subtitle_streams.push_back(std::move(info));
+    }
+
+    // ---- Attachments ----
+    for (unsigned i = 0; i < fmt_ctx_->nb_streams; ++i) {
+        AVStream* st = fmt_ctx_->streams[i];
+        if (st && st->codecpar
+            && st->codecpar->codec_type == AVMEDIA_TYPE_ATTACHMENT) {
+            d.num_attachments++;
+        }
+    }
+
+    return d;
 }
 
 int VideoPlayer::getIntrinsicRotation() const {
@@ -1162,16 +1409,50 @@ void VideoPlayer::setMuted(bool m) {
     applyGain();
 }
 
+void VideoPlayer::setHighResDownscaleMode(HighResDownscaleMode m) {
+    hires_downscale_mode_.store(m);
+    // Re-evaluate the active flag against the current source so a
+    // Settings toggle applies to the file already playing. HDR still
+    // has its own hdr_half_res axis; hires only affects the SDR path
+    // (materializeYUV's sws_scale output). Next frame the display
+    // texture in main.cpp will notice getOutputWidth changed and
+    // rebuild at the new size; sws_getCachedContext handles the
+    // input->output size change transparently.
+    if (loaded_.load() && hdr_kind_ == HdrKind::None && video_width_ > 0) {
+        double src_fps = 0.0;
+        if (fmt_ctx_ && video_stream_idx_ >= 0) {
+            AVRational fr = fmt_ctx_->streams[video_stream_idx_]->r_frame_rate;
+            if (fr.num == 0 || fr.den == 0) {
+                fr = fmt_ctx_->streams[video_stream_idx_]->avg_frame_rate;
+            }
+            if (fr.num > 0 && fr.den > 0) src_fps = av_q2d(fr);
+        }
+        double pix_rate = (double)video_width_ * (double)video_height_ * src_fps;
+        bool want = (m == HighResDownscaleMode::ForceOn)
+                 || (m == HighResDownscaleMode::Auto
+                     && (video_width_ > 3840 || pix_rate > 300e6));
+        hires_downscale_active_ = want;
+    }
+}
+
 int VideoPlayer::getOutputWidth() const {
     if (hdr_half_res_active_) {
         int w = video_width_ / 2;
         return (w > 0) ? (w & ~1) : video_width_;   // round to even
+    }
+    if (hires_downscale_active_) {
+        int w = video_width_ / 2;
+        return (w > 0) ? (w & ~1) : video_width_;
     }
     return video_width_;
 }
 
 int VideoPlayer::getOutputHeight() const {
     if (hdr_half_res_active_) {
+        int h = video_height_ / 2;
+        return (h > 0) ? (h & ~1) : video_height_;
+    }
+    if (hires_downscale_active_) {
         int h = video_height_ / 2;
         return (h > 0) ? (h & ~1) : video_height_;
     }
@@ -1528,7 +1809,7 @@ static bool loadHdrLutCache(std::vector<float>& pq_in,
                             std::vector<uint16_t>& out,
                             std::vector<float>& hlg_gain) {
     std::string path = hdrLutCachePath();
-    std::FILE* f = std::fopen(path.c_str(), "rb");
+    std::FILE* f = FileIO::open(path.c_str(), "rb");
     if (!f) return false;
     uint32_t hdr[2] = {0, 0};
     if (std::fread(hdr, sizeof(uint32_t), 2, f) != 2
@@ -1564,7 +1845,7 @@ static void saveHdrLutCache(const std::vector<float>& pq_in,
     if (pq_in.size() != 65536 || hlg_in.size() != 65536
         || out.size() != 65536 || hlg_gain.size() != 65536) return;
     std::string path = hdrLutCachePath();
-    std::FILE* f = std::fopen(path.c_str(), "wb");
+    std::FILE* f = FileIO::open(path.c_str(), "wb");
     if (!f) return;
     uint32_t hdr[2] = { kHdrLutCacheMagic, kHdrLutCacheVersion };
     std::fwrite(hdr, sizeof(uint32_t), 2, f);
@@ -2262,7 +2543,7 @@ bool VideoPlayer::snapshot(const std::string& out_path) {
     bool ok = false;
     if (avcodec_send_frame(enc, rgb) >= 0) {
         if (avcodec_receive_packet(enc, pkt) >= 0) {
-            std::FILE* f = std::fopen(out_path.c_str(), "wb");
+            std::FILE* f = FileIO::open(out_path.c_str(), "wb");
             if (f) {
                 if ((int)std::fwrite(pkt->data, 1, pkt->size, f) == pkt->size) ok = true;
                 std::fclose(f);
@@ -2335,7 +2616,7 @@ bool VideoPlayer::snapshotFromBytes(const std::string& out_path,
     bool ok = false;
     if (avcodec_send_frame(enc, rgb) >= 0
         && avcodec_receive_packet(enc, pkt) >= 0) {
-        std::FILE* f = std::fopen(out_path.c_str(), "wb");
+        std::FILE* f = FileIO::open(out_path.c_str(), "wb");
         if (f) {
             if ((int)std::fwrite(pkt->data, 1, pkt->size, f) == pkt->size) ok = true;
             std::fclose(f);
@@ -2345,383 +2626,6 @@ bool VideoPlayer::snapshotFromBytes(const std::string& out_path,
     av_packet_free(&pkt);
     avcodec_free_context(&enc);
     av_frame_free(&rgb);
-    return ok;
-}
-
-bool VideoPlayer::exportSegment(const std::string& src, const std::string& dst,
-                                double start, double end) {
-    if (src.empty() || dst.empty() || end <= start) return false;
-
-    AVFormatContext* in_ctx = nullptr;
-    if (avformat_open_input(&in_ctx, src.c_str(), nullptr, nullptr) < 0) {
-        return false;
-    }
-    if (avformat_find_stream_info(in_ctx, nullptr) < 0) {
-        avformat_close_input(&in_ctx);
-        return false;
-    }
-
-    AVFormatContext* out_ctx = nullptr;
-    if (avformat_alloc_output_context2(&out_ctx, nullptr, nullptr, dst.c_str()) < 0
-        || !out_ctx) {
-        avformat_close_input(&in_ctx);
-        return false;
-    }
-
-    // Map input stream index -> output stream index. Streams whose codec
-    // ID doesn't fit the container (e.g. attached picture in mp4) are
-    // silently dropped by leaving their map entry at -1.
-    std::vector<int> stream_map(in_ctx->nb_streams, -1);
-    for (unsigned i = 0; i < in_ctx->nb_streams; ++i) {
-        AVStream* in_s = in_ctx->streams[i];
-        AVMediaType t = in_s->codecpar->codec_type;
-        if (t != AVMEDIA_TYPE_VIDEO
-            && t != AVMEDIA_TYPE_AUDIO
-            && t != AVMEDIA_TYPE_SUBTITLE) continue;
-        AVStream* out_s = avformat_new_stream(out_ctx, nullptr);
-        if (!out_s) continue;
-        if (avcodec_parameters_copy(out_s->codecpar, in_s->codecpar) < 0) continue;
-        // codec_tag=0 makes the muxer pick a compatible tag itself; the
-        // input's tag often refers to a container-specific stream type
-        // (e.g. AVI vs mp4) and mp4 mux rejects the mismatch.
-        out_s->codecpar->codec_tag = 0;
-        stream_map[i] = out_s->index;
-    }
-
-    if (!(out_ctx->oformat->flags & AVFMT_NOFILE)) {
-        if (avio_open(&out_ctx->pb, dst.c_str(), AVIO_FLAG_WRITE) < 0) {
-            avformat_free_context(out_ctx);
-            avformat_close_input(&in_ctx);
-            return false;
-        }
-    }
-    if (avformat_write_header(out_ctx, nullptr) < 0) {
-        if (!(out_ctx->oformat->flags & AVFMT_NOFILE)) avio_closep(&out_ctx->pb);
-        avformat_free_context(out_ctx);
-        avformat_close_input(&in_ctx);
-        return false;
-    }
-
-    // Seek to the keyframe at or before `start`. Using AVSEEK_FLAG_BACKWARD
-    // guarantees we land on a keyframe (may be earlier than requested;
-    // acceptable so the output is playable from frame 0).
-    int64_t start_ts = (int64_t)(start * AV_TIME_BASE);
-    av_seek_frame(in_ctx, -1, start_ts, AVSEEK_FLAG_BACKWARD);
-
-    // Shift output PTS so packets start at 0 (per stream). Otherwise
-    // players open the file with a large initial delay while they wait
-    // for pts to catch up to the mux-declared start.
-    std::vector<int64_t> pts_offset(out_ctx->nb_streams, AV_NOPTS_VALUE);
-
-    AVPacket* pkt = av_packet_alloc();
-    if (!pkt) {
-        av_write_trailer(out_ctx);
-        if (!(out_ctx->oformat->flags & AVFMT_NOFILE)) avio_closep(&out_ctx->pb);
-        avformat_free_context(out_ctx);
-        avformat_close_input(&in_ctx);
-        return false;
-    }
-
-    bool ok = true;
-    while (av_read_frame(in_ctx, pkt) >= 0) {
-        int in_idx = pkt->stream_index;
-        int out_idx = (in_idx < (int)stream_map.size()) ? stream_map[in_idx] : -1;
-        if (out_idx < 0) { av_packet_unref(pkt); continue; }
-
-        AVStream* in_s  = in_ctx->streams[in_idx];
-        AVStream* out_s = out_ctx->streams[out_idx];
-
-        // Stop condition: pts of this packet exceeds `end` on the video
-        // stream. Audio may lag a bit past video in interleave; letting
-        // it through until video crosses `end` keeps A/V aligned at
-        // the tail. Any packet strictly beyond end is dropped.
-        double pts_sec = (pkt->pts == AV_NOPTS_VALUE)
-            ? -1.0
-            : (double)pkt->pts * av_q2d(in_s->time_base);
-        if (pts_sec > end + 0.5) { av_packet_unref(pkt); break; }
-        if (pts_sec > end && in_s->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            av_packet_unref(pkt);
-            break;
-        }
-
-        pkt->stream_index = out_idx;
-        av_packet_rescale_ts(pkt, in_s->time_base, out_s->time_base);
-        // Normalize pts/dts so the output timeline starts at 0.
-        if (pts_offset[out_idx] == AV_NOPTS_VALUE) {
-            pts_offset[out_idx] = (pkt->pts != AV_NOPTS_VALUE) ? pkt->pts
-                                : (pkt->dts != AV_NOPTS_VALUE) ? pkt->dts
-                                : 0;
-        }
-        if (pkt->pts != AV_NOPTS_VALUE) pkt->pts -= pts_offset[out_idx];
-        if (pkt->dts != AV_NOPTS_VALUE) pkt->dts -= pts_offset[out_idx];
-        if (pkt->pts != AV_NOPTS_VALUE && pkt->pts < 0) pkt->pts = 0;
-        if (pkt->dts != AV_NOPTS_VALUE && pkt->dts < 0) pkt->dts = 0;
-        pkt->pos = -1;
-
-        if (av_interleaved_write_frame(out_ctx, pkt) < 0) { ok = false; break; }
-        av_packet_unref(pkt);
-    }
-
-    av_write_trailer(out_ctx);
-    av_packet_free(&pkt);
-    if (!(out_ctx->oformat->flags & AVFMT_NOFILE)) avio_closep(&out_ctx->pb);
-    avformat_free_context(out_ctx);
-    avformat_close_input(&in_ctx);
-    return ok;
-}
-
-bool VideoPlayer::exportSegmentAsGif(const std::string& src, const std::string& dst,
-                                     double start, double end,
-                                     int target_fps, int target_width) {
-    if (src.empty() || dst.empty() || end <= start) return false;
-    if (target_fps  <= 0 || target_fps  > 60) target_fps  = 15;
-    if (target_width <= 0 || target_width > 2000) target_width = 480;
-
-    AVFormatContext* in_ctx = nullptr;
-    if (avformat_open_input(&in_ctx, src.c_str(), nullptr, nullptr) < 0) return false;
-    if (avformat_find_stream_info(in_ctx, nullptr) < 0) {
-        avformat_close_input(&in_ctx); return false;
-    }
-
-    // Find the video stream + decoder.
-    int vidx = -1;
-    for (unsigned i = 0; i < in_ctx->nb_streams; ++i) {
-        if (in_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            vidx = (int)i; break;
-        }
-    }
-    if (vidx < 0) { avformat_close_input(&in_ctx); return false; }
-    AVStream* vst = in_ctx->streams[vidx];
-    const AVCodec* dec = avcodec_find_decoder(vst->codecpar->codec_id);
-    if (!dec) { avformat_close_input(&in_ctx); return false; }
-    AVCodecContext* dec_ctx = avcodec_alloc_context3(dec);
-    if (!dec_ctx || avcodec_parameters_to_context(dec_ctx, vst->codecpar) < 0
-                 || avcodec_open2(dec_ctx, dec, nullptr) < 0) {
-        if (dec_ctx) avcodec_free_context(&dec_ctx);
-        avformat_close_input(&in_ctx); return false;
-    }
-
-    // Filter graph: fps + scale + split(palettegen | paletteuse). The
-    // split branches let one path build the palette while the other
-    // buffers frames; paletteuse merges them into a stream of PAL8
-    // frames ready for the GIF encoder.
-    AVFilterGraph* graph = avfilter_graph_alloc();
-    if (!graph) {
-        avcodec_free_context(&dec_ctx); avformat_close_input(&in_ctx); return false;
-    }
-    AVFilterContext* src_ctx = nullptr;
-    AVFilterContext* sink_ctx = nullptr;
-    char src_args[256];
-    AVRational tb = vst->time_base;
-    AVRational sar = dec_ctx->sample_aspect_ratio.num
-                        ? dec_ctx->sample_aspect_ratio
-                        : AVRational{1, 1};
-    std::snprintf(src_args, sizeof(src_args),
-        "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
-        dec_ctx->width, dec_ctx->height, (int)dec_ctx->pix_fmt,
-        tb.num, tb.den, sar.num, sar.den);
-    const AVFilter* bufsrc  = avfilter_get_by_name("buffer");
-    const AVFilter* bufsink = avfilter_get_by_name("buffersink");
-    if (!bufsrc || !bufsink
-        || avfilter_graph_create_filter(&src_ctx, bufsrc,  "in",  src_args, nullptr, graph) < 0
-        || avfilter_graph_create_filter(&sink_ctx, bufsink, "out", nullptr,  nullptr, graph) < 0) {
-        avfilter_graph_free(&graph); avcodec_free_context(&dec_ctx);
-        avformat_close_input(&in_ctx); return false;
-    }
-    // Restrict buffersink to PAL8 so paletteuse's output arrives ready
-    // for the GIF encoder without another conversion filter. Uses
-    // av_opt_set_bin directly to sidestep the FFmpeg 7.x deprecation
-    // warning on the av_opt_set_int_list convenience macro.
-    {
-        const enum AVPixelFormat pix_fmts[] = { AV_PIX_FMT_PAL8 };
-        if (av_opt_set_bin(sink_ctx, "pix_fmts",
-                           (const uint8_t*)pix_fmts, sizeof(pix_fmts),
-                           AV_OPT_SEARCH_CHILDREN) < 0) {
-            avfilter_graph_free(&graph); avcodec_free_context(&dec_ctx);
-            avformat_close_input(&in_ctx); return false;
-        }
-    }
-
-    // Build the middle chain from a string. `split` buffers frames so
-    // palettegen can consume the whole segment before paletteuse fires
-    // per-frame. `stats_mode=full` gives one palette for the whole clip
-    // (best color reproduction for a GIF of a short scene).
-    char middle[256];
-    std::snprintf(middle, sizeof(middle),
-        "fps=%d,scale=%d:-2:flags=lanczos,split[a][b];"
-        "[a]palettegen=stats_mode=full[p];[b][p]paletteuse=dither=bayer:bayer_scale=3",
-        target_fps, target_width);
-    AVFilterInOut* parsed_in  = nullptr;
-    AVFilterInOut* parsed_out = nullptr;
-    if (avfilter_graph_parse2(graph, middle, &parsed_in, &parsed_out) < 0
-        || !parsed_in || !parsed_out) {
-        if (parsed_in)  avfilter_inout_free(&parsed_in);
-        if (parsed_out) avfilter_inout_free(&parsed_out);
-        avfilter_graph_free(&graph); avcodec_free_context(&dec_ctx);
-        avformat_close_input(&in_ctx); return false;
-    }
-    // Link src -> parsed_in.first, parsed_out.first -> sink.
-    bool link_ok =
-        (avfilter_link(src_ctx, 0, parsed_in->filter_ctx, parsed_in->pad_idx) >= 0)
-     && (avfilter_link(parsed_out->filter_ctx, parsed_out->pad_idx, sink_ctx, 0) >= 0);
-    avfilter_inout_free(&parsed_in);
-    avfilter_inout_free(&parsed_out);
-    if (!link_ok || avfilter_graph_config(graph, nullptr) < 0) {
-        avfilter_graph_free(&graph); avcodec_free_context(&dec_ctx);
-        avformat_close_input(&in_ctx); return false;
-    }
-
-    // Output: GIF muxer with GIF encoder that accepts PAL8.
-    AVFormatContext* out_ctx = nullptr;
-    if (avformat_alloc_output_context2(&out_ctx, nullptr, "gif", dst.c_str()) < 0
-        || !out_ctx) {
-        avfilter_graph_free(&graph); avcodec_free_context(&dec_ctx);
-        avformat_close_input(&in_ctx); return false;
-    }
-    const AVCodec* gif_codec = avcodec_find_encoder(AV_CODEC_ID_GIF);
-    AVStream* out_st = avformat_new_stream(out_ctx, nullptr);
-    AVCodecContext* enc_ctx = gif_codec ? avcodec_alloc_context3(gif_codec) : nullptr;
-    if (!gif_codec || !out_st || !enc_ctx) {
-        if (enc_ctx) avcodec_free_context(&enc_ctx);
-        avformat_free_context(out_ctx);
-        avfilter_graph_free(&graph); avcodec_free_context(&dec_ctx);
-        avformat_close_input(&in_ctx); return false;
-    }
-    // Query the sink for its actual output resolution (post-scale).
-    int gif_w = av_buffersink_get_w(sink_ctx);
-    int gif_h = av_buffersink_get_h(sink_ctx);
-    if (gif_w <= 0 || gif_h <= 0) {
-        avcodec_free_context(&enc_ctx); avformat_free_context(out_ctx);
-        avfilter_graph_free(&graph); avcodec_free_context(&dec_ctx);
-        avformat_close_input(&in_ctx); return false;
-    }
-    enc_ctx->width     = gif_w;
-    enc_ctx->height    = gif_h;
-    enc_ctx->pix_fmt   = AV_PIX_FMT_PAL8;
-    enc_ctx->time_base = AVRational{1, target_fps};
-    enc_ctx->framerate = AVRational{target_fps, 1};
-    if (out_ctx->oformat->flags & AVFMT_GLOBALHEADER) {
-        enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    }
-    if (avcodec_open2(enc_ctx, gif_codec, nullptr) < 0
-        || avcodec_parameters_from_context(out_st->codecpar, enc_ctx) < 0) {
-        avcodec_free_context(&enc_ctx); avformat_free_context(out_ctx);
-        avfilter_graph_free(&graph); avcodec_free_context(&dec_ctx);
-        avformat_close_input(&in_ctx); return false;
-    }
-    out_st->time_base = enc_ctx->time_base;
-
-    if (!(out_ctx->oformat->flags & AVFMT_NOFILE)) {
-        if (avio_open(&out_ctx->pb, dst.c_str(), AVIO_FLAG_WRITE) < 0) {
-            avcodec_free_context(&enc_ctx); avformat_free_context(out_ctx);
-            avfilter_graph_free(&graph); avcodec_free_context(&dec_ctx);
-            avformat_close_input(&in_ctx); return false;
-        }
-    }
-    if (avformat_write_header(out_ctx, nullptr) < 0) {
-        if (!(out_ctx->oformat->flags & AVFMT_NOFILE)) avio_closep(&out_ctx->pb);
-        avcodec_free_context(&enc_ctx); avformat_free_context(out_ctx);
-        avfilter_graph_free(&graph); avcodec_free_context(&dec_ctx);
-        avformat_close_input(&in_ctx); return false;
-    }
-
-    // Seek input to the keyframe at/before `start`. Later frames whose
-    // decoded pts is < start get discarded before feeding the filter.
-    int64_t start_ts = (int64_t)(start * AV_TIME_BASE);
-    av_seek_frame(in_ctx, -1, start_ts, AVSEEK_FLAG_BACKWARD);
-    avcodec_flush_buffers(dec_ctx);
-
-    AVPacket* pkt   = av_packet_alloc();
-    AVFrame*  frame = av_frame_alloc();
-    AVFrame*  filt  = av_frame_alloc();
-    bool ok = true;
-    int64_t out_pts = 0;
-
-    auto write_encoded = [&](AVFrame* f) -> bool {
-        if (avcodec_send_frame(enc_ctx, f) < 0) return false;
-        AVPacket* op = av_packet_alloc();
-        while (avcodec_receive_packet(enc_ctx, op) == 0) {
-            op->stream_index = out_st->index;
-            av_packet_rescale_ts(op, enc_ctx->time_base, out_st->time_base);
-            if (av_interleaved_write_frame(out_ctx, op) < 0) {
-                av_packet_free(&op); return false;
-            }
-            av_packet_unref(op);
-        }
-        av_packet_free(&op);
-        return true;
-    };
-
-    auto drain_sink = [&](bool assign_pts) -> bool {
-        while (true) {
-            int fr = av_buffersink_get_frame(sink_ctx, filt);
-            if (fr == AVERROR(EAGAIN) || fr == AVERROR_EOF) return true;
-            if (fr < 0) return false;
-            if (assign_pts) filt->pts = out_pts++;
-            if (!write_encoded(filt)) { av_frame_unref(filt); return false; }
-            av_frame_unref(filt);
-        }
-    };
-
-    // Feed frames from `start` up to `end` into the filter graph.
-    bool eof_reached = false;
-    while (ok && !eof_reached) {
-        int rf = av_read_frame(in_ctx, pkt);
-        if (rf == AVERROR_EOF) { eof_reached = true; break; }
-        if (rf < 0)            { ok = false; break; }
-        if (pkt->stream_index != vidx) { av_packet_unref(pkt); continue; }
-
-        if (avcodec_send_packet(dec_ctx, pkt) < 0) { av_packet_unref(pkt); ok = false; break; }
-        av_packet_unref(pkt);
-
-        while (ok) {
-            int dr = avcodec_receive_frame(dec_ctx, frame);
-            if (dr == AVERROR(EAGAIN)) break;
-            if (dr == AVERROR_EOF)     { eof_reached = true; break; }
-            if (dr < 0)                { ok = false; break; }
-            double pts_sec = (frame->best_effort_timestamp == AV_NOPTS_VALUE)
-                                ? -1.0
-                                : (double)frame->best_effort_timestamp * av_q2d(tb);
-            if (pts_sec >= 0.0 && pts_sec < start) {
-                av_frame_unref(frame); continue;   // pre-start warm-up
-            }
-            if (pts_sec > end) { eof_reached = true; av_frame_unref(frame); break; }
-            if (av_buffersrc_add_frame(src_ctx, frame) < 0) { ok = false; av_frame_unref(frame); break; }
-            av_frame_unref(frame);
-            // palettegen doesn't emit until after EOF, so no sink drain
-            // here - just push and continue.
-        }
-    }
-
-    // Flush decoder + filter graph so palettegen emits and paletteuse
-    // processes the buffered frames.
-    if (ok) {
-        avcodec_send_packet(dec_ctx, nullptr);
-        while (avcodec_receive_frame(dec_ctx, frame) == 0) {
-            double pts_sec = (frame->best_effort_timestamp == AV_NOPTS_VALUE)
-                                ? -1.0
-                                : (double)frame->best_effort_timestamp * av_q2d(tb);
-            if (pts_sec > end) { av_frame_unref(frame); continue; }
-            if (pts_sec >= 0.0 && pts_sec < start) { av_frame_unref(frame); continue; }
-            (void)av_buffersrc_add_frame(src_ctx, frame);
-            av_frame_unref(frame);
-        }
-        (void)av_buffersrc_add_frame(src_ctx, nullptr);   // signal EOF
-        if (!drain_sink(true)) ok = false;
-        // Flush encoder.
-        if (ok && !write_encoded(nullptr)) ok = false;
-    }
-    av_write_trailer(out_ctx);
-
-    av_frame_free(&filt);
-    av_frame_free(&frame);
-    av_packet_free(&pkt);
-    avcodec_free_context(&enc_ctx);
-    if (!(out_ctx->oformat->flags & AVFMT_NOFILE)) avio_closep(&out_ctx->pb);
-    avformat_free_context(out_ctx);
-    avfilter_graph_free(&graph);
-    avcodec_free_context(&dec_ctx);
-    avformat_close_input(&in_ctx);
     return ok;
 }
 
@@ -2777,7 +2681,9 @@ void VideoPlayer::demuxDecodeThread() {
             // once a frame at or after target reaches display.
             video_skip_to_pts_.store(target);
             int64_t ts = (int64_t)(target * AV_TIME_BASE);
+            open_deadline_.store(SDL_GetTicks() + 5000);
             av_seek_frame(fmt_ctx_, -1, ts, AVSEEK_FLAG_BACKWARD);
+            open_deadline_.store(0);
             // Discard queued packets on BOTH streams, then flush the
             // decoders under their respective ctx mutexes so the
             // decode threads don't race with the flush.
@@ -2912,7 +2818,9 @@ void VideoPlayer::demuxDecodeThread() {
             continue;
         }
 
+        open_deadline_.store(SDL_GetTicks() + 5000);
         int ret = av_read_frame(fmt_ctx_, packet);
+        open_deadline_.store(0);
         if (ret == AVERROR_EOF || ret == AVERROR(EIO)) {
             // Push flush sentinels (null-data packets) to both decode
             // threads so they drain their internal buffers.
@@ -2994,11 +2902,18 @@ void VideoPlayer::videoDecodeThread() {
             }
             src = tmp_sw;
         }
+        // Output dims come from getOutputWidth/Height so hires-downscale
+        // (source > 3840 wide) shrinks the sws_scale target, halving the
+        // per-frame CPU->GPU upload and the sws work in one shot. HDR
+        // frames were intercepted at the top of this lambda and never
+        // reach this path - their own half-res is inside materializeHdrToneMap_.
+        const int out_w = getOutputWidth();
+        const int out_h = getOutputHeight();
         AVFrame* out = av_frame_alloc();
         if (!out) { if (tmp_sw) av_frame_free(&tmp_sw); return nullptr; }
         out->format = AV_PIX_FMT_YUV420P;
-        out->width  = video_width_;
-        out->height = video_height_;
+        out->width  = out_w;
+        out->height = out_h;
         if (av_frame_get_buffer(out, 32) != 0) {
             av_frame_free(&out);
             if (tmp_sw) av_frame_free(&tmp_sw);
@@ -3006,7 +2921,7 @@ void VideoPlayer::videoDecodeThread() {
         }
         sws_ctx_ = sws_getCachedContext(sws_ctx_,
             src->width, src->height, (AVPixelFormat)src->format,
-            video_width_, video_height_, AV_PIX_FMT_YUV420P,
+            out_w, out_h, AV_PIX_FMT_YUV420P,
             SWS_BILINEAR, nullptr, nullptr, nullptr);
         if (!sws_ctx_) {
             av_frame_free(&out);

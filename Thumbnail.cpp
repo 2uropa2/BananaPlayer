@@ -163,7 +163,11 @@ void ThumbnailProvider::workerLoop() {
                     || close_requested_.load()
                     || has_pending_;
             });
-            if (quit_.load()) return;
+            if (quit_.load()) {
+                lk.unlock();
+                closeContextLocked();
+                return;
+            }
             if (reopen_requested_.load()) {
                 pending_path = path_;
                 do_reopen = true;
@@ -201,9 +205,10 @@ void ThumbnailProvider::workerLoop() {
 }
 
 void ThumbnailProvider::openContextLocked(const std::string& path) {
-    // No interrupt callback here - the primary VideoPlayer already
-    // validated the file (thumbnails are only opened AFTER a successful
-    // main-player load). Keeping this path simple.
+    fmt_ctx_ = avformat_alloc_context();
+    if (!fmt_ctx_) return;
+    fmt_ctx_->interrupt_callback = { &ThumbnailProvider::interruptIo, this };
+    io_deadline_ = SDL_GetTicks() + 5000;
     if (avformat_open_input(&fmt_ctx_, path.c_str(), nullptr, nullptr) < 0) {
         fmt_ctx_ = nullptr;
         return;
@@ -248,6 +253,14 @@ void ThumbnailProvider::openContextLocked(const std::string& path) {
     video_time_base_ = fmt_ctx_->streams[video_stream_idx_]->time_base;
     src_w_ = dec_ctx_->width;
     src_h_ = dec_ctx_->height;
+    io_deadline_ = 0;
+}
+
+int ThumbnailProvider::interruptIo(void* opaque) {
+    auto* self = static_cast<ThumbnailProvider*>(opaque);
+    return self->quit_.load() || self->reopen_requested_.load()
+        || self->close_requested_.load()
+        || (self->io_deadline_ && SDL_GetTicks() >= self->io_deadline_);
 }
 
 void ThumbnailProvider::closeContextLocked() {
@@ -277,6 +290,7 @@ void ThumbnailProvider::decodeOne(double target_pts) {
     // BACKWARD flag lands on the previous keyframe so decode can start
     // cleanly. Small alignment error (up to ~2 s) is acceptable for a
     // preview.
+    io_deadline_ = SDL_GetTicks() + 5000;
     if (av_seek_frame(fmt_ctx_, video_stream_idx_, ts, AVSEEK_FLAG_BACKWARD) < 0) {
         return;
     }
@@ -304,6 +318,8 @@ void ThumbnailProvider::decodeOne(double target_pts) {
     }
 
     while (packets_read < MAX_PACKETS) {
+        if (interruptIo(this)) break;
+        io_deadline_ = SDL_GetTicks() + 5000;
         int rr = av_read_frame(fmt_ctx_, pkt);
         if (rr < 0) {
             // EOF or error: flush the decoder to release any buffered

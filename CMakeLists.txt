@@ -55,6 +55,8 @@ set(BP_SOURCES
     SingleInstance.cpp
     Promo.cpp
     License.cpp
+    MediaExport.cpp
+    ExportJob.cpp
 )
 
 # On Windows, compile the .rc so Explorer/taskbar pick up icon + version info.

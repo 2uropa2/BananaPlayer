@@ -100,6 +100,8 @@ private:
     std::atomic<bool> reopen_requested_{false};
     std::atomic<bool> close_requested_{false};
     std::atomic<bool> quit_{false};
+    uint64_t io_deadline_ = 0; // Worker-owned; callback runs on the same worker.
+    static int interruptIo(void* opaque);
 
     // Coalesced work slot. If has_pending_ is true when a request comes
     // in, we overwrite pending_target_ with the newer value so the worker

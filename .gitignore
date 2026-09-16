@@ -55,3 +55,16 @@ UIController_modified.txt
 
 # Runtime output from tools/install_local.ps1 / install_elevated.ps1
 install_last.log
+
+# Claude Code local settings
+.claude/
+
+# Runtime probe / debug logs
+*.log
+player_out.txt
+
+# Probe / benchmark harness output (regenerated on demand)
+test_runs/
+
+# Personal strategy / planning notes (not for repo)
+strategy.html

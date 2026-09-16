@@ -1,3 +1,4 @@
+#include "FileIO.hpp"
 #include "Youtube.hpp"
 
 #include <algorithm>
@@ -12,14 +13,7 @@ namespace {
 
 // Full path of the running BananaPlayer.exe's directory, used to look for a
 // portable yt-dlp.exe dropped next to it.
-std::string appDir() {
-    char buf[MAX_PATH];
-    DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return ".";
-    std::string s(buf, n);
-    size_t p = s.find_last_of("\\/");
-    return (p == std::string::npos) ? "." : s.substr(0, p);
-}
+std::string appDir() { return FileIO::executableDirectory(); }
 
 // Case-insensitive prefix compare.
 bool startsWithI(const std::string& s, const char* prefix) {
@@ -77,7 +71,7 @@ namespace {
 // so DST / timezone shenanigans don't skew the count.
 int fileAgeDays(const std::string& path) {
     WIN32_FILE_ATTRIBUTE_DATA a{};
-    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &a)) return -1;
+    if (!FileIO::attributesEx(path.c_str(), GetFileExInfoStandard, &a)) return -1;
     FILETIME now_ft{};
     GetSystemTimeAsFileTime(&now_ft);
     ULARGE_INTEGER now_i{};   now_i.LowPart = now_ft.dwLowDateTime;
@@ -104,7 +98,7 @@ std::string probeYtDlpVersion(const std::string& yt_dlp_path) {
     if (!CreatePipe(&read_h, &write_h, &sa, 0)) return {};
     SetHandleInformation(read_h, HANDLE_FLAG_INHERIT, 0);
 
-    STARTUPINFOA si{};
+    STARTUPINFOW si{};
     si.cb         = sizeof(si);
     si.dwFlags    = STARTF_USESTDHANDLES;
     si.hStdOutput = write_h;
@@ -113,9 +107,8 @@ std::string probeYtDlpVersion(const std::string& yt_dlp_path) {
 
     PROCESS_INFORMATION pi{};
     std::string cmd = "\"" + yt_dlp_path + "\" --version";
-    std::vector<char> cmd_buf(cmd.begin(), cmd.end());
-    cmd_buf.push_back('\0');
-    BOOL ok = CreateProcessA(nullptr, cmd_buf.data(), nullptr, nullptr, TRUE,
+    std::wstring cmd_buf = FileIO::wide(cmd);
+    BOOL ok = CreateProcessW(FileIO::wide(yt_dlp_path).c_str(), cmd_buf.data(), nullptr, nullptr, TRUE,
                              CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
     CloseHandle(write_h);
     if (!ok) { CloseHandle(read_h); return {}; }
@@ -164,55 +157,16 @@ std::string YoutubeResolver::locateYtDlp() {
     // 1) Portable drop next to BananaPlayer.exe wins - it's what the user
     //    consciously placed there.
     std::string portable = appDir() + "\\yt-dlp.exe";
-    DWORD attrs = GetFileAttributesA(portable.c_str());
+    DWORD attrs = FileIO::attributes(portable.c_str());
     if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
         return portable;
     }
 
-    // 2) PATH lookup via where.exe. Capture stdout through an anonymous
-    //    pipe; the first line is the absolute path we want.
-    HANDLE read_h  = nullptr;
-    HANDLE write_h = nullptr;
-    SECURITY_ATTRIBUTES sa{};
-    sa.nLength        = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-    if (!CreatePipe(&read_h, &write_h, &sa, 0)) return {};
-    // The read end must NOT be inherited - otherwise the child could hold
-    // it open and ReadFile would block after the child exits.
-    SetHandleInformation(read_h, HANDLE_FLAG_INHERIT, 0);
-
-    STARTUPINFOA si{};
-    si.cb         = sizeof(si);
-    si.dwFlags    = STARTF_USESTDHANDLES;
-    si.hStdOutput = write_h;
-    si.hStdError  = write_h;
-    si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
-
-    PROCESS_INFORMATION pi{};
-    char cmd[] = "where.exe yt-dlp.exe";
-    BOOL ok = CreateProcessA(nullptr, cmd, nullptr, nullptr, TRUE,
-                             CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-    CloseHandle(write_h);
-    if (!ok) {
-        CloseHandle(read_h);
-        return {};
-    }
-    // Bounded wait - where.exe is essentially instant, but a hung shell
-    // hook could stall us; cap at 3 s.
-    WaitForSingleObject(pi.hProcess, 3000);
-    DWORD exit_code = 0;
-    GetExitCodeProcess(pi.hProcess, &exit_code);
-    std::string out = readAllFromPipe(read_h);
-    CloseHandle(read_h);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    if (exit_code != 0) return {};
-
-    std::string first = out;
-    size_t nl = first.find_first_of("\r\n");
-    if (nl != std::string::npos) first = first.substr(0, nl);
-    first = trimWs(first);
-    return first;
+    std::wstring found(32768, L'\0');
+    DWORD size = SearchPathW(nullptr, L"yt-dlp.exe", nullptr, (DWORD)found.size(), found.data(), nullptr);
+    if (!size || size >= found.size()) return {};
+    found.resize(size);
+    return FileIO::utf8(found);
 }
 
 uint64_t YoutubeResolver::requestResolve(const std::string& url,
@@ -360,7 +314,7 @@ bool YoutubeResolver::runYtDlp(const std::string& yt_dlp_path,
     SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(err_r, HANDLE_FLAG_INHERIT, 0);
 
-    STARTUPINFOA si{};
+    STARTUPINFOW si{};
     si.cb         = sizeof(si);
     si.dwFlags    = STARTF_USESTDHANDLES;
     si.hStdOutput = out_w;
@@ -382,11 +336,10 @@ bool YoutubeResolver::runYtDlp(const std::string& yt_dlp_path,
         + " \"" + url + "\"";
 
     // CreateProcessA mutates the command buffer - give it a writable copy.
-    std::vector<char> cmd_buf(cmd.begin(), cmd.end());
-    cmd_buf.push_back('\0');
+    std::wstring cmd_buf = FileIO::wide(cmd);
 
     PROCESS_INFORMATION pi{};
-    BOOL ok = CreateProcessA(nullptr, cmd_buf.data(), nullptr, nullptr, TRUE,
+    BOOL ok = CreateProcessW(FileIO::wide(yt_dlp_path).c_str(), cmd_buf.data(), nullptr, nullptr, TRUE,
                              CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
     CloseHandle(out_w);
     CloseHandle(err_w);

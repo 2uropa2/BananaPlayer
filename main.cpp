@@ -131,7 +131,16 @@ void renderOneFrame() {
 
     if (g_app.video_texture && g_app.tex_w > 0 && g_app.tex_h > 0
         && g_app.has_first_frame) {
-        float src_aspect = (float)g_app.tex_w / (float)g_app.tex_h;
+        // src_aspect includes the video stream's SAR (pixel aspect). For
+        // square pixels SAR is 1:1 and this reduces to width/height. For
+        // anamorphic sources (e.g. shortform re-encodes coded 1920x1080 but
+        // tagged 607:1920 to display as portrait) the SAR shrinks or
+        // stretches the effective width so we letterbox to the intended
+        // display aspect instead of the coded 16:9.
+        AVRational sar = player.getVideoSampleAspectRatio();
+        if (sar.num <= 0 || sar.den <= 0) { sar.num = 1; sar.den = 1; }
+        float src_aspect = ((float)g_app.tex_w * (float)sar.num)
+                         / ((float)g_app.tex_h * (float)sar.den);
         int intrinsic_deg = player.getIntrinsicRotation();
         int user_deg = 0;
         switch (ui.getRotation()) {
@@ -203,29 +212,6 @@ bool SDLCALL modalRenderMessageHook(void* userdata, MSG* msg) {
 }   // anonymous namespace
 
 int main(int argc, char* argv[]) {
-    // License key generation mode. Server-side use: takes an email
-    // (after payment) and prints the matching Pro key to stdout so
-    // the delivery pipeline can email it to the buyer. Never runs
-    // any SDL / UI code - pure crypto + print.
-    //   BananaPlayer.exe --gen-license user@example.com
-    for (int i = 1; i < argc - 1; ++i) {
-        if (argv[i] && std::strcmp(argv[i], "--gen-license") == 0) {
-            // Release builds link as WINDOWS subsystem; stdout redirection
-            // from cmd/pwsh is unreliable. Write to a file arg instead:
-            //   BananaPlayer.exe --gen-license user@example.com key.txt
-            // The file receives one line with the key (no trailing LF).
-            const char* email = argv[i + 1];
-            std::string k = License::keyForEmail(email);
-            if (k.empty()) return 2;
-            const char* out_path = (i + 2 < argc) ? argv[i + 2] : nullptr;
-            if (!out_path) return 3;
-            std::FILE* f = std::fopen(out_path, "wb");
-            if (!f) return 4;
-            std::fwrite(k.data(), 1, k.size(), f);
-            std::fclose(f);
-            return 0;
-        }
-    }
     // Smoke-test flag. Used by CI + local `install_local.ps1` follow-ups
     // to verify the built exe can actually get through SDL init, window
     // creation, ImGui bootstrap, font atlas load, UIController ctor

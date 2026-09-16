@@ -1,3 +1,4 @@
+#include "FileIO.hpp"
 #include "Promo.hpp"
 
 #include <atomic>
@@ -113,7 +114,7 @@ bool isExpired(const std::string& iso_date) {
 // -------- Cache I/O --------
 
 bool loadCache(Banner& out) {
-    std::FILE* f = std::fopen(g_cache_path.c_str(), "rb");
+    std::FILE* f = FileIO::open(g_cache_path.c_str(), "rb");
     if (!f) return false;
     std::fseek(f, 0, SEEK_END);
     long sz = std::ftell(f);
@@ -132,14 +133,13 @@ bool loadCache(Banner& out) {
 
 void saveCache(const std::string& body) {
     std::string tmp = g_cache_path + ".tmp";
-    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    std::FILE* f = FileIO::open(tmp.c_str(), "wb");
     if (!f) return;
     std::fwrite(body.data(), 1, body.size(), f);
     std::fflush(f);
     std::fclose(f);
 #ifdef _WIN32
-    MoveFileExA(tmp.c_str(), g_cache_path.c_str(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    FileIO::replace(tmp, g_cache_path);
 #else
     std::rename(tmp.c_str(), g_cache_path.c_str());
 #endif

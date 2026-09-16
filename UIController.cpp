@@ -1,3 +1,4 @@
+#include "FileIO.hpp"
 #include "UIController.hpp"
 #include "License.hpp"
 #include "Promo.hpp"
@@ -47,20 +48,19 @@ namespace {
 template <class Writer>
 bool writeSidecarAtomic(const std::string& path, Writer writer) {
     std::string tmp = path + ".tmp";
-    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    std::FILE* f = FileIO::open(tmp.c_str(), "wb");
     if (!f) return false;
     writer(f);
     std::fflush(f);
     std::fclose(f);
 #ifdef _WIN32
-    if (!MoveFileExA(tmp.c_str(), path.c_str(),
-                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        DeleteFileA(tmp.c_str());
+    if (!FileIO::replace(tmp, path)) {
+        FileIO::remove(tmp.c_str());
         return false;
     }
 #else
     if (std::rename(tmp.c_str(), path.c_str()) != 0) {
-        std::remove(tmp.c_str());
+        FileIO::remove(tmp.c_str());
         return false;
     }
 #endif
@@ -86,14 +86,7 @@ std::string formatTime(double seconds) {
     return buf;
 }
 
-std::string appDir() {
-    char buf[MAX_PATH];
-    DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return ".";
-    std::string s(buf, n);
-    size_t p = s.find_last_of("\\/");
-    return (p == std::string::npos) ? "." : s.substr(0, p);
-}
+std::string appDir() { return FileIO::executableDirectory(); }
 
 // Writable-for-sure sidecar location. When Banana Player is installed
 // under C:\Program Files\..., appDir() is admin-only and fopen("wb") on
@@ -148,19 +141,19 @@ static void migrateSidecarsToDataDir() {
         for (const char* nm : names) {
             std::string src = src_base + nm;
             std::string dst = dst_base + nm;
-            if (GetFileAttributesA(dst.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
-            if (GetFileAttributesA(src.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
-            CopyFileA(src.c_str(), dst.c_str(), TRUE);
+            if (FileIO::attributes(dst.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+            if (FileIO::attributes(src.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+            FileIO::copy(src.c_str(), dst.c_str(), TRUE);
         }
     }
 
     // Pass 2: legacy %APPDATA%\Vela\vela.* -> %APPDATA%\BananaPlayer\banana.*
     // (Vela-era users upgrading in place).
     {
-        const char* appdata = std::getenv("APPDATA");
-        if (!appdata) return;
+        const std::string appdata = FileIO::environment("APPDATA");
+        if (appdata.empty()) return;
         std::string legacy_dir = std::string(appdata) + "\\Vela\\";
-        if (GetFileAttributesA(legacy_dir.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+        if (FileIO::attributes(legacy_dir.c_str()) == INVALID_FILE_ATTRIBUTES) return;
         const char* legacy_names[] = {
             "vela.config", "vela.resume", "vela.bookmarks",
             "vela.recent", "vela.session.m3u",
@@ -169,17 +162,17 @@ static void migrateSidecarsToDataDir() {
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
             std::string src = legacy_dir + legacy_names[i];
             std::string dst = dst_base + names[i];
-            if (GetFileAttributesA(dst.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
-            if (GetFileAttributesA(src.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
-            CopyFileA(src.c_str(), dst.c_str(), TRUE);
+            if (FileIO::attributes(dst.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+            if (FileIO::attributes(src.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+            FileIO::copy(src.c_str(), dst.c_str(), TRUE);
         }
         // Legacy window geometry uses the same filename in both eras.
         {
             std::string src = legacy_dir + "vela.window";
             std::string dst = dst_base + "banana.window";
-            if (GetFileAttributesA(dst.c_str()) == INVALID_FILE_ATTRIBUTES &&
-                GetFileAttributesA(src.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                CopyFileA(src.c_str(), dst.c_str(), TRUE);
+            if (FileIO::attributes(dst.c_str()) == INVALID_FILE_ATTRIBUTES &&
+                FileIO::attributes(src.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                FileIO::copy(src.c_str(), dst.c_str(), TRUE);
             }
         }
     }
@@ -206,24 +199,11 @@ std::string bookmarkIndexPath() { return dataDir() + "banana.bookmarks"; }
 std::string statsIndexPath()    { return dataDir() + "banana.stats"; }
 
 std::string openFileDialogWin() {
-    OPENFILENAMEA ofn = {};
-    char szFile[MAX_PATH] = {0};
-    ofn.lStructSize = sizeof(ofn);
-    ofn.lpstrFile = szFile;
-    ofn.nMaxFile = sizeof(szFile);
-    ofn.lpstrFilter =
-        "Media Files\0"
-        "*.mp4;*.mkv;*.avi;*.mov;*.webm;*.wmv;*.flv;*.m4v;*.mpg;*.mpeg;*.ts;*.3gp;"
-        "*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.tif;*.tiff;"
-        "*.m4a;*.mp3;*.flac;*.wav;*.aac;*.opus;*.ogg\0"
-        "Video Files\0*.mp4;*.mkv;*.avi;*.mov;*.webm;*.wmv;*.flv;*.m4v;*.mpg;*.mpeg;*.ts;*.3gp\0"
-        "Audio Files\0*.m4a;*.mp3;*.flac;*.wav;*.aac;*.opus;*.ogg\0"
-        "Image Files\0*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.tif;*.tiff\0"
-        "All Files\0*.*\0";
-    ofn.nFilterIndex = 1;
-    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
-    if (GetOpenFileNameA(&ofn)) return std::string(szFile);
-    return {};
+    return FileIO::chooseFile(L"Open media",
+        L"Media Files\0*.mp4;*.mkv;*.avi;*.mov;*.webm;*.wmv;*.flv;*.m4v;*.mpg;*.mpeg;*.ts;*.3gp;*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.tif;*.tiff;*.m4a;*.mp3;*.flac;*.wav;*.aac;*.opus;*.ogg\0"
+        L"Video Files\0*.mp4;*.mkv;*.avi;*.mov;*.webm;*.wmv;*.flv;*.m4v;*.mpg;*.mpeg;*.ts;*.3gp\0"
+        L"Audio Files\0*.m4a;*.mp3;*.flac;*.wav;*.aac;*.opus;*.ogg\0"
+        L"Image Files\0*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.tif;*.tiff\0All Files\0*.*\0");
 }
 
 // Map iso639-2/3 language codes (and a couple of iso639-1 two-letter
@@ -333,7 +313,7 @@ void UIController::shutdownBeforeSdl() {
 
 void UIController::loadResumeIndex() {
     resume_index_.clear();
-    std::FILE* f = std::fopen(resumeIndexPath().c_str(), "rb");
+    std::FILE* f = FileIO::open(resumeIndexPath().c_str(), "rb");
     if (!f) return;
     char buf[4096];
     while (std::fgets(buf, sizeof(buf), f)) {
@@ -397,7 +377,7 @@ void UIController::clearResume(const std::string& path) {
 
 void UIController::loadBookmarkIndex() {
     bookmark_index_.clear();
-    std::FILE* f = std::fopen(bookmarkIndexPath().c_str(), "rb");
+    std::FILE* f = FileIO::open(bookmarkIndexPath().c_str(), "rb");
     if (!f) return;
     // Line format:  t1,t2,t3\t<path>
     // Times are decimal seconds ascending.
@@ -519,7 +499,7 @@ void UIController::clearBookmarks() {
 
 void UIController::loadStatsIndex() {
     stats_.clear();
-    std::FILE* f = std::fopen(statsIndexPath().c_str(), "rb");
+    std::FILE* f = FileIO::open(statsIndexPath().c_str(), "rb");
     if (!f) return;
     char buf[8192];
     while (std::fgets(buf, sizeof(buf), f)) {
@@ -838,7 +818,7 @@ void UIController::enqueuePaths(const std::vector<std::string>& paths, bool play
     std::vector<std::string> expanded;
     expanded.reserve(paths.size());
     for (const auto& p : paths) {
-        DWORD attrs = GetFileAttributesA(p.c_str());
+        DWORD attrs = FileIO::attributes(p.c_str());
         if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
             auto found = scanFolderVideosBySize(p);
             expanded.insert(expanded.end(), found.begin(), found.end());
@@ -987,7 +967,7 @@ void UIController::openAny(const std::string& path) {
     // CLI folder arg. Without this branch a forwarded folder from
     // single-instance IPC would fall into loadPath which fails on a
     // directory, and the user's drag would silently no-op.
-    DWORD attrs = GetFileAttributesA(path.c_str());
+    DWORD attrs = FileIO::attributes(path.c_str());
     if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
         auto found = scanFolderVideosBySize(path);
         if (found.empty()) {
@@ -1044,6 +1024,43 @@ void UIController::nudgeVisible() {
     }
 }
 
+// Shared writer used by both takeSnapshot (auto-path / burst) and
+// takeSnapshotAskPath (Save As dialog). Honors the "include overlays"
+// setting: on = read the composited back buffer, off = read the raw
+// last decoded frame. Returns true on successful write.
+static bool writeSnapshotToPath_(const std::string& full,
+                                 VideoPlayer* player,
+                                 SDL_Renderer* renderer,
+                                 bool include_overlays) {
+    if (include_overlays && renderer) {
+        SDL_Surface* surf = SDL_RenderReadPixels(renderer, nullptr);
+        if (!surf) return false;
+        int avfmt = AV_PIX_FMT_RGBA;
+        const SDL_PixelFormatDetails* d = SDL_GetPixelFormatDetails(surf->format);
+        if (d) {
+            switch (surf->format) {
+                case SDL_PIXELFORMAT_RGBA32:  avfmt = AV_PIX_FMT_RGBA; break;
+                case SDL_PIXELFORMAT_BGRA32:  avfmt = AV_PIX_FMT_BGRA; break;
+                case SDL_PIXELFORMAT_ARGB32:  avfmt = AV_PIX_FMT_ARGB; break;
+                case SDL_PIXELFORMAT_ABGR32:  avfmt = AV_PIX_FMT_ABGR; break;
+                case SDL_PIXELFORMAT_XRGB8888:avfmt = AV_PIX_FMT_0RGB; break;
+                case SDL_PIXELFORMAT_XBGR8888:avfmt = AV_PIX_FMT_0BGR; break;
+                case SDL_PIXELFORMAT_RGBX8888:avfmt = AV_PIX_FMT_RGB0; break;
+                case SDL_PIXELFORMAT_BGRX8888:avfmt = AV_PIX_FMT_BGR0; break;
+                case SDL_PIXELFORMAT_RGB24:   avfmt = AV_PIX_FMT_RGB24; break;
+                case SDL_PIXELFORMAT_BGR24:   avfmt = AV_PIX_FMT_BGR24; break;
+                default:                      avfmt = AV_PIX_FMT_RGBA; break;
+            }
+        }
+        bool ok = VideoPlayer::snapshotFromBytes(full, surf->w, surf->h,
+                                                 avfmt, surf->pitch,
+                                                 (const uint8_t*)surf->pixels);
+        SDL_DestroySurface(surf);
+        return ok;
+    }
+    return player->snapshot(full);
+}
+
 void UIController::takeSnapshot() {
     if (!player_->isLoaded()) return;
     // Audio-only files have no frame to snapshot. Silently no-op instead
@@ -1063,42 +1080,8 @@ void UIController::takeSnapshot() {
     }
     std::string name = std::string("snapshot_") + timestampString() + ".png";
     std::string full = dir + "\\" + name;
-    bool ok = false;
-    if (snapshot_include_overlays_ && renderer_) {
-        // Screen capture route: reads the composited SDL back buffer so
-        // subtitles + OSD + any visible HUD ride along. Wait for HUD to
-        // fade (3 s idle) before triggering if a "video + subs only"
-        // capture is what you're after.
-        SDL_Surface* surf = SDL_RenderReadPixels(renderer_, nullptr);
-        if (surf) {
-            // SDL3 usually returns RGBA/BGRA at 32 bpp with pitch aligned;
-            // hand the bytes off to the FFmpeg encoder verbatim - it does
-            // its own sws conversion to RGB24 for PNG.
-            int avfmt = AV_PIX_FMT_RGBA;
-            const SDL_PixelFormatDetails* d = SDL_GetPixelFormatDetails(surf->format);
-            if (d) {
-                switch (surf->format) {
-                    case SDL_PIXELFORMAT_RGBA32:  avfmt = AV_PIX_FMT_RGBA; break;
-                    case SDL_PIXELFORMAT_BGRA32:  avfmt = AV_PIX_FMT_BGRA; break;
-                    case SDL_PIXELFORMAT_ARGB32:  avfmt = AV_PIX_FMT_ARGB; break;
-                    case SDL_PIXELFORMAT_ABGR32:  avfmt = AV_PIX_FMT_ABGR; break;
-                    case SDL_PIXELFORMAT_XRGB8888:avfmt = AV_PIX_FMT_0RGB; break;
-                    case SDL_PIXELFORMAT_XBGR8888:avfmt = AV_PIX_FMT_0BGR; break;
-                    case SDL_PIXELFORMAT_RGBX8888:avfmt = AV_PIX_FMT_RGB0; break;
-                    case SDL_PIXELFORMAT_BGRX8888:avfmt = AV_PIX_FMT_BGR0; break;
-                    case SDL_PIXELFORMAT_RGB24:   avfmt = AV_PIX_FMT_RGB24; break;
-                    case SDL_PIXELFORMAT_BGR24:   avfmt = AV_PIX_FMT_BGR24; break;
-                    default:                      avfmt = AV_PIX_FMT_RGBA; break;
-                }
-            }
-            ok = VideoPlayer::snapshotFromBytes(full, surf->w, surf->h,
-                                                avfmt, surf->pitch,
-                                                (const uint8_t*)surf->pixels);
-            SDL_DestroySurface(surf);
-        }
-    } else {
-        ok = player_->snapshot(full);
-    }
+    bool ok = writeSnapshotToPath_(full, player_, renderer_,
+                                   snapshot_include_overlays_);
     if (ok) {
         snapshot_flash_ = 1.0f;
         // Suppress the per-file "Saved <path>" OSD while a burst is in
@@ -1107,6 +1090,37 @@ void UIController::takeSnapshot() {
         if (burst_remaining_ == 0) {
             showOsd(std::string("Saved  ") + name);
         }
+    } else {
+        showOsd("Snapshot failed");
+    }
+}
+
+void UIController::takeSnapshotAskPath() {
+    if (!player_->isLoaded()) return;
+    if (player_->isAudioOnly()) {
+        showOsd("No video to snapshot");
+        return;
+    }
+    // Suggest snapshot_dir_ (or dataDir) as the initial folder and a
+    // timestamp-based filename so the user can just hit Enter for the
+    // usual auto-named file at a location they pick.
+    std::string dir = snapshot_dir_.empty() ? dataDir() : snapshot_dir_;
+    while (!dir.empty() && (dir.back() == '\\' || dir.back() == '/')) {
+        dir.pop_back();
+    }
+    std::string default_name = std::string("snapshot_") + timestampString() + ".png";
+
+    const std::string full = FileIO::chooseFile(L"Save snapshot",
+        L"PNG Image\0*.png\0All Files\0*.*\0", true, default_name, dir, L"png");
+    if (full.empty()) return;
+    bool ok = writeSnapshotToPath_(full, player_, renderer_,
+                                   snapshot_include_overlays_);
+    if (ok) {
+        snapshot_flash_ = 1.0f;
+        // Show just the basename in the OSD - full absolute paths on
+        // deep folders would blow past the toast width.
+        std::string leaf = baseName(full.c_str());
+        showOsd(std::string("Saved  ") + leaf);
     } else {
         showOsd("Snapshot failed");
     }
@@ -1258,7 +1272,7 @@ void UIController::pasteAndPlay() {
 
     // Not a URL - assume file / folder path. Folders expand into the
     // playlist the same way drag-drop of a folder does.
-    DWORD attrs = GetFileAttributesA(picked.c_str());
+    DWORD attrs = FileIO::attributes(picked.c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES) {
         // Might be a bare path without scheme that FFmpeg can still open
         // (e.g. a UNC path). Try loadPath anyway; it will OSD "Cannot open"
@@ -1311,7 +1325,7 @@ void UIController::revealInExplorer(const std::string& path) {
     // /select,"<path>" opens the containing folder with the file highlighted.
     // Quote the path so folder names with spaces survive the command line.
     std::string args = "/select,\"" + path + "\"";
-    HINSTANCE h = ShellExecuteA(nullptr, "open", "explorer.exe",
+    HINSTANCE h = FileIO::shell(nullptr, "open", "explorer.exe",
                                 args.c_str(), nullptr, SW_SHOWNORMAL);
     // ShellExecute returns a value > 32 on success. Anything <= 32 is an
     // error code (per Microsoft docs).
@@ -1464,18 +1478,9 @@ void UIController::openSubtitleDialog() {
         showOsd("No video loaded");
         return;
     }
-    OPENFILENAMEA ofn = {};
-    char szFile[MAX_PATH] = {0};
-    ofn.lStructSize = sizeof(ofn);
-    ofn.lpstrFile = szFile;
-    ofn.nMaxFile = sizeof(szFile);
-    ofn.lpstrFilter =
-        "Subtitle Files (*.srt;*.smi)\0*.srt;*.smi\0"
-        "All Files (*.*)\0*.*\0";
-    ofn.nFilterIndex = 1;
-    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
-    if (!GetOpenFileNameA(&ofn)) return;   // user cancelled
-    std::string picked(szFile);
+    const std::string picked = FileIO::chooseFile(L"Open subtitles",
+        L"Subtitle Files (*.srt;*.smi)\0*.srt;*.smi\0All Files (*.*)\0*.*\0");
+    if (picked.empty()) return;
     if (loadSubtitleSidecar(picked)) {
         showOsd("Subtitle loaded");
     } else {
@@ -1626,7 +1631,7 @@ void UIController::lookupCurrentSubtitleInBrowser() {
     // URL doesn't break on multi-line cues.
     for (char& c : text) if (c == '\n' || c == '\r') c = ' ';
     std::string url = "https://www.google.com/search?q=" + urlEncode(text);
-    ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    FileIO::shell(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     showOsd("Opening browser lookup", 1.4f);
 }
 
@@ -1636,7 +1641,7 @@ void UIController::lookupCurrentSubtitleInBrowser() {
 // Files smaller than 128 KB return 0 (the algorithm requires 64 KB at
 // each end).
 static uint64_t openSubtitlesHash(const std::string& path) {
-    std::FILE* f = std::fopen(path.c_str(), "rb");
+    std::FILE* f = FileIO::open(path.c_str(), "rb");
     if (!f) return 0;
     if (std::fseek(f, 0, SEEK_END) != 0) { std::fclose(f); return 0; }
     long size_l = std::ftell(f);
@@ -1685,7 +1690,7 @@ void UIController::searchSubtitlesOnline() {
         url += "&MovieHash=";
         url += hash_hex;
     }
-    ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    FileIO::shell(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     if (hash_hex[0]) {
         showOsd("Opened OpenSubtitles (hash matched)", 2.0f);
     } else {
@@ -1694,6 +1699,7 @@ void UIController::searchSubtitlesOnline() {
 }
 
 void UIController::exportABSegmentAsGif() {
+    if (export_job_.running()) { showOsd("An export is already running"); return; }
     if (!player_->isLoaded()) { showOsd("No video loaded"); return; }
     if (loop_a_ < 0.0 || loop_b_ < 0.0) {
         showOsd("Set A and B first (press A twice)", 2.0f); return;
@@ -1719,39 +1725,19 @@ void UIController::exportABSegmentAsGif() {
                   (int)std::lround(loop_a_),
                   (int)std::lround(loop_b_));
 
-    OPENFILENAMEA ofn = {};
-    char out_path[MAX_PATH];
-    std::strncpy(out_path, suggest, sizeof(out_path) - 1);
-    out_path[sizeof(out_path) - 1] = '\0';
-    ofn.lStructSize = sizeof(ofn);
-    ofn.lpstrFile   = out_path;
-    ofn.nMaxFile    = sizeof(out_path);
-    ofn.lpstrFilter = "Animated GIF (*.gif)\0*.gif\0All Files (*.*)\0*.*\0";
-    ofn.nFilterIndex = 1;
-    ofn.lpstrDefExt = "gif";
-    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT
-              | OFN_NOCHANGEDIR | OFN_EXPLORER;
-    ofn.lpstrTitle = "Save A-B segment as GIF...";
-    if (!GetSaveFileNameA(&ofn)) return;
+    const std::string out_path = FileIO::chooseFile(L"Save A-B segment as GIF",
+        L"Output files\0*.gif\0All Files\0*.*\0", true, suggest);
+    if (out_path.empty()) return;
 
-    showOsd("Exporting GIF...", 3.0f);
-    // Palettegen + paletteuse is slow enough that a UI freeze is
-    // noticeable; the OSD above at least warns the user. 15 fps and
-    // 480 px width are the standard reddit-clip defaults - readable,
-    // reasonable file size, doesn't scare the browser upload dialog.
-    bool ok = VideoPlayer::exportSegmentAsGif(src, out_path,
-                                              loop_a_, loop_b_,
-                                              /*fps=*/15, /*width=*/480);
-    if (ok) {
-        char msg[MAX_PATH + 32];
-        std::snprintf(msg, sizeof(msg), "GIF saved  %s", baseName(out_path));
-        showOsd(msg, 2.6f);
+    if (export_job_.start(src, out_path, loop_a_, loop_b_, true)) {
+        showOsd("Export started", 1.5f);
     } else {
-        showOsd("GIF export failed", 2.4f);
+        showOsd("Could not start export", 2.4f);
     }
 }
 
 void UIController::exportABSegmentToFile() {
+    if (export_job_.running()) { showOsd("An export is already running"); return; }
     if (!player_->isLoaded()) { showOsd("No video loaded"); return; }
     if (loop_a_ < 0.0 || loop_b_ < 0.0) {
         showOsd("Set A and B first (press A twice)", 2.0f);
@@ -1778,60 +1764,23 @@ void UIController::exportABSegmentToFile() {
                   (int)std::lround(loop_b_),
                   ext.c_str());
 
-    OPENFILENAMEA ofn = {};
-    char out_path[MAX_PATH];
-    std::strncpy(out_path, suggest, sizeof(out_path) - 1);
-    out_path[sizeof(out_path) - 1] = '\0';
-    ofn.lStructSize = sizeof(ofn);
-    ofn.lpstrFile   = out_path;
-    ofn.nMaxFile    = sizeof(out_path);
-    ofn.lpstrFilter =
-        "Video (*.mp4;*.mkv;*.mov)\0*.mp4;*.mkv;*.mov\0"
-        "All Files (*.*)\0*.*\0";
-    ofn.nFilterIndex = 1;
-    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT
-              | OFN_NOCHANGEDIR | OFN_EXPLORER;
-    ofn.lpstrTitle = "Save A-B segment as...";
-    if (!GetSaveFileNameA(&ofn)) return;   // user cancelled
+    const std::string out_path = FileIO::chooseFile(L"Save A-B segment",
+        L"Output files\0*.mp4;*.mkv;*.mov\0All Files\0*.*\0", true, suggest);
+    if (out_path.empty()) return;
 
-    showOsd("Exporting A-B segment...", 3.0f);
-    // Synchronous - typical stream copy is fast (100 MB/s+ on SSD) so
-    // this stalls the UI for a second or two on ordinary clips. Users
-    // see the "Exporting..." OSD until the OK/fail toast replaces it.
-    bool ok = VideoPlayer::exportSegment(src, out_path, loop_a_, loop_b_);
-    if (ok) {
-        char msg[MAX_PATH + 32];
-        std::snprintf(msg, sizeof(msg), "Saved  %s", baseName(out_path));
-        showOsd(msg, 2.6f);
+    if (export_job_.start(src, out_path, loop_a_, loop_b_, false)) {
+        showOsd("Export started", 1.5f);
     } else {
-        showOsd("Export failed", 2.4f);
+        showOsd("Could not start export", 2.4f);
     }
 }
 
 void UIController::openSnapshotFolderDialog() {
-    // Classic SHBrowseForFolder - modern IFileOpenDialog is nicer but
-    // needs full COM plumbing. This dialog is used once in a blue moon,
-    // so keep it lean.
-    BROWSEINFOA bi{};
-    bi.hwndOwner = nullptr;
-    bi.lpszTitle = "Choose the folder Banana Player snapshots should land in";
-    bi.ulFlags   = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-    LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
-    if (!pidl) return;   // user cancelled
-    char picked[MAX_PATH]{};
-    if (SHGetPathFromIDListA(pidl, picked)) {
-        DWORD attrs = GetFileAttributesA(picked);
-        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-            snapshot_dir_ = picked;
-            char msg[MAX_PATH + 32];
-            std::snprintf(msg, sizeof(msg), "Snapshots -> %s", picked);
-            showOsd(msg, 2.4f);
-            markConfigDirty();
-        } else {
-            showOsd("Selected path is not a directory", 2.0f);
-        }
-    }
-    CoTaskMemFree(pidl);
+    const auto picked = FileIO::chooseFolder(L"Choose snapshot folder");
+    if (picked.empty()) return;
+    snapshot_dir_ = picked;
+    showOsd("Snapshot folder updated", 2.4f);
+    markConfigDirty();
 }
 
 void UIController::openSubtitleSearch() {
@@ -2020,8 +1969,12 @@ void UIController::togglePipMode() {
             int total = ((player_->getIntrinsicRotation()
                           + ((int)rotation_ * 90)) % 360 + 360) % 360;
             bool rot90 = (total == 90 || total == 270);
-            int ew = rot90 ? vh : vw;
-            int eh = rot90 ? vw : vh;
+            AVRational sar = player_->getVideoSampleAspectRatio();
+            if (sar.num <= 0 || sar.den <= 0) { sar.num = 1; sar.den = 1; }
+            int dw = (int)std::lround((double)vw * (double)sar.num / (double)sar.den);
+            if (dw < 1) dw = 1;
+            int ew = rot90 ? vh : dw;
+            int eh = rot90 ? dw : vh;
             const int kPipTargetLong = 480;
             if (ew >= eh) {
                 target_w = kPipTargetLong;
@@ -2174,7 +2127,7 @@ void UIController::drawFirstRunHint(int W, int H) {
         "Drop any video / image onto the window to play it",
         "Right-click on the picture for the full menu",
         "Click the gear icon (or Ctrl+,) to open Settings",
-        "F1 or ?  to see every keyboard shortcut",
+        "?  to see every keyboard shortcut  (Tab = quick file info)",
     };
     for (const char* t : tips) {
         dl->AddText(font, 13.5f, ImVec2(x + pad, hy),
@@ -2249,7 +2202,7 @@ void UIController::drawShortcutsPanel(int W, int H) {
         }},
         { "Seek", {
             { "Left  /  Right",  "Back / forward 5 s" },
-            { "PgUp  /  PgDn",   "Back / forward 30 s" },
+            { "Shift + Left/Right", "Back / forward 30 s" },
             { "Mouse X1 / X2",   "Back / forward 5 s (side buttons)" },
             { "Home  /  End",    "Jump to start / near end" },
             { "Ctrl + Home / End","Also jump to start / near end" },
@@ -2287,15 +2240,15 @@ void UIController::drawShortcutsPanel(int W, int H) {
             { "F4 / Backspace",  "Close current file, back to splash" },
             { "F5",              "Reload current file" },
             { "Ctrl + Q",        "Quit" },
-            { "Ctrl + S",        "Snapshot (PNG next to the app)" },
-            { "Ctrl + Shift + S","Snapshot to clipboard" },
+            { "Ctrl + S",        "Save snapshot as... (prompts for path)" },
+            { "Ctrl + C  /  Ctrl + Shift + S", "Copy snapshot to clipboard" },
             { "0 - 9",           "Jump to 0 - 90 % of the file" },
             { "Delete",          "Remove item from playlist (panel open)" },
             { "Drop .srt / .smi","Load subtitles for current video" },
             { "Right-click",     "Context menu" },
             { "Wheel over seekbar","Seek +/- 5 s" },
-            { "N  /  Ctrl + N",  "Next in playlist" },
-            { "Ctrl + B",        "Previous in playlist" },
+            { "N  /  Ctrl + N  /  PgDn", "Next in playlist" },
+            { "Ctrl + B  /  PgUp",       "Previous in playlist" },
             { "P",               "Toggle playlist panel" },
             { "L",               "Cycle repeat: Off / One / All" },
             { "H",               "Shuffle" },
@@ -2315,8 +2268,9 @@ void UIController::drawShortcutsPanel(int W, int H) {
             { "Shift + P",       "Picture-in-picture toggle" },
             { "Ctrl + ,",        "Settings dialog" },
             { "Ctrl + H",        "Playback history" },
-            { "I",               "Media info panel" },
-            { "?  /  F1",        "Show this panel" },
+            { "Tab",             "Quick info overlay (top-left)" },
+            { "I  /  F1",        "Detailed media info panel" },
+            { "?",               "Show this panel" },
         }},
     };
 
@@ -2489,7 +2443,7 @@ void UIController::drawAboutPanel(int W, int H) {
                                      license_email_buf_,
                                      sizeof(license_email_buf_));
             ImGui::SetNextItemWidth(-1.0f);
-            ImGui::InputTextWithHint("##lic_key", "V4-XXXX-XXXX-XXXX",
+            ImGui::InputTextWithHint("##lic_key", "Paste your V5 license key",
                                      license_key_buf_,
                                      sizeof(license_key_buf_));
             if (ImGui::Button("Verify", ImVec2(90.0f, 0.0f))) {
@@ -2627,6 +2581,7 @@ void UIController::drawInfoPanel(int W, int H) {
                           ImGuiWindowFlags_HorizontalScrollbar);
 
         const std::string& path = player_->getFilename();
+        VideoPlayer::MediaDetail md = player_->getMediaDetail();
 
         // ---- FILE ----
         section("FILE");
@@ -2653,7 +2608,7 @@ void UIController::drawInfoPanel(int W, int H) {
         // fine, the row just shows "-".
         std::string size_str = "-";
         WIN32_FILE_ATTRIBUTE_DATA fad{};
-        if (GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fad)) {
+        if (FileIO::attributesEx(path.c_str(), GetFileExInfoStandard, &fad)) {
             uint64_t bytes = ((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
             char sbuf[64];
             if (bytes >= (1ULL << 30))
@@ -2731,13 +2686,48 @@ void UIController::drawInfoPanel(int W, int H) {
             std::snprintf(bbuf, sizeof(bbuf), "-");
         row("Bit rate", bbuf);
 
+        // ---- CONTAINER ----
+        section("CONTAINER");
+        {
+            std::string cshort = md.container_short.empty() ? std::string("-") : md.container_short;
+            if (!md.container_long.empty()) cshort += "  (" + md.container_long + ")";
+            row("Format", cshort);
+            char sb[64];
+            std::snprintf(sb, sizeof(sb), "%d", md.num_streams);
+            row("Streams", sb);
+            if (md.num_programs > 0) {
+                std::snprintf(sb, sizeof(sb), "%d", md.num_programs);
+                row("Programs", sb);
+            }
+            if (md.num_attachments > 0) {
+                std::snprintf(sb, sizeof(sb), "%d", md.num_attachments);
+                row("Attachments", sb);
+            }
+        }
+
         // ---- VIDEO ----
         // Skipped for audio-only files (.m4a / .mp3 / voice memos) - every
         // row below reads from the video stream and would show all-dashes.
         if (player_->hasVideo()) {
             section("VIDEO");
-            const char* vc = player_->getVideoCodecName();
-            row("Codec", (vc && *vc) ? std::string(vc) : std::string("-"));
+            std::string codec_line = md.video_codec_short.empty()
+                                   ? std::string("-") : md.video_codec_short;
+            if (!md.video_codec_long.empty())
+                codec_line += "  (" + md.video_codec_long + ")";
+            row("Codec", codec_line);
+
+            if (!md.video_profile.empty() || md.video_level > 0) {
+                char pbuf[96];
+                if (md.video_level > 0) {
+                    std::snprintf(pbuf, sizeof(pbuf), "%s%sL%.1f",
+                                  md.video_profile.empty() ? "" : md.video_profile.c_str(),
+                                  md.video_profile.empty() ? "" : "  ",
+                                  md.video_level / 10.0);
+                } else {
+                    std::snprintf(pbuf, sizeof(pbuf), "%s", md.video_profile.c_str());
+                }
+                row("Profile", pbuf);
+            }
 
             char resbuf[96];
             int vw = player_->getVideoWidth();
@@ -2753,11 +2743,91 @@ void UIController::drawInfoPanel(int W, int H) {
             }
             row("Resolution", resbuf);
 
-            double fps = player_->getVideoFrameRate();
-            char fbuf[48];
-            if (fps > 0.0) std::snprintf(fbuf, sizeof(fbuf), "%.3f fps", fps);
-            else           std::snprintf(fbuf, sizeof(fbuf), "-");
+            // Display / sample aspect from container metadata (can differ
+            // from the pixel aspect above on anamorphic content).
+            if (md.video_sar.num > 0 && md.video_sar.den > 0
+                && (md.video_sar.num != 1 || md.video_sar.den != 1)) {
+                char sarbuf[64];
+                std::snprintf(sarbuf, sizeof(sarbuf), "%d:%d",
+                              md.video_sar.num, md.video_sar.den);
+                row("Pixel aspect", sarbuf);
+            }
+            if (md.video_dar.num > 0 && md.video_dar.den > 0) {
+                char darbuf[64];
+                std::snprintf(darbuf, sizeof(darbuf), "%d:%d",
+                              md.video_dar.num, md.video_dar.den);
+                row("Display aspect", darbuf);
+            }
+
+            double fps = md.video_fps > 0.0 ? md.video_fps : md.video_avg_fps;
+            char fbuf[96];
+            if (fps > 0.0) {
+                if (md.video_avg_fps > 0.0
+                    && std::fabs(md.video_avg_fps - fps) > 0.01) {
+                    std::snprintf(fbuf, sizeof(fbuf), "%.3f fps  (avg %.3f)",
+                                  fps, md.video_avg_fps);
+                } else {
+                    std::snprintf(fbuf, sizeof(fbuf), "%.3f fps", fps);
+                }
+            } else {
+                std::snprintf(fbuf, sizeof(fbuf), "-");
+            }
             row("Frame rate", fbuf);
+
+            if (md.video_nb_frames > 0) {
+                char nfbuf[48];
+                std::snprintf(nfbuf, sizeof(nfbuf), "%lld",
+                              (long long)md.video_nb_frames);
+                row("Frames", nfbuf);
+            }
+
+            if (md.keyframe_interval_sec > 0.0) {
+                char kbuf[96];
+                std::snprintf(kbuf, sizeof(kbuf),
+                              "%.2f s  (avg over %d keyframes)",
+                              md.keyframe_interval_sec, md.keyframe_count);
+                row("Keyframe interval", kbuf);
+            } else {
+                row_disabled("Keyframe interval", "index unavailable");
+            }
+
+            if (md.video_bitrate > 0) {
+                char vbuf[64];
+                if (md.video_bitrate >= 1000000)
+                    std::snprintf(vbuf, sizeof(vbuf), "%.2f Mbps",
+                                  md.video_bitrate / 1000000.0);
+                else
+                    std::snprintf(vbuf, sizeof(vbuf), "%.0f kbps",
+                                  md.video_bitrate / 1000.0);
+                row("Bit rate", vbuf);
+            }
+
+            if (!md.video_pix_fmt.empty()) {
+                std::string pf = md.video_pix_fmt;
+                if (md.video_bits_per_component > 0) {
+                    char bb[24];
+                    std::snprintf(bb, sizeof(bb), "  (%d-bit)",
+                                  md.video_bits_per_component);
+                    pf += bb;
+                }
+                row("Pixel format", pf);
+            }
+            if (!md.video_color_space.empty())
+                row("Color space", md.video_color_space);
+            if (!md.video_color_range.empty())
+                row("Color range", md.video_color_range);
+            if (!md.video_color_primaries.empty())
+                row("Color primaries", md.video_color_primaries);
+            if (!md.video_color_transfer.empty())
+                row("Transfer", md.video_color_transfer);
+            if (!md.video_chroma_location.empty())
+                row("Chroma loc.", md.video_chroma_location);
+            if (!md.video_field_order.empty())
+                row("Field order", md.video_field_order);
+            if (!md.video_language.empty())
+                row("Language", md.video_language);
+            if (!md.video_title.empty())
+                row("Title", md.video_title);
 
             std::string dec = player_->isHardwareDecoding()
                                 ? (std::string("Hardware  (") + player_->getHardwareDecoderName() + ")")
@@ -2797,8 +2867,13 @@ void UIController::drawInfoPanel(int W, int H) {
         // ---- AUDIO ----
         section("AUDIO");
         if (player_->hasAudio()) {
-            const char* ac = player_->getAudioCodecName();
-            row("Codec", (ac && *ac) ? std::string(ac) : std::string("-"));
+            std::string acodec = md.audio_codec_short.empty()
+                               ? std::string("-") : md.audio_codec_short;
+            if (!md.audio_codec_long.empty())
+                acodec += "  (" + md.audio_codec_long + ")";
+            row("Codec", acodec);
+            if (!md.audio_profile.empty())
+                row("Profile", md.audio_profile);
             char sbuf[48];
             std::snprintf(sbuf, sizeof(sbuf), "%d Hz",
                           player_->getAudioSampleRate());
@@ -2812,6 +2887,34 @@ void UIController::drawInfoPanel(int W, int H) {
             char cbuf[48];
             std::snprintf(cbuf, sizeof(cbuf), "%d%s", ch, ch_name);
             row("Channels", cbuf);
+            if (!md.audio_channel_layout.empty()
+                && md.audio_channel_layout != std::to_string(ch)) {
+                row("Layout", md.audio_channel_layout);
+            }
+            if (!md.audio_sample_fmt.empty()) {
+                std::string sf = md.audio_sample_fmt;
+                if (md.audio_bits_per_sample > 0) {
+                    char bb[24];
+                    std::snprintf(bb, sizeof(bb), "  (%d-bit)",
+                                  md.audio_bits_per_sample);
+                    sf += bb;
+                }
+                row("Sample format", sf);
+            }
+            if (md.audio_bitrate > 0) {
+                char abr[64];
+                if (md.audio_bitrate >= 1000000)
+                    std::snprintf(abr, sizeof(abr), "%.2f Mbps",
+                                  md.audio_bitrate / 1000000.0);
+                else
+                    std::snprintf(abr, sizeof(abr), "%.0f kbps",
+                                  md.audio_bitrate / 1000.0);
+                row("Bit rate", abr);
+            }
+            if (!md.audio_language.empty())
+                row("Language", md.audio_language);
+            if (!md.audio_title.empty())
+                row("Title", md.audio_title);
             int atc = player_->getAudioTrackCount();
             if (atc > 1) {
                 char abuf[48];
@@ -2841,7 +2944,8 @@ void UIController::drawInfoPanel(int W, int H) {
 
         // ---- SUBTITLES ----
         section("SUBTITLES");
-        if (subtitles_.empty() && subtitle_tracks_.empty()) {
+        if (subtitles_.empty() && subtitle_tracks_.empty()
+            && md.subtitle_streams.empty()) {
             row_disabled("Status", "none loaded");
         } else {
             char tbuf[128];
@@ -2857,6 +2961,29 @@ void UIController::drawInfoPanel(int W, int H) {
                 std::snprintf(tbuf, sizeof(tbuf), "%d sidecar file(s)",
                               (int)subtitle_tracks_.size());
                 row("Sidecars", tbuf);
+            }
+            // Container-embedded subtitle streams. Show up to 8 to keep
+            // the panel readable on the wildest anime rips.
+            const int emb = (int)md.subtitle_streams.size();
+            if (emb > 0) {
+                std::snprintf(tbuf, sizeof(tbuf), "%d embedded", emb);
+                row("Embedded", tbuf);
+                int show = std::min(emb, 8);
+                for (int i = 0; i < show; ++i) {
+                    const auto& s = md.subtitle_streams[i];
+                    std::string line = s.codec_short.empty() ? std::string("(unknown)") : s.codec_short;
+                    if (!s.language.empty()) line += "  [" + s.language + "]";
+                    if (!s.title.empty())    line += "  \"" + s.title + "\"";
+                    if (!s.selectable)       line += "  (bitmap - not selectable)";
+                    char label[16];
+                    std::snprintf(label, sizeof(label), "  #%d", i + 1);
+                    row(label, line);
+                }
+                if (emb > show) {
+                    char more[48];
+                    std::snprintf(more, sizeof(more), "... +%d more", emb - show);
+                    row_disabled("", more);
+                }
             }
         }
 
@@ -2910,10 +3037,173 @@ void UIController::drawInfoPanel(int W, int H) {
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
-    ImGui::TextDisabled("Press Esc or I to close");
+    ImGui::TextDisabled("Press Esc, I, or F1 to close");
 
     ImGui::End();
     ImGui::PopStyleVar();
+}
+
+// Compact top-left overlay toggled by Tab. Semi-transparent card with the
+// essentials at a glance: filename, resolution / fps, video + audio codec,
+// container bit rate, keyframe interval, path. Never blocks input - it
+// sits on the background draw list and lets clicks through to whatever's
+// underneath. Auto-hides with overlay fade so the picture doesn't get
+// permanently covered when the user leaves it on.
+void UIController::drawQuickInfoOverlay(int W, int H) {
+    if (!show_quick_info_ || !player_ || !player_->isLoaded()) return;
+
+    // Fade in fast, out slow - matches the bottom-bar treatment.
+    float alpha = overlay_alpha_;
+    if (alpha < 0.05f) return;
+
+    VideoPlayer::MediaDetail d = player_->getMediaDetail();
+    const std::string& path = player_->getFilename();
+    std::string name = baseName(path.c_str());
+
+    ImDrawList* bg = ImGui::GetBackgroundDrawList();
+    const float pad_x  = 16.0f;
+    const float pad_y  = 12.0f;
+    const float margin = 22.0f;
+
+    // Compose the info lines. Empty fields are skipped so we don't show
+    // ": -" everywhere for containers that omit them.
+    struct Line { std::string label; std::string value; };
+    std::vector<Line> lines;
+    lines.push_back({"", name});
+
+    if (d.has_video) {
+        char resbuf[96];
+        if (d.video_width > 0 && d.video_height > 0) {
+            if (d.video_fps > 0.0)
+                std::snprintf(resbuf, sizeof(resbuf), "%d x %d  @ %.3f fps",
+                              d.video_width, d.video_height, d.video_fps);
+            else
+                std::snprintf(resbuf, sizeof(resbuf), "%d x %d",
+                              d.video_width, d.video_height);
+            lines.push_back({"Video", resbuf});
+        }
+        std::string vc = d.video_codec_short;
+        if (!d.video_profile.empty()) vc += "  " + d.video_profile;
+        if (d.video_level > 0) {
+            char lb[32]; std::snprintf(lb, sizeof(lb), "  L%.1f", d.video_level / 10.0);
+            vc += lb;
+        }
+        if (!d.video_pix_fmt.empty()) vc += "  " + d.video_pix_fmt;
+        if (d.hw_decoder.empty()) vc += "  (SW)";
+        else                      vc += "  (HW: " + d.hw_decoder + ")";
+        lines.push_back({"Codec", vc});
+    }
+    if (d.has_audio) {
+        char abuf[128];
+        std::snprintf(abuf, sizeof(abuf), "%s  %d Hz  %d ch",
+                      d.audio_codec_short.c_str(),
+                      d.audio_sample_rate,
+                      d.audio_channels);
+        lines.push_back({"Audio", abuf});
+    }
+    // Container bit rate + keyframe interval.
+    {
+        char b[96];
+        std::string val;
+        if (d.format_bitrate >= 1000000)
+            std::snprintf(b, sizeof(b), "%.2f Mbps",
+                          d.format_bitrate / 1000000.0);
+        else if (d.format_bitrate > 0)
+            std::snprintf(b, sizeof(b), "%.0f kbps",
+                          d.format_bitrate / 1000.0);
+        else
+            b[0] = '\0';
+        if (b[0]) val = b;
+        if (d.keyframe_interval_sec > 0.0) {
+            char kb[64];
+            std::snprintf(kb, sizeof(kb), "GOP %.2fs",
+                          d.keyframe_interval_sec);
+            if (!val.empty()) val += "  |  ";
+            val += kb;
+        }
+        if (!d.container_short.empty()) {
+            if (!val.empty()) val += "  |  ";
+            val += d.container_short;
+        }
+        if (!val.empty()) lines.push_back({"Stream", val});
+    }
+    lines.push_back({"Path", path});
+
+    // Sizing: 44 % of window width by default, cap to [420, 720] so it
+    // stays sensible in tiny and huge windows. Wrap all long values so
+    // paths and titles don't blow the box out.
+    float box_w = std::min(720.0f, std::max(420.0f, W * 0.44f));
+    // Estimate height by counting lines - we'll re-measure after
+    // rendering into a hidden child. Cheap upper bound: 4 lines fit in
+    // ~120 px including padding at font scale 16.
+    const float title_sz  = 20.0f;
+    const float value_sz  = 15.0f;
+    const float base_sz   = ImGui::GetFontSize();
+    const float title_h   = title_sz + 4.0f;
+    const float value_h   = value_sz + 4.0f;
+    float need_h = pad_y * 2 + title_h + 6.0f;
+    for (size_t i = 1; i < lines.size(); ++i) {
+        // Rough wrap estimate: 74 chars per line at 15 px.
+        int len = (int)lines[i].value.size();
+        int wraps = std::max(1, (len + 73) / 74);
+        need_h += value_h * wraps;
+    }
+    float box_h = std::min((float)H - 2 * margin, need_h);
+
+    ImVec2 tl(margin, margin);
+    ImVec2 br(tl.x + box_w, tl.y + box_h);
+    ImU32 bg_col      = IM_COL32(14, 18, 30, (int)(230 * alpha));
+    ImU32 shadow_col  = IM_COL32(0, 0, 0, (int)(90 * alpha));
+    ImU32 border_col  = IM_COL32(96, 176, 246, (int)(140 * alpha));
+    bg->AddRectFilled(ImVec2(tl.x - 3, tl.y - 3), ImVec2(br.x + 3, br.y + 6),
+                      shadow_col, 12.0f);
+    bg->AddRectFilled(tl, br, bg_col, 10.0f);
+    bg->AddRect(tl, br, border_col, 10.0f, 0, 1.0f);
+
+    // Draw content via an ImGui window pinned to the box - lets us use
+    // TextWrapped for long paths/titles.
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize
+                             | ImGuiWindowFlags_NoMove   | ImGuiWindowFlags_NoScrollbar
+                             | ImGuiWindowFlags_NoBackground
+                             | ImGuiWindowFlags_NoBringToFrontOnFocus
+                             | ImGuiWindowFlags_NoInputs
+                             | ImGuiWindowFlags_NoSavedSettings;
+    ImGui::SetNextWindowPos(tl);
+    ImGui::SetNextWindowSize(ImVec2(box_w, box_h));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(pad_x, pad_y));
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+    ImGui::Begin("##QuickInfoOverlay", nullptr, flags);
+
+    // Title = filename, bigger and brighter.
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f, 0.96f, 1.0f, 1.0f));
+    ImGui::SetWindowFontScale(title_sz / base_sz);
+    ImGui::PushTextWrapPos(box_w - pad_x * 2);
+    ImGui::TextUnformatted(name.c_str());
+    ImGui::PopTextWrapPos();
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::PopStyleColor();
+
+    ImGui::Dummy(ImVec2(0, 4));
+
+    // Body rows: fixed label column + wrapped value.
+    ImGui::SetWindowFontScale(value_sz / base_sz);
+    const float label_w = 62.0f;
+    for (size_t i = 1; i < lines.size(); ++i) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.66f, 0.78f, 0.96f, 0.9f));
+        ImGui::TextUnformatted(lines[i].label.c_str());
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(pad_x + label_w);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.94f, 0.96f, 1.0f, 0.94f));
+        ImGui::PushTextWrapPos(box_w - pad_x);
+        ImGui::TextUnformatted(lines[i].value.c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+    }
+    ImGui::SetWindowFontScale(1.0f);
+
+    ImGui::End();
+    ImGui::PopStyleVar(2);
 }
 
 void UIController::drawHistoryPanel(int W, int H) {
@@ -3318,6 +3608,16 @@ void UIController::drawSettingsDialog(int W, int H) {
                                 if (player_) player_->setHdrHalfResMode(
                                     (VideoPlayer::HdrHalfResMode)m);
                             });
+                radio_group("High-res SDR downscale (perf lever for 8K sources)",
+                            hires_downscale_mode_,
+                            {{"Off  (full quality)", 0},
+                             {"Auto (on for source > 3840 wide)", 1},
+                             {"Force on", 2}},
+                            [this](int m) {
+                                if (player_) player_->setHighResDownscaleMode(
+                                    (VideoPlayer::HighResDownscaleMode)m);
+                            });
+                ImGui::TextDisabled("Halves the sws_scale output when the source is > 3840 wide. Desktop monitors max at 4K anyway; the picture is visually identical and the CPU->GPU upload drops ~4x.");
                 VideoPlayer::DeinterlaceMode dcur = player_->getDeinterlaceMode();
                 int di = (dcur == VideoPlayer::DeinterlaceMode::On) ? 2
                        : (dcur == VideoPlayer::DeinterlaceMode::Auto) ? 1 : 0;
@@ -3439,6 +3739,7 @@ void UIController::drawSettingsDialog(int W, int H) {
         if (ImGui::BeginTabItem("Snapshots")) {
             ImGui::Spacing();
             ImGui::TextUnformatted("Folder");
+            ImGui::TextDisabled("Initial folder for the Ctrl+S Save As dialog. Burst snapshots (Ctrl+Shift+G) also land here silently.");
             ImGui::Indent(16.0f);
             const std::string cur = snapshot_dir_.empty()
                                       ? std::string("(next to the app)")
@@ -3460,7 +3761,7 @@ void UIController::drawSettingsDialog(int W, int H) {
                 if (dir.empty()) {
                     showOsd("No snapshot folder");
                 } else {
-                    HINSTANCE h = ShellExecuteA(nullptr, "open", dir.c_str(),
+                    HINSTANCE h = FileIO::shell(nullptr, "open", dir.c_str(),
                                                 nullptr, nullptr, SW_SHOWNORMAL);
                     if ((INT_PTR)h <= 32) showOsd("Explorer open failed");
                 }
@@ -3908,12 +4209,20 @@ void UIController::cancelAutoNext() {
 }
 
 void UIController::newFrame() {
+    switch (export_job_.takeResult()) {
+        case ExportJob::State::Succeeded: showOsd("Export saved", 2.4f); break;
+        case ExportJob::State::Cancelled: showOsd("Export cancelled", 2.4f); break;
+        case ExportJob::State::Failed: showOsd("Export failed; check the source and destination", 3.0f); break;
+        default: break;
+    }
+
     ImGui_ImplSDLRenderer3_NewFrame();
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
 }
 
 void UIController::render(int W, int H) {
+    drawExportProgress(W, H);
     ImGuiIO& io = ImGui::GetIO();
     float dt = io.DeltaTime;
 
@@ -4161,6 +4470,7 @@ void UIController::render(int W, int H) {
     drawShortcutsPanel(W, H);
     drawAboutPanel(W, H);
     drawInfoPanel(W, H);
+    drawQuickInfoOverlay(W, H);
     drawHistoryPanel(W, H);
     drawSettingsDialog(W, H);
     drawGotoTimeDialog(W, H);
@@ -4372,7 +4682,7 @@ void UIController::drawSplash(int W, int H) {
     dl->AddText(font, ss, ImVec2(cx - sd.x * 0.5f, sub_y),
                 IM_COL32(185, 170, 138, 210), subtitle);
 
-    const char* subtitle2 = "?  or  F1  for keyboard shortcuts";
+    const char* subtitle2 = "?  keyboard shortcuts  -  Tab quick info  -  F1 media info";
     ImVec2 sd2 = font->CalcTextSizeA(ss, FLT_MAX, 0.0f, subtitle2);
     float sub2_y = sub_y + ss + 6.0f;
     dl->AddText(font, ss, ImVec2(cx - sd2.x * 0.5f, sub2_y),
@@ -4626,7 +4936,7 @@ void UIController::drawSplash(int W, int H) {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
             }
             if (ImGui::IsItemClicked()) {
-                ShellExecuteA(nullptr, "open", pb->click_url.c_str(),
+                FileIO::shell(nullptr, "open", pb->click_url.c_str(),
                               nullptr, nullptr, SW_SHOWNORMAL);
             }
             ImGui::PopID();
@@ -5532,8 +5842,9 @@ void UIController::drawBottomOverlay(int W, int H, float alpha) {
     ImGui::SameLine();
 
     if (Style::IconButton("snap", Style::Icon::Snapshot, btn_sz,
-                          "Snapshot (Ctrl+S)", false, 1.0f, alpha)) {
-        takeSnapshot();
+                          "Save snapshot as... (Ctrl+S)  -  Ctrl+C copies to clipboard",
+                          false, 1.0f, alpha)) {
+        takeSnapshotAskPath();
     }
     ImGui::SameLine();
     // Subtitle on/off toggle - only visible when a subtitle source is
@@ -6110,7 +6421,8 @@ void UIController::drawMainMenuContents() {
         }
     }
 
-    if (ImGui::MenuItem("Snapshot", "Ctrl+S", false, player_->isLoaded())) takeSnapshot();
+    if (ImGui::MenuItem("Snapshot...", "Ctrl+S", false, player_->isLoaded())) takeSnapshotAskPath();
+    if (ImGui::MenuItem("Copy snapshot to clipboard", "Ctrl+C", false, player_->isLoaded())) snapshotToClipboard();
     {
         bool have_ab = (loop_a_ >= 0.0 && loop_b_ >= 0.0);
         char label[64];
@@ -6274,7 +6586,7 @@ void UIController::drawMainMenuContents() {
         show_shortcuts_ = false; show_about_ = false;
         show_info_ = false;      show_history_ = false;
     }
-    if (ImGui::MenuItem("Media Info", "I", false, player_->isLoaded())) {
+    if (ImGui::MenuItem("Media Info", "I / F1", false, player_->isLoaded())) {
         show_info_ = true; show_shortcuts_ = false; show_about_ = false;
         show_history_ = false;
     }
@@ -6282,7 +6594,7 @@ void UIController::drawMainMenuContents() {
         show_history_ = true;
         show_shortcuts_ = false; show_about_ = false; show_info_ = false;
     }
-    if (ImGui::MenuItem("Keyboard Shortcuts", "?  /  F1")) {
+    if (ImGui::MenuItem("Keyboard Shortcuts", "?")) {
         show_shortcuts_ = true;
         show_about_ = false;
         show_info_ = false;
@@ -6653,12 +6965,13 @@ void UIController::handleEvent(const SDL_Event& event) {
         // combos, ...) must fire once per press. Ctrl-modified Left/Right are
         // NOT holdable: they nudge A/V sync (30 ms) or subtitle sync (100 ms)
         // per press - repeating them at OS rate would silently rack up drift.
+        // PageUp / PageDown are NOT holdable either: they switch playlist
+        // files, and holding would rip through the entire queue.
         if (event.key.repeat) {
             bool arrow_no_ctrl =
                 ((key == SDLK_LEFT) || (key == SDLK_RIGHT)) && !(mod & SDL_KMOD_CTRL);
             bool holdable =
                 arrow_no_ctrl ||
-                (key == SDLK_PAGEUP) || (key == SDLK_PAGEDOWN) ||
                 (key == SDLK_UP)     || (key == SDLK_DOWN) ||
                 (key == SDLK_COMMA)  || (key == SDLK_PERIOD) ||
                 (key == SDLK_EQUALS) || (key == SDLK_PLUS) || (key == SDLK_KP_PLUS) ||
@@ -6713,11 +7026,20 @@ void UIController::handleEvent(const SDL_Event& event) {
             if (show_shortcuts_) { show_shortcuts_ = false; return; }
             if (show_about_)     { show_about_    = false; return; }
             if (show_info_)      { show_info_     = false; return; }
+            if (show_quick_info_){ show_quick_info_ = false; return; }
             if (show_history_)   { show_history_  = false; return; }
             if (show_settings_)  { show_settings_ = false; return; }
             if (show_goto_time_) { show_goto_time_ = false; goto_time_buf_[0] = '\0'; return; }
             if (show_playlist_)  { show_playlist_ = false; return; }
             if (fullscreen_)     { setFullscreen(false);   return; }
+            return;
+        }
+        // Quick file-info overlay (Tab). PotPlayer convention. Compact
+        // top-left card with the essentials. NavEnableKeyboard is off
+        // globally so Tab isn't captured by ImGui focus navigation.
+        if (key == SDLK_TAB && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_SHIFT))) {
+            show_quick_info_ = !show_quick_info_;
+            if (show_quick_info_) nudgeVisible();
             return;
         }
         // File info modal (I, no modifiers).
@@ -6759,9 +7081,20 @@ void UIController::handleEvent(const SDL_Event& event) {
             }
             return;
         }
-        // Shortcuts help: '?' (Shift+/) or F1.
-        if (key == SDLK_F1
-            || (key == SDLK_SLASH && (mod & SDL_KMOD_SHIFT))) {
+        // Detailed Media Info window (F1). Same content as `I` opens -
+        // one shortcut for people who reach for F1 out of habit. F1
+        // used to open the shortcuts modal but the detailed info window
+        // is a much more common ask; shortcuts stay reachable via `?`.
+        if (key == SDLK_F1) {
+            show_info_ = !show_info_;
+            if (show_info_) {
+                show_shortcuts_ = false; show_about_ = false;
+                show_history_ = false;
+            }
+            return;
+        }
+        // Shortcuts help: '?' (Shift+/).
+        if (key == SDLK_SLASH && (mod & SDL_KMOD_SHIFT)) {
             show_shortcuts_ = !show_shortcuts_;
             if (show_shortcuts_) {
                 show_about_ = false; show_info_ = false; show_history_ = false;
@@ -6821,6 +7154,19 @@ void UIController::handleEvent(const SDL_Event& event) {
         }
         if (key == SDLK_RIGHT && (mod & SDL_KMOD_ALT)) {
             seekNextChapter();
+            return;
+        }
+        // Shift + Left / Shift + Right = +/-30 s big seek. Moved from
+        // PageUp / PageDown (now playlist prev/next). Holdable via the
+        // arrow_no_ctrl branch in the repeat filter.
+        if (key == SDLK_LEFT  && (mod & SDL_KMOD_SHIFT)
+            && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT))) {
+            if (player_->isLoaded()) { player_->seekRelative(-30.0); SEEK_OSD("- 30s"); }
+            return;
+        }
+        if (key == SDLK_RIGHT && (mod & SDL_KMOD_SHIFT)
+            && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT))) {
+            if (player_->isLoaded()) { player_->seekRelative( 30.0); SEEK_OSD("+ 30s"); }
             return;
         }
         if (key == SDLK_LEFT)  { if (player_->isLoaded()) { player_->seekRelative(-5.0); SEEK_OSD("- 5s"); } return; }
@@ -6898,12 +7244,21 @@ void UIController::handleEvent(const SDL_Event& event) {
             pasteAndPlay();
             return;
         }
-        // Ctrl+Shift+S = snapshot to clipboard (checked before Ctrl+S file-save).
+        // Snapshot bindings:
+        //   Ctrl+C          = copy current frame to clipboard (screen capture)
+        //   Ctrl+Shift+S    = same as Ctrl+C (kept for muscle-memory backcompat)
+        //   Ctrl+S          = save current frame as PNG, prompts for path
+        // Ctrl+Shift+S must be checked BEFORE Ctrl+S so the shift-combo
+        // doesn't fall through to the file-save dialog.
+        if (sc == SDL_SCANCODE_C && (mod & SDL_KMOD_CTRL) && !(mod & SDL_KMOD_SHIFT)) {
+            snapshotToClipboard();
+            return;
+        }
         if (sc == SDL_SCANCODE_S && (mod & SDL_KMOD_CTRL) && (mod & SDL_KMOD_SHIFT)) {
             snapshotToClipboard();
             return;
         }
-        if (sc == SDL_SCANCODE_S && (mod & SDL_KMOD_CTRL)) { takeSnapshot(); return; }
+        if (sc == SDL_SCANCODE_S && (mod & SDL_KMOD_CTRL)) { takeSnapshotAskPath(); return; }
         // Ctrl+F - subtitle text search.
         if (sc == SDL_SCANCODE_F && (mod & SDL_KMOD_CTRL) && !(mod & SDL_KMOD_SHIFT)) {
             openSubtitleSearch();
@@ -6992,9 +7347,21 @@ void UIController::handleEvent(const SDL_Event& event) {
             addBookmark();
             return;
         }
-        // Number keys 0-9 (no modifiers): jump to N * 10 % of the file.
+        // Number keys 1 / 2 / 3 (no modifiers): resize the whole window so
+        // its client area is (scale * native video pixels) at 0.5x / 1.0x /
+        // 2.0x. The video fills the new window edge-to-edge at the correct
+        // aspect - no letterboxing inside a scaled view.
+        if (!(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_SHIFT))
+            && (key == SDLK_1 || key == SDLK_2 || key == SDLK_3)) {
+            float s = (key == SDLK_1) ? 0.5f
+                    : (key == SDLK_2) ? 1.0f : 2.0f;
+            snapWindowToVideoScale(s);
+            return;
+        }
+        // Number keys 0, 4-9 (no modifiers): jump to N * 10 % of the file.
         // Ctrl+0 / Ctrl+Shift+0 are handled above for A/V and subtitle sync
-        // resets, so we only fire when neither Ctrl nor Alt is held.
+        // resets, so we only fire when neither Ctrl nor Alt is held. Keys
+        // 1-3 are consumed above for zoom snaps.
         if (!(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT))
             && key >= SDLK_0 && key <= SDLK_9) {
             if (player_->isLoaded()) {
@@ -7108,8 +7475,12 @@ void UIController::handleEvent(const SDL_Event& event) {
             markConfigDirty();
             return;
         }
-        if (key == SDLK_PAGEUP)   { if (player_->isLoaded()) { player_->seekRelative( 30.0); SEEK_OSD("+ 30s"); } return; }
-        if (key == SDLK_PAGEDOWN) { if (player_->isLoaded()) { player_->seekRelative(-30.0); SEEK_OSD("- 30s"); } return; }
+        // PageUp / PageDown = playlist prev / next file. Matches file
+        // manager and PotPlayer convention (up in the visual list =
+        // previous item). The +/-30s big-seek moved to Shift+Left /
+        // Shift+Right, which are still holdable for continuous nudging.
+        if (key == SDLK_PAGEUP)   { playPrevInPlaylist(); return; }
+        if (key == SDLK_PAGEDOWN) { playNextInPlaylist(); return; }
         // Frame step. OSD is shown unconditionally (not gated behind
         // NDEBUG like the +/-5s / +/-30s toasts) because a single-frame move
         // is often too small to spot visually - the user needs some
@@ -7271,7 +7642,7 @@ void UIController::handleEvent(const SDL_Event& event) {
                 nudgeVisible();
                 return;
             }
-            DWORD attrs = GetFileAttributesA(p.c_str());
+            DWORD attrs = FileIO::attributes(p.c_str());
             if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
                 // Dropped a folder - scan it exactly like Ctrl+Shift+O.
                 auto found = scanFolderVideosBySize(p);
@@ -7542,17 +7913,17 @@ std::vector<std::string> UIController::scanFolderVideosBySize(const std::string&
     // everything else is thumbnails / samples / behind-the-scenes.
     struct SizedPath { std::string path; uint64_t size; };
     std::vector<SizedPath> vids;
-    WIN32_FIND_DATAA fd{};
+    WIN32_FIND_DATAW fd{};
     std::string pattern = dir + "\\*";
-    HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+    HANDLE h = FindFirstFileW(FileIO::wide(pattern).c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            std::string full = dir + "\\" + fd.cFileName;
+            std::string full = dir + "\\" + FileIO::utf8(fd.cFileName);
             if (!isVideoFile(full)) continue;
             uint64_t sz = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
             vids.push_back({std::move(full), sz});
-        } while (FindNextFileA(h, &fd));
+        } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
     std::sort(vids.begin(), vids.end(),
@@ -7602,7 +7973,7 @@ void UIController::loadConfig() {
     // install and enable the welcome banner. The banner then persists
     // `first_run_done=1` so a subsequent launch (with a config now on
     // disk) suppresses it.
-    if (fopen_s(&fp, path.c_str(), "rb") != 0 || !fp) {
+    if (FileIO::open(&fp, path.c_str(), "rb") != 0 || !fp) {
         first_run_hint_pending_ = true;
         return;
     }
@@ -7676,6 +8047,13 @@ void UIController::loadConfig() {
             if (i < 0) i = 0; else if (i > 2) i = 2;
             hdr_half_res_mode_ = i;
         }
+        else if (std::strcmp(k, "hires_downscale") == 0) {
+            // 0 = Off, 1 = Auto (default: on for source > 3840 wide),
+            // 2 = ForceOn. Missing key defaults to 1 via member init.
+            int i = std::atoi(v);
+            if (i < 0) i = 0; else if (i > 2) i = 2;
+            hires_downscale_mode_ = i;
+        }
         else if (std::strcmp(k, "pause_on_focus_loss") == 0) pause_on_focus_loss_ = std::atoi(v) != 0;
         else if (std::strcmp(k, "snapshot_overlays") == 0) snapshot_include_overlays_ = std::atoi(v) != 0;
         else if (std::strcmp(k, "burst_count") == 0) {
@@ -7746,6 +8124,11 @@ void UIController::loadConfig() {
           : (hdr_half_res_mode_ == 1) ? VideoPlayer::HdrHalfResMode::Auto
                                       : VideoPlayer::HdrHalfResMode::Off;
         player_->setHdrHalfResMode(m);
+        VideoPlayer::HighResDownscaleMode hd =
+            (hires_downscale_mode_ == 2) ? VideoPlayer::HighResDownscaleMode::ForceOn
+          : (hires_downscale_mode_ == 0) ? VideoPlayer::HighResDownscaleMode::Off
+                                         : VideoPlayer::HighResDownscaleMode::Auto;
+        player_->setHighResDownscaleMode(hd);
         player_->setAudioOutputLatencyMs(audio_out_latency_ms_);
         player_->setLoudnessNormalize(loudness_normalize_);
         player_->setVoiceBoost(voice_boost_);
@@ -7773,6 +8156,7 @@ void UIController::saveConfig() {
     std::fprintf(fp, "loudness_normalize=%d\n",   loudness_normalize_ ? 1 : 0);
     std::fprintf(fp, "voice_boost=%d\n",          voice_boost_ ? 1 : 0);
     std::fprintf(fp, "hdr_half_res=%d\n",       hdr_half_res_mode_);
+    std::fprintf(fp, "hires_downscale=%d\n",    hires_downscale_mode_);
     std::fprintf(fp, "pause_on_focus_loss=%d\n", pause_on_focus_loss_ ? 1 : 0);
     std::fprintf(fp, "auto_next_countdown=%d\n", auto_next_countdown_);
     std::fprintf(fp, "single_instance=%d\n",     single_instance_mode_ ? 1 : 0);
@@ -7820,7 +8204,7 @@ void UIController::saveConfig() {
 void UIController::loadRecents() {
     std::string path = sidecarPath("banana.recent");
     FILE* fp = nullptr;
-    if (fopen_s(&fp, path.c_str(), "rb") != 0 || !fp) return;
+    if (FileIO::open(&fp, path.c_str(), "rb") != 0 || !fp) return;
     recent_files_.clear();
     char line[1024];
     while (std::fgets(line, sizeof(line), fp)) {
@@ -7844,7 +8228,7 @@ void UIController::saveRecents() {
 void UIController::applyStoredWindowGeometry() {
     std::string path = sidecarPath("banana.window");
     FILE* fp = nullptr;
-    if (fopen_s(&fp, path.c_str(), "rb") != 0 || !fp) return;
+    if (FileIO::open(&fp, path.c_str(), "rb") != 0 || !fp) return;
     int x = 0, y = 0, w = 0, h = 0, maximized = 0;
     bool have_pos = false, have_size = false;
     char line[256];
@@ -7898,13 +8282,19 @@ void UIController::snapWindowToVideo() {
         showOsd("Not while fullscreen");
         return;
     }
-    // Effective aspect after intrinsic + user rotation (matches the render
-    // path in main.cpp so the picture fills the client area exactly).
+    // Effective aspect after intrinsic + user rotation AND pixel aspect
+    // (matches the render path in main.cpp so the picture fills the client
+    // area exactly). SAR is applied to the coded width in the un-rotated
+    // domain; rotation then swaps.
     int total_deg = ((player_->getIntrinsicRotation()
                       + ((int)rotation_ * 90)) % 360 + 360) % 360;
     bool rot90 = (total_deg == 90 || total_deg == 270);
-    int eff_w = rot90 ? vh : vw;
-    int eff_h = rot90 ? vw : vh;
+    AVRational sar = player_->getVideoSampleAspectRatio();
+    if (sar.num <= 0 || sar.den <= 0) { sar.num = 1; sar.den = 1; }
+    int disp_w = (int)std::lround((double)vw * (double)sar.num / (double)sar.den);
+    if (disp_w < 1) disp_w = 1;
+    int eff_w = rot90 ? vh     : disp_w;
+    int eff_h = rot90 ? disp_w : vh;
     // Fetch the display the window is currently on; fall back to primary.
     SDL_DisplayID disp = SDL_GetDisplayForWindow(window_);
     if (disp == 0) disp = SDL_GetPrimaryDisplay();
@@ -7942,6 +8332,75 @@ void UIController::snapWindowToVideo() {
     showOsd(buf);
 }
 
+void UIController::snapWindowToVideoScale(float scale) {
+    // Same guard rails as snapWindowToVideo - no video / fullscreen bail out
+    // with an OSD so the user gets feedback either way.
+    if (!player_->isLoaded()) {
+        showOsd("No video loaded");
+        return;
+    }
+    int vw = player_->getVideoWidth();
+    int vh = player_->getVideoHeight();
+    if (vw <= 0 || vh <= 0) {
+        showOsd("No video loaded");
+        return;
+    }
+    if (fullscreen_
+        || (SDL_GetWindowFlags(window_) & SDL_WINDOW_FULLSCREEN) != 0) {
+        showOsd("Not while fullscreen");
+        return;
+    }
+    int total_deg = ((player_->getIntrinsicRotation()
+                      + ((int)rotation_ * 90)) % 360 + 360) % 360;
+    bool rot90 = (total_deg == 90 || total_deg == 270);
+    AVRational sar = player_->getVideoSampleAspectRatio();
+    if (sar.num <= 0 || sar.den <= 0) { sar.num = 1; sar.den = 1; }
+    int disp_w = (int)std::lround((double)vw * (double)sar.num / (double)sar.den);
+    if (disp_w < 1) disp_w = 1;
+    int eff_w = rot90 ? vh     : disp_w;
+    int eff_h = rot90 ? disp_w : vh;
+
+    SDL_DisplayID disp = SDL_GetDisplayForWindow(window_);
+    if (disp == 0) disp = SDL_GetPrimaryDisplay();
+    SDL_Rect bounds{};
+    if (!SDL_GetDisplayUsableBounds(disp, &bounds)) {
+        if (!SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &bounds)) {
+            showOsd("Cannot query display");
+            return;
+        }
+    }
+    if ((SDL_GetWindowFlags(window_) & SDL_WINDOW_MAXIMIZED) != 0) {
+        SDL_RestoreWindow(window_);
+    }
+
+    float target_w = (float)eff_w * scale;
+    float target_h = (float)eff_h * scale;
+    // Cap at ~95 % of the display so a 2x on a 4K clip doesn't overflow the
+    // work area. Preserve aspect while shrinking.
+    float src_aspect = (float)eff_w / (float)eff_h;
+    float max_w = (float)bounds.w * 0.95f;
+    float max_h = (float)bounds.h * 0.95f;
+    if (target_w > max_w) { target_w = max_w; target_h = target_w / src_aspect; }
+    if (target_h > max_h) { target_h = max_h; target_w = target_h * src_aspect; }
+    int tw = (int)target_w;
+    int th = (int)target_h;
+    if (tw < 640) tw = 640;
+    if (th < 400) th = 400;
+
+    // Reset internal zoom / pan so the video fills the new client area
+    // exactly. Otherwise a residual video_zoom_ from a prior Ctrl+Wheel would
+    // stack on top of the window resize and defeat the "fit to ratio" intent.
+    video_zoom_  = 1.0f;
+    video_pan_x_ = 0.0f;
+    video_pan_y_ = 0.0f;
+
+    SDL_SetWindowSize(window_, tw, th);
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "Size %d%%  %dx%d",
+                  (int)std::lround(scale * 100.0f), tw, th);
+    showOsd(buf, 1.2f);
+}
+
 void UIController::captureWindowGeometry() {
     // Don't overwrite the saved geometry with fullscreen state - the user
     // usually wants their windowed position back on next launch.
@@ -7952,7 +8411,7 @@ void UIController::captureWindowGeometry() {
     bool maximized = (SDL_GetWindowFlags(window_) & SDL_WINDOW_MAXIMIZED) != 0;
     std::string path = sidecarPath("banana.window");
     FILE* fp = nullptr;
-    if (fopen_s(&fp, path.c_str(), "wb") != 0 || !fp) return;
+    if (FileIO::open(&fp, path.c_str(), "wb") != 0 || !fp) return;
     std::fprintf(fp, "x=%d\ny=%d\nw=%d\nh=%d\nmaximized=%d\n",
                  x, y, w, h, maximized ? 1 : 0);
     std::fclose(fp);
@@ -7961,7 +8420,7 @@ void UIController::captureWindowGeometry() {
 void UIController::loadLastPlaylist() {
     std::string path = sidecarPath("banana.session.m3u");
     FILE* fp = nullptr;
-    if (fopen_s(&fp, path.c_str(), "rb") != 0 || !fp) return;
+    if (FileIO::open(&fp, path.c_str(), "rb") != 0 || !fp) return;
     // Don't auto-play the last session (VLC-like restraint). Just prime
     // the playlist so N/Ctrl+N and the panel show the previous queue when
     // the user opens something new or re-plays a recent.
@@ -7981,7 +8440,7 @@ void UIController::saveLastPlaylist() {
     // Wipe the file if the playlist is empty so we don't strand yesterday's
     // list forever.
     if (playlist_.empty()) {
-        std::remove(path.c_str());
+        FileIO::remove(path.c_str());
         return;
     }
     writeSidecarAtomic(path, [&](std::FILE* fp) {
@@ -7993,47 +8452,15 @@ void UIController::saveLastPlaylist() {
 // -------------- Open Folder + M3U --------------
 
 std::string UIController::openFolderDialog() {
-    // Trick: use the file dialog with a "select this folder" hint. We
-    // rely on the user picking any file inside the folder and take the
-    // parent directory. Cleaner Vista-style IFileDialog would be nicer
-    // but this keeps the same code path as openFileDialog.
-    OPENFILENAMEA ofn = {};
-    char szFile[MAX_PATH] = {0};
-    ofn.lStructSize = sizeof(ofn);
-    ofn.lpstrFile   = szFile;
-    ofn.nMaxFile    = sizeof(szFile);
-    ofn.lpstrTitle  = "Pick any file in the folder to add all videos in it";
-    ofn.lpstrFilter = "All Files\0*.*\0";
-    ofn.Flags = OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
-    if (!GetOpenFileNameA(&ofn)) return {};
-    std::string p = szFile;
-    size_t slash = p.find_last_of("\\/");
-    return (slash == std::string::npos) ? std::string() : p.substr(0, slash);
+    return FileIO::chooseFolder(L"Open media folder");
 }
 
 std::string UIController::savePlaylistDialog() {
-    OPENFILENAMEA ofn = {};
-    char szFile[MAX_PATH] = "playlist.m3u8";
-    ofn.lStructSize = sizeof(ofn);
-    ofn.lpstrFile   = szFile;
-    ofn.nMaxFile    = sizeof(szFile);
-    ofn.lpstrFilter = "M3U Playlist\0*.m3u;*.m3u8\0All Files\0*.*\0";
-    ofn.lpstrDefExt = "m3u8";
-    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR | OFN_EXPLORER;
-    if (!GetSaveFileNameA(&ofn)) return {};
-    return std::string(szFile);
+    return FileIO::chooseFile(L"Save playlist", L"M3U Playlist\0*.m3u;*.m3u8\0All Files\0*.*\0", true, "playlist.m3u8", {}, L"m3u8");
 }
 
 std::string UIController::openPlaylistDialog() {
-    OPENFILENAMEA ofn = {};
-    char szFile[MAX_PATH] = {0};
-    ofn.lStructSize = sizeof(ofn);
-    ofn.lpstrFile   = szFile;
-    ofn.nMaxFile    = sizeof(szFile);
-    ofn.lpstrFilter = "M3U Playlist\0*.m3u;*.m3u8\0All Files\0*.*\0";
-    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
-    if (!GetOpenFileNameA(&ofn)) return {};
-    return std::string(szFile);
+    return FileIO::chooseFile(L"Open playlist", L"M3U Playlist\0*.m3u;*.m3u8\0All Files\0*.*\0");
 }
 
 void UIController::openFolderAsPlaylist() {
@@ -8052,7 +8479,7 @@ void UIController::openFolderAsPlaylist() {
 
 void UIController::savePlaylistM3U(const std::string& path) {
     FILE* fp = nullptr;
-    if (fopen_s(&fp, path.c_str(), "wb") != 0 || !fp) {
+    if (FileIO::open(&fp, path.c_str(), "wb") != 0 || !fp) {
         showOsd("Save failed"); return;
     }
     std::fprintf(fp, "#EXTM3U\n");
@@ -8065,7 +8492,7 @@ void UIController::savePlaylistM3U(const std::string& path) {
 
 void UIController::loadPlaylistM3U(const std::string& path) {
     FILE* fp = nullptr;
-    if (fopen_s(&fp, path.c_str(), "rb") != 0 || !fp) {
+    if (FileIO::open(&fp, path.c_str(), "rb") != 0 || !fp) {
         showOsd("Open failed"); return;
     }
     std::vector<std::string> paths;
@@ -8087,4 +8514,16 @@ void UIController::loadPlaylistM3U(const std::string& path) {
     std::snprintf(buf, sizeof(buf), "Loaded  %zu  from  %s",
                   paths.size(), baseName(path.c_str()));
     showOsd(buf);
+}
+
+void UIController::drawExportProgress(int W, int H) {
+    if (!export_job_.running()) return;
+    ImGui::SetNextWindowPos(ImVec2((float)W - 16.0f, 16.0f), ImGuiCond_Always, ImVec2(1, 0));
+    ImGui::SetNextWindowSize(ImVec2(280, 0), ImGuiCond_Always);
+    if (ImGui::Begin("Export progress", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove
+                     | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse)) {
+        ImGui::ProgressBar(export_job_.progress(), ImVec2(-1, 0));
+        if (ImGui::Button("Cancel export")) export_job_.cancel();
+    }
+    ImGui::End();
 }

@@ -8,6 +8,7 @@
 #include <deque>
 #include <vector>
 #include <functional>
+#include "ExportJob.hpp"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -122,12 +123,32 @@ public:
     // True when the current file is running under half-res tone map
     // (auto or forced). UI reads for the Info panel row.
     bool            isHdrHalfResActive() const          { return hdr_half_res_active_; }
+
+    // High-resolution SDR source downscale. Trinary Off / Auto / ForceOn,
+    // Auto = engage when source width > 3840 (i.e. 5K/6K/8K sources).
+    // Applies only to the SDR path (materializeYUV's sws_scale output);
+    // HDR has its own hdr_half_res_mode_ so users can tune those axes
+    // independently. Rationale: for an 8K source the pipeline was doing
+    // 8K NV12 GPU->CPU download + 8K sws_scale to YUV420P + 8K YUV420P
+    // CPU->GPU upload every frame - ~150 MB/frame memory bandwidth just
+    // for the render round-trip, before any decoding work. On any
+    // consumer CPU this pins one core at 100% and drops frames on
+    // anything above 24 fps. Since desktop monitors max out at 4K, the
+    // downscaled picture is visually identical. Applied at loadFile
+    // time. Old configs missing the key default to Auto.
+    enum class HighResDownscaleMode { Off = 0, Auto = 1, ForceOn = 2 };
+    void                 setHighResDownscaleMode(HighResDownscaleMode m);
+    HighResDownscaleMode getHighResDownscaleMode() const                 { return hires_downscale_mode_.load(); }
+    bool                 isHighResDownscaleActive() const                { return hires_downscale_active_; }
     // Actual output resolution (accounting for any half-res override).
     // Non-HDR files always return video_width_ / video_height_.
     int  getOutputWidth() const;
     int  getOutputHeight() const;
     int getVideoWidth() const { return video_width_; }
     int getVideoHeight() const { return video_height_; }
+    // Pixel aspect ratio. {1,1} when unset. Callers that need the effective
+    // display aspect should compute (W * sar.num) / (H * sar.den).
+    AVRational getVideoSampleAspectRatio() const { return video_sar_; }
     const std::string& getFilename() const { return filename_; }
 
     // Info-panel accessors. Safe to call regardless of load state - each
@@ -142,6 +163,77 @@ public:
     int64_t     getFileBitrate() const;
     int         getAudioSampleRate() const { return audio_stream_idx_ >= 0 ? audio_sample_rate_ : 0; }
     int         getAudioChannels() const   { return audio_stream_idx_ >= 0 ? audio_channels_ : 0; }
+
+    // Rich MediaInfo-style snapshot for the detailed info window. One
+    // call rather than a dozen small getters because the info panel
+    // only draws when open and doesn't need per-field accessors. Every
+    // field is a sentinel ("" / 0) when the container / codec didn't
+    // populate the source, so the UI can render without null-guards.
+    struct MediaDetail {
+        // Container
+        std::string container_short;    // e.g. "mov,mp4,m4a,3gp,3g2,mj2"
+        std::string container_long;     // human-readable
+        int         num_streams   = 0;
+        int         num_programs  = 0;
+        int64_t     format_bitrate = 0;
+        int64_t     probe_score   = 0;
+        int64_t     start_time_us = 0;
+
+        // Video
+        bool        has_video          = false;
+        std::string video_codec_short; // "h264"
+        std::string video_codec_long;
+        std::string video_profile;     // "High"
+        int         video_level        = 0;
+        int         video_width        = 0;
+        int         video_height       = 0;
+        int         video_bits_per_component = 0;
+        std::string video_pix_fmt;     // "yuv420p"
+        std::string video_color_space;
+        std::string video_color_range;
+        std::string video_color_primaries;
+        std::string video_color_transfer;
+        std::string video_chroma_location;
+        std::string video_field_order;
+        AVRational  video_sar          {0, 1};   // sample aspect ratio
+        AVRational  video_dar          {0, 1};   // display aspect ratio
+        double      video_fps          = 0.0;    // r_frame_rate primary
+        double      video_avg_fps      = 0.0;    // avg_frame_rate
+        int64_t     video_bitrate      = 0;
+        int64_t     video_nb_frames    = 0;
+        double      keyframe_interval_sec = 0.0;  // avg from index entries; 0 if unknown
+        int         keyframe_count     = 0;
+        std::string hw_decoder;                  // "" when SW
+        std::string video_language;
+        std::string video_title;
+
+        // Audio (currently-active track)
+        bool        has_audio          = false;
+        std::string audio_codec_short;
+        std::string audio_codec_long;
+        std::string audio_profile;
+        int         audio_sample_rate  = 0;
+        int         audio_channels     = 0;
+        std::string audio_channel_layout;   // "stereo", "5.1", ...
+        std::string audio_sample_fmt;       // "fltp", "s16", ...
+        int         audio_bits_per_sample = 0;
+        int64_t     audio_bitrate      = 0;
+        std::string audio_language;
+        std::string audio_title;
+
+        // Subtitle streams (all container-embedded)
+        struct SubStreamInfo {
+            std::string codec_short;
+            std::string language;
+            std::string title;
+            bool        selectable = false;
+        };
+        std::vector<SubStreamInfo> subtitle_streams;
+
+        // Attachments (fonts / images embedded in MKV etc.)
+        int         num_attachments = 0;
+    };
+    MediaDetail getMediaDetail() const;
 
     // True when the loaded file is a still-image codec (PNG, JPEG, BMP,
     // TIFF, WebP, ...). The decode pipeline handles these the same way
@@ -322,9 +414,9 @@ public:
     // muxed unchanged. That means the output starts at the first keyframe
     // at or before `start` (so it may include a few frames of lead-in),
     // and the container is inferred from the dst extension (.mp4 / .mkv).
-    // Blocks the calling thread - callers should show a spinner OSD.
+    // Blocking worker API. UI callers use ExportJob for progress/cancellation.
     static bool exportSegment(const std::string& src, const std::string& dst,
-                              double start, double end);
+                              double start, double end, ExportControl* control = nullptr);
 
     // Encode [start, end] of `src` as an animated GIF at `dst`. Uses
     // libavfilter's `palettegen` + `paletteuse` chain for good color
@@ -335,7 +427,7 @@ public:
     // palettegen filter.
     static bool exportSegmentAsGif(const std::string& src, const std::string& dst,
                                    double start, double end,
-                                   int target_fps, int target_width);
+                                   int target_fps, int target_width, ExportControl* control = nullptr);
 
     // Copy the most-recently displayed frame into `bgr` as a tightly-
     // packed top-down BGR24 image with 4-byte-aligned rows. Populates
@@ -371,7 +463,7 @@ private:
     // We use a wall-clock deadline so bad network shares / dead drives
     // don't freeze the UI thread indefinitely.
     static int openInterruptCb(void* opaque);
-    uint64_t open_deadline_ = 0;
+    std::atomic<uint64_t> open_deadline_{0};
 
     AVFormatContext* fmt_ctx_ = nullptr;
     AVCodecContext* video_dec_ctx_ = nullptr;
@@ -409,6 +501,10 @@ private:
     // source dims + HDR-ness. Default Off - see HdrHalfResMode doc.
     std::atomic<HdrHalfResMode> hdr_half_res_mode_{HdrHalfResMode::Off};
     bool                        hdr_half_res_active_ = false;
+    // High-res SDR downscale state. Materialised at loadFile from the
+    // mode + source width. See setter doc for rationale.
+    std::atomic<HighResDownscaleMode> hires_downscale_mode_{HighResDownscaleMode::Auto};
+    bool                              hires_downscale_active_ = false;
     // Deinterlacing state. Only touched from the decode thread except
     // for `deinterlace_mode_` and `deinterlace_rebuild_` which flip via
     // the UI. `filter_graph_` etc. are owned by the decode thread and
@@ -486,6 +582,11 @@ private:
 
     int video_width_ = 0;
     int video_height_ = 0;
+    // Sample aspect ratio (pixel aspect) from the video stream's codecpar.
+    // {1,1} for square pixels (the common case). Anamorphic sources like
+    // 1920x1080 shortform re-encodes may carry {607, 1920} etc. - the render
+    // path must multiply width by this ratio to avoid squishing.
+    AVRational video_sar_{1, 1};
     double duration_ = 0.0;
     std::string filename_;
 
