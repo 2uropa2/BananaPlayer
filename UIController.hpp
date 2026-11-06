@@ -201,7 +201,7 @@ private:
     int audio_out_latency_ms_ = 30;
     // Loudness normalize (dynaudnorm). Off default - engages a filter
     // in the audio decode path. Persists across files.
-    bool loudness_normalize_ = false;
+    bool loudness_normalize_ = true;
     // Voice boost. Cross-forum "explosions loud, dialogue quiet" fix.
     // Off by default so the audio graph stays inert on load.
     bool voice_boost_ = false;

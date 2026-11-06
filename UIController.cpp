@@ -3655,10 +3655,32 @@ void UIController::drawSettingsDialog(int W, int H) {
         if (ImGui::BeginTabItem("Audio")) {
             ImGui::Spacing();
             if (player_) {
+                // Loudness normalizer first - it's the one audio knob
+                // 99 % of users care about. Big label, no abbreviations,
+                // on at the top instead of buried below the peak-based
+                // mode. Shift+N hotkey shown on the row for muscle-memory.
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.95f, 1.0f, 1.0f));
+                ImGui::TextUnformatted("Loudness normalizer");
+                ImGui::PopStyleColor();
+                ImGui::SameLine();
+                ImGui::TextDisabled("  (Shift+N)");
+                bool ln = player_->isLoudnessNormalize();
+                if (ImGui::Checkbox("##loudness_on", &ln)) {
+                    player_->setLoudnessNormalize(ln);
+                    loudness_normalize_ = ln;
+                    markConfigDirty();
+                }
+                ImGui::SameLine();
+                ImGui::TextUnformatted(ln ? "ON  -  boosts quiet dialogue, caps loud peaks"
+                                          : "OFF  -  source volume unchanged");
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
                 VideoPlayer::NormalizeMode ncur = player_->getNormalizeMode();
                 int nm = (ncur == VideoPlayer::NormalizeMode::Strong) ? 2
                        : (ncur == VideoPlayer::NormalizeMode::Soft)   ? 1 : 0;
-                radio_group("Volume normalize (peak-based static gain)",
+                radio_group("Peak-based static gain (legacy)",
                             nm,
                             {{"Off",    0},
                              {"Soft   (peak 0.90)", 1},
@@ -3671,14 +3693,8 @@ void UIController::drawSettingsDialog(int W, int H) {
                                              : VideoPlayer::NormalizeMode::Off;
                                 player_->setNormalizeMode(nn);
                             });
-                bool ln = player_->isLoudnessNormalize();
-                if (ImGui::Checkbox("Normalizer (loudness, dynaudnorm) (Shift+N)",
-                                    &ln)) {
-                    player_->setLoudnessNormalize(ln);
-                    loudness_normalize_ = ln;
-                    markConfigDirty();
-                }
-                ImGui::TextDisabled("Boost quiet dialogue without clipping loud action.");
+                ImGui::TextDisabled("One-shot measured gain. Prefer the loudness normalizer above.");
+                ImGui::Spacing();
                 bool vb = player_->isVoiceBoost();
                 if (ImGui::Checkbox("Voice boost (+6 dB @ 2.5 kHz presence band)",
                                     &vb)) {

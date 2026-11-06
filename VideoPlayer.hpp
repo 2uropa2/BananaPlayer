@@ -567,7 +567,7 @@ private:
     // decode thread. `loudness_normalize_` is the UI toggle;
     // `loudness_rebuild_` flips when the toggle changes so the next
     // decode iteration tears down / rebuilds.
-    std::atomic<bool>            loudness_normalize_{false};
+    std::atomic<bool>            loudness_normalize_{true};
     std::atomic<bool>            loudness_rebuild_{false};
     // Voice boost. Same graph as loudness_normalize_ (see
     // buildLoudnessGraph_) - a change to either flag flips
