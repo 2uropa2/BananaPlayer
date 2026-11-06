@@ -78,10 +78,14 @@ public:
     static bool isYoutubeUrl(const std::string& s);
 
     RotationMode getRotation() const { return rotation_; }
-    // YUV colorspace / range readback for main.cpp's texture
-    // creation. Full range (0..255) by default; the toggle in Settings
-    // -> Video switches to studio range (16..235). See member docs.
-    bool getYuvStudioRange() const { return yuv_studio_range_; }
+    // YUV range override exposed to main.cpp's texture creation.
+    // Auto (default) honors the stream's codecpar color_range: Limited
+    // when AVCOL_RANGE_MPEG / UNSPECIFIED (virtually all distribution
+    // content), Full when AVCOL_RANGE_JPEG (MJPEG / JPEG stills / some
+    // phone camera streams). The forced modes exist as a rescue for
+    // mis-tagged files. See member docs.
+    enum class YuvRangeMode { Auto = 0, ForceLimited = 1, ForceFull = 2 };
+    YuvRangeMode getYuvRangeMode() const { return yuv_range_mode_; }
     // Monotonic counter bumped whenever a texture-affecting Settings
     // value changes. main.cpp compares this against its last-seen
     // value and rebuilds the SDL texture when it moves - the create
@@ -174,17 +178,16 @@ private:
     // can flip it off to send source values straight through the SDR
     // pipeline without our Hable+709 flattening. Persisted in banana.config.
     bool hdr_tonemap_enabled_ = true;
-    // YUV -> RGB input range for SDL_UpdateYUVTexture uploads. Default
-    // false = full range 0..255 (SDL_COLORSPACE_BT709_FULL); when true,
-    // interpret input as studio/broadcast range 16..235 luma / 16..240
-    // chroma (SDL_COLORSPACE_BT709_LIMITED). The default was flipped
-    // from SDL's own default (BT.601 limited) at the user's request:
-    // most web / social / phone content ships as full-range these days
-    // and looked washed out under the limited assumption. Broadcast
-    // masters, DVD / Blu-ray rips, and older H.264 remain limited-range
-    // and need the toggle. Bumps texture_generation_ so main.cpp
-    // recreates the SDL texture with the new colorspace property.
-    bool yuv_studio_range_ = false;
+    // YUV input-range override for SDL YUV texture uploads. Auto is the
+    // right default: it reads codecpar->color_range and sets the SDL
+    // texture colorspace accordingly (Limited for AVCOL_RANGE_MPEG /
+    // UNSPECIFIED, Full for AVCOL_RANGE_JPEG). The earlier design
+    // hard-defaulted to Full and lifted blacks on every Limited-range
+    // source - WEB-DL / Blu-ray / broadcast - because SDL then mapped
+    // Y=16 as ~6 % gray instead of true black. Force* overrides are
+    // kept for rescuing mis-tagged files. Change bumps
+    // texture_generation_ so main.cpp rebuilds the texture.
+    YuvRangeMode yuv_range_mode_ = YuvRangeMode::Auto;
     // Bump this whenever a texture-affecting setting changes so
     // main.cpp's texture-creation gate sees "dims same, but token
     // moved" and rebuilds with the new colorspace property.

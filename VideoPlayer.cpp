@@ -278,6 +278,8 @@ void VideoPlayer::unload() {
     video_width_ = 0;
     video_height_ = 0;
     video_sar_ = {1, 1};
+    video_color_range_ = AVCOL_RANGE_UNSPECIFIED;
+    video_color_space_ = AVCOL_SPC_UNSPECIFIED;
     duration_ = 0.0;
     filename_.clear();
     quit_ = false;
@@ -432,6 +434,17 @@ bool VideoPlayer::loadFile(const std::string& filename, int preferred_audio_stre
                                 ->codecpar->sample_aspect_ratio;
             if (s.num <= 0 || s.den <= 0) s = {1, 1};
             video_sar_ = s;
+        }
+
+        // Capture color range + matrix from codecpar so the renderer can pin
+        // the correct SDL_Colorspace on the YUV texture. The default Full
+        // BT.709 that SDL would otherwise map Limited-range content against
+        // lifts blacks across virtually all distribution content.
+        {
+            AVCodecParameters* cp =
+                fmt_ctx_->streams[video_stream_idx_]->codecpar;
+            video_color_range_ = cp->color_range;
+            video_color_space_ = cp->color_space;
         }
 
         // HDR classification is informational only until we have a real

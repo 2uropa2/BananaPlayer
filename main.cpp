@@ -57,6 +57,12 @@ struct AppRenderCtx {
     // Studio-range toggle in Settings), we rebuild the texture even
     // though dims are unchanged. Sentinel ~0u forces first-time build.
     unsigned int   tex_generation  = ~0u;
+    // Last SDL_Colorspace the texture was created with. Tracked
+    // separately from tex_generation because the colorspace is now
+    // resolved from the stream's codecpar - switching to a differently
+    // tagged file at the same resolution must still trigger a rebuild.
+    // SDL_COLORSPACE_UNKNOWN = 0 is the "not yet set" sentinel.
+    SDL_Colorspace tex_colorspace   = SDL_COLORSPACE_UNKNOWN;
     bool           has_first_frame = false;
 };
 AppRenderCtx g_app;
@@ -78,17 +84,52 @@ void renderOneFrame() {
         int vw = player.getOutputWidth();
         int vh = player.getOutputHeight();
         unsigned int ui_gen = ui.getTextureGeneration();
+
+        // Resolve SDL colorspace from the stream's codecpar + user
+        // override up front so we can gate on it. Full-range is the
+        // exception (MJPEG / JPEG stills / some phone camera streams
+        // tagged AVCOL_RANGE_JPEG); Limited is the right default for
+        // WEB-DL / Blu-ray / broadcast and anything with UNSPECIFIED
+        // range. BT.601 vs BT.709 follows the stream matrix tag with
+        // a resolution fallback (SD < 720 picks 601, HD/UHD picks 709)
+        // - most modern content is 709.
+        bool full_range;
+        {
+            UIController::YuvRangeMode mode = ui.getYuvRangeMode();
+            if (mode == UIController::YuvRangeMode::ForceLimited)      full_range = false;
+            else if (mode == UIController::YuvRangeMode::ForceFull)    full_range = true;
+            else /* Auto */ full_range =
+                (player.getVideoColorRange() == AVCOL_RANGE_JPEG);
+        }
+        bool bt601;
+        {
+            AVColorSpace cs_tag = player.getVideoColorSpace();
+            switch (cs_tag) {
+                case AVCOL_SPC_BT709:
+                    bt601 = false; break;
+                case AVCOL_SPC_SMPTE170M:
+                case AVCOL_SPC_BT470BG:
+                case AVCOL_SPC_FCC:
+                case AVCOL_SPC_SMPTE240M:
+                    bt601 = true;  break;
+                default:
+                    // Unspecified (or BT.2020 / other post-tone-map) -
+                    // pick by resolution. HDR tone-map output lands in
+                    // BT.709 regardless so that path falls here too.
+                    bt601 = (vh > 0 && vh < 720);
+                    break;
+            }
+        }
+        SDL_Colorspace cs;
+        if (bt601)   cs = full_range ? SDL_COLORSPACE_BT601_FULL  : SDL_COLORSPACE_BT601_LIMITED;
+        else         cs = full_range ? SDL_COLORSPACE_BT709_FULL  : SDL_COLORSPACE_BT709_LIMITED;
+
         if (vw > 0 && vh > 0
             && (vw != g_app.tex_w || vh != g_app.tex_h
                 || !g_app.video_texture
-                || ui_gen != g_app.tex_generation)) {
+                || ui_gen != g_app.tex_generation
+                || cs != g_app.tex_colorspace)) {
             if (g_app.video_texture) SDL_DestroyTexture(g_app.video_texture);
-            // Property-based creation so we can pin the input
-            // colorspace / range. Default full-range BT.709; the
-            // Studio-range toggle in Settings -> Video switches to
-            // BT.709 LIMITED (16-235). SDL's own default for YUV
-            // textures is BT.601 LIMITED, which is neither what we
-            // want as the default nor what most modern content is.
             SDL_PropertiesID props = SDL_CreateProperties();
             SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER,
                                   SDL_PIXELFORMAT_IYUV);
@@ -96,9 +137,6 @@ void renderOneFrame() {
                                   SDL_TEXTUREACCESS_STREAMING);
             SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, vw);
             SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, vh);
-            SDL_Colorspace cs = ui.getYuvStudioRange()
-                              ? SDL_COLORSPACE_BT709_LIMITED
-                              : SDL_COLORSPACE_BT709_FULL;
             SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_COLORSPACE_NUMBER,
                                   (Sint64)cs);
             g_app.video_texture = SDL_CreateTextureWithProperties(renderer, props);
@@ -107,6 +145,7 @@ void renderOneFrame() {
                 SDL_SetTextureScaleMode(g_app.video_texture, SDL_SCALEMODE_LINEAR);
             g_app.tex_w = vw; g_app.tex_h = vh;
             g_app.tex_generation = ui_gen;
+            g_app.tex_colorspace = cs;
             g_app.has_first_frame = false;
         }
     } else if (player.isLoaded() && player.isAudioOnly() && g_app.video_texture) {
@@ -117,6 +156,7 @@ void renderOneFrame() {
         g_app.video_texture   = nullptr;
         g_app.tex_w           = 0;
         g_app.tex_h           = 0;
+        g_app.tex_colorspace  = SDL_COLORSPACE_UNKNOWN;
         g_app.has_first_frame = false;
     }
     if (g_app.video_texture && !player.isAudioOnly()) {

@@ -149,6 +149,14 @@ public:
     // Pixel aspect ratio. {1,1} when unset. Callers that need the effective
     // display aspect should compute (W * sar.num) / (H * sar.den).
     AVRational getVideoSampleAspectRatio() const { return video_sar_; }
+    // Color range and matrix from the video stream's codecpar, captured at
+    // loadFile. The renderer uses these to pick the correct SDL_Colorspace
+    // for the YUV texture - without them the default assumption (Full BT.709)
+    // lifts blacks on the overwhelming majority of distribution content
+    // (WEB-DL / Blu-ray / broadcast are all Limited range). Returns
+    // AVCOL_RANGE_UNSPECIFIED / AVCOL_SPC_UNSPECIFIED until a file is loaded.
+    AVColorRange getVideoColorRange() const { return video_color_range_; }
+    AVColorSpace getVideoColorSpace() const { return video_color_space_; }
     const std::string& getFilename() const { return filename_; }
 
     // Info-panel accessors. Safe to call regardless of load state - each
@@ -587,6 +595,10 @@ private:
     // 1920x1080 shortform re-encodes may carry {607, 1920} etc. - the render
     // path must multiply width by this ratio to avoid squishing.
     AVRational video_sar_{1, 1};
+    // Color range / matrix from the stream codecpar. Captured at loadFile
+    // and cleared on unload. See getVideoColorRange() for why this matters.
+    AVColorRange video_color_range_ = AVCOL_RANGE_UNSPECIFIED;
+    AVColorSpace video_color_space_ = AVCOL_SPC_UNSPECIFIED;
     double duration_ = 0.0;
     std::string filename_;
 

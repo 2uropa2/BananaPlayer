@@ -3590,14 +3590,18 @@ void UIController::drawSettingsDialog(int W, int H) {
                     toggleHdrToneMap();
                 }
                 ImGui::Spacing();
-                bool studio = yuv_studio_range_;
-                if (ImGui::Checkbox("Studio YUV range (16-235)  -  off = full range (0-255) default",
-                                    &studio)) {
-                    yuv_studio_range_ = studio;
-                    ++texture_generation_;
-                    markConfigDirty();
-                }
-                ImGui::TextDisabled("Off suits web/social/phone footage. Turn on for DVD/Blu-ray/broadcast rips.");
+                int range_mode = (int)yuv_range_mode_;
+                radio_group("YUV range",
+                            range_mode,
+                            {{"Auto  (read stream color_range tag)", 0},
+                             {"Force Limited / Studio (16-235)",      1},
+                             {"Force Full (0-255)",                   2}},
+                            [this](int m) {
+                                yuv_range_mode_ = (YuvRangeMode)m;
+                                ++texture_generation_;
+                            });
+                ImGui::TextDisabled("Auto is correct for virtually all content (WEB-DL / Blu-ray / broadcast are Limited).");
+                ImGui::TextDisabled("Use Force Full only if blacks look crushed / dark on a known Full-range source.");
                 ImGui::Spacing();
                 radio_group("HDR half-resolution (perf lever for 4K HDR)",
                             hdr_half_res_mode_,
@@ -8024,7 +8028,17 @@ void UIController::loadConfig() {
         else if (std::strcmp(k, "subtitles_enabled") == 0) subtitles_enabled_ = std::atoi(v) != 0;
         else if (std::strcmp(k, "always_on_top") == 0)   always_on_top_ = std::atoi(v) != 0;
         else if (std::strcmp(k, "hdr_tonemap") == 0)     hdr_tonemap_enabled_ = std::atoi(v) != 0;
-        else if (std::strcmp(k, "yuv_studio_range") == 0) yuv_studio_range_ = std::atoi(v) != 0;
+        else if (std::strcmp(k, "yuv_range_mode") == 0) {
+            int i = std::atoi(v);
+            if (i < 0) i = 0; else if (i > 2) i = 2;
+            yuv_range_mode_ = (YuvRangeMode)i;
+        }
+        // Legacy key (pre-auto-detect): true -> ForceLimited, false -> Auto.
+        // Never map the old-default false to ForceFull - that was the bug.
+        else if (std::strcmp(k, "yuv_studio_range") == 0) {
+            yuv_range_mode_ = (std::atoi(v) != 0) ? YuvRangeMode::ForceLimited
+                                                  : YuvRangeMode::Auto;
+        }
         else if (std::strcmp(k, "audio_out_latency_ms") == 0) {
             int i = std::atoi(v);
             if (i < 0) i = 0; else if (i > 500) i = 500;
@@ -8150,7 +8164,7 @@ void UIController::saveConfig() {
     std::fprintf(fp, "subtitles_enabled=%d\n",  subtitles_enabled_ ? 1 : 0);
     std::fprintf(fp, "always_on_top=%d\n",      always_on_top_ ? 1 : 0);
     std::fprintf(fp, "hdr_tonemap=%d\n",        hdr_tonemap_enabled_ ? 1 : 0);
-    std::fprintf(fp, "yuv_studio_range=%d\n",   yuv_studio_range_ ? 1 : 0);
+    std::fprintf(fp, "yuv_range_mode=%d\n",     (int)yuv_range_mode_);
     std::fprintf(fp, "audio_out_latency_ms=%d\n", audio_out_latency_ms_);
     std::fprintf(fp, "time_display_mode=%d\n",  time_display_mode_);
     std::fprintf(fp, "loudness_normalize=%d\n",   loudness_normalize_ ? 1 : 0);
