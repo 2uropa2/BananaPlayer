@@ -325,6 +325,31 @@ public:
     // (1.0 == pass-through). UI reads this for the Info panel row.
     float         getAutoGain() const { return auto_gain_.load(); }
 
+    // Diagnostic tap: invoked on the audio decode thread immediately
+    // before each SDL_PutAudioStreamData call with the exact S16 stereo
+    // bytes being handed to SDL. Captures the post-filter + post-swr
+    // signal - i.e. "what the user hears". Used by the --audio-dump
+    // headless mode in main.cpp to produce WAV files for offline
+    // analysis of filter / resampler artifacts. Clear by passing a
+    // null function. Not persisted; call before play().
+    void setAudioTap(std::function<void(const uint8_t*, int)> cb) {
+        std::lock_guard<std::mutex> lk(audio_tap_mutex_);
+        audio_tap_ = std::move(cb);
+    }
+
+    // Companion to setAudioTap for the --audio-dump harness: when on,
+    // the demux thread drops video packets instead of enqueueing them,
+    // so the video packet / frame queues never fill and back-pressure
+    // the audio path. Without this, headless audio capture stalls after
+    // ~5 s because no one consumes video frames. Normal playback leaves
+    // this false; call once before play().
+    void setDemuxDiscardVideo(bool on) { demux_discard_video_.store(on); }
+    // Companion knob: when on, the demuxer no longer back-pressures on
+    // SDL audio queue depth. Needed for the --audio-dump harness where
+    // SDL runs with the "dummy" driver and never drains the stream;
+    // without this the demuxer sleeps forever once ~4 s is queued.
+    void setDemuxIgnoreAudioQueue(bool on) { demux_ignore_audio_queue_.store(on); }
+
     // Playback rate. 1.0 = real time. Values above/below rescale the master
     // clock and adjust the audio stream's frequency ratio (pitch is not
     // preserved - simple approach). Clamped to [0.25, 3.0].
@@ -565,6 +590,11 @@ private:
     bool buildLoudnessGraph_(int rate, AVSampleFormat fmt,
                              const AVChannelLayout& layout);
     void freeLoudnessGraph_();
+    // Soft-knee limiter applied to filter output before swr converts
+    // to the SDL stream's S16. Handles FLTP (the pinned buffersink
+    // format for our normal path) and FLT as a safety case. No-op for
+    // integer formats (they'd already have hard-clipped upstream).
+    static void softClipAudioFrame_(AVFrame* f);
     SwsContext*    sws_hdr_from_rgb_  = nullptr;   // RGB48LE (SDR 709) -> YUV420P
     // Precomputed tables that keep the per-pixel hot loop free of pow(),
     // div, and function calls:
@@ -777,6 +807,17 @@ private:
     // window finishes. `peak_bytes_analyzed_` tracks how much has been
     // scanned so far; `peak_max_abs_` is the running max sample magnitude
     // normalized to [0, 1]. Reset in loadFile.
+    // Diagnostic tap - see setAudioTap(). Guarded by a dedicated mutex
+    // because audioDecodeThread reads it at push rate and the main
+    // thread may install/clear it between files.
+    std::mutex audio_tap_mutex_;
+    std::function<void(const uint8_t*, int)> audio_tap_;
+    // Demux-side video discard for headless audio capture. Checked
+    // once per demuxed packet in the demux thread.
+    std::atomic<bool> demux_discard_video_{false};
+    // Demux-side SDL audio queue back-pressure bypass for headless mode.
+    std::atomic<bool> demux_ignore_audio_queue_{false};
+
     std::atomic<NormalizeMode> normalize_mode_{NormalizeMode::Off};
     std::atomic<float> auto_gain_{1.0f};
     std::atomic<uint64_t> peak_bytes_analyzed_{0};

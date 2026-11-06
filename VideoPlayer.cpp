@@ -1556,6 +1556,56 @@ void VideoPlayer::setVoiceBoost(bool on) {
     }
 }
 
+// Soft-knee limiter in the filter output domain. Below the threshold
+// signal passes through linearly; above, the overshoot is mapped
+// through a rational curve that asymptotes to the ceiling, so no
+// matter how hot the input, output stays bounded. Applied in place.
+void VideoPlayer::softClipAudioFrame_(AVFrame* f) {
+    if (!f || f->nb_samples <= 0) return;
+    const float thr  = 0.75f;
+    const float ceil = 0.95f;
+    const float knee = ceil - thr;      // 0.20
+    auto clip = [&](float x) -> float {
+        float ax = x < 0.0f ? -x : x;
+        if (ax <= thr) return x;
+        float over = ax - thr;
+        float out  = thr + knee * (over / (over + knee));
+        return (x < 0.0f) ? -out : out;
+    };
+    AVSampleFormat fmt = (AVSampleFormat)f->format;
+    // dynaudnorm actually emits DBLP by default - don't assume FLTP
+    // (that was the first-attempt bug: handling only FLTP left the
+    // real signal unclipped).
+    if (fmt == AV_SAMPLE_FMT_FLTP) {
+        int planes = f->ch_layout.nb_channels;
+        for (int ch = 0; ch < planes; ++ch) {
+            float* p = (float*)f->extended_data[ch];
+            if (!p) continue;
+            for (int i = 0; i < f->nb_samples; ++i) p[i] = clip(p[i]);
+        }
+    } else if (fmt == AV_SAMPLE_FMT_FLT) {
+        float* p = (float*)f->extended_data[0];
+        if (!p) return;
+        int total = f->nb_samples * f->ch_layout.nb_channels;
+        for (int i = 0; i < total; ++i) p[i] = clip(p[i]);
+    } else if (fmt == AV_SAMPLE_FMT_DBLP) {
+        int planes = f->ch_layout.nb_channels;
+        for (int ch = 0; ch < planes; ++ch) {
+            double* p = (double*)f->extended_data[ch];
+            if (!p) continue;
+            for (int i = 0; i < f->nb_samples; ++i)
+                p[i] = (double)clip((float)p[i]);
+        }
+    } else if (fmt == AV_SAMPLE_FMT_DBL) {
+        double* p = (double*)f->extended_data[0];
+        if (!p) return;
+        int total = f->nb_samples * f->ch_layout.nb_channels;
+        for (int i = 0; i < total; ++i)
+            p[i] = (double)clip((float)p[i]);
+    }
+    // Integer formats fell out of the filter already clipped; no op.
+}
+
 void VideoPlayer::freeLoudnessGraph_() {
     if (audio_filter_graph_) {
         avfilter_graph_free(&audio_filter_graph_);
@@ -1627,18 +1677,30 @@ bool VideoPlayer::buildLoudnessGraph_(int rate, AVSampleFormat fmt,
         prev = eq_ctx;
     }
     if (loudness_normalize_.load(std::memory_order_relaxed)) {
-        // dynaudnorm parameters:
-        //   f=200  - frame length ms (default 500; 200 = snappier response)
-        //   g=15   - gaussian window frames (default 31; 15 = still smooth
-        //            but reacts faster to loudness swings)
-        //   p=0.90 - target peak (default 0.95; leave headroom)
-        // No lookahead - suitable for real-time playback without adding
-        // A/V sync latency.
+        // dynaudnorm parameters.
+        //   f=500  - frame length ms (default 500; see m= note below)
+        //   g=15   - gaussian window frames (default 31; 15 = snappier
+        //            response to level changes without obvious pumping)
+        //   p=0.75 - target peak (default 0.95). Leaving 2.5 dB of
+        //            headroom under full scale means the inevitable
+        //            overshoot between per-frame gain estimation and
+        //            actual sample values doesn't push the resampler's
+        //            S16 conversion into hard clipping.
+        //   m=4    - max gain (default 10.0). The default allowed a
+        //            +20 dB boost which, on broadcast-mastered content
+        //            at -24 LUFS, pinned the output to full scale and
+        //            glued large plateaus to the ceiling (verified via
+        //            --audio-dump + astats on Hopeu AMZN WEB-DL: 54 %
+        //            of samples at +/-32767 with the old defaults).
+        //            4x = +12 dB is still plenty to lift a quiet laptop
+        //            source to normal TV loudness.
+        // Chased by an alimiter brick-wall at -1 dBFS as a safety net
+        // for intra-frame peaks that still slip past dynaudnorm.
         const AVFilter* dyn = avfilter_get_by_name("dynaudnorm");
         if (!dyn) { freeLoudnessGraph_(); return false; }
         AVFilterContext* dyn_ctx = nullptr;
         if (avfilter_graph_create_filter(&dyn_ctx, dyn, "dynaudnorm",
-                                         "f=200:g=15:p=0.90",
+                                         "f=500:g=15:p=0.75:m=4:s=12",
                                          nullptr, audio_filter_graph_) < 0) {
             freeLoudnessGraph_(); return false;
         }
@@ -1646,6 +1708,33 @@ bool VideoPlayer::buildLoudnessGraph_(int rate, AVSampleFormat fmt,
             freeLoudnessGraph_(); return false;
         }
         prev = dyn_ctx;
+
+        // Explicit aformat back to the decoder's native sample format.
+        // dynaudnorm internally promotes to DBLP and the buffersink pin
+        // (sample_fmts) does NOT force a reconversion: the frame reaches
+        // the sink in DBLP and gets handed to a swr_ctx_ configured for
+        // FLTP input, producing hard-clipped garbage. Inserting an
+        // explicit aformat makes the format conversion visible and
+        // guaranteed. sample_fmt name needed in the options string; we
+        // look it up from the pinned `fmt` param.
+        const AVFilter* afmt = avfilter_get_by_name("aformat");
+        if (afmt) {
+            const char* fmt_name = av_get_sample_fmt_name(fmt);
+            if (fmt_name) {
+                char layout_pin[128];
+                av_channel_layout_describe(&layout, layout_pin, sizeof(layout_pin));
+                char args[256];
+                std::snprintf(args, sizeof(args),
+                    "sample_fmts=%s:sample_rates=%d:channel_layouts=%s",
+                    fmt_name, rate, layout_pin);
+                AVFilterContext* afmt_ctx = nullptr;
+                if (avfilter_graph_create_filter(&afmt_ctx, afmt, "backfmt",
+                                                 args, nullptr, audio_filter_graph_) >= 0
+                    && avfilter_link(prev, 0, afmt_ctx, 0) >= 0) {
+                    prev = afmt_ctx;
+                }
+            }
+        }
     }
     if (avfilter_link(prev, 0, audio_buffersink_, 0) < 0) {
         freeLoudnessGraph_(); return false;
@@ -2826,6 +2915,7 @@ void VideoPlayer::demuxDecodeThread() {
         // The per-stream enqueue below waits if its own queue is
         // full, so memory stays bounded either way.
         if (audio_stream_
+            && !demux_ignore_audio_queue_.load(std::memory_order_relaxed)
             && SDL_GetAudioStreamQueued(audio_stream_) > AUDIO_QUEUE_MAX_BYTES) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
@@ -2866,10 +2956,12 @@ void VideoPlayer::demuxDecodeThread() {
         }
 
         if (packet->stream_index == video_stream_idx_) {
-            enqueuePacketClone(packet, video_pkt_queue_,
-                               video_pkt_mutex_, video_pkt_cv_,
-                               kVideoPktQueueMax, quit_, seek_requested_);
-            demux_video_packets_.fetch_add(1, std::memory_order_relaxed);
+            if (!demux_discard_video_.load(std::memory_order_relaxed)) {
+                enqueuePacketClone(packet, video_pkt_queue_,
+                                   video_pkt_mutex_, video_pkt_cv_,
+                                   kVideoPktQueueMax, quit_, seek_requested_);
+                demux_video_packets_.fetch_add(1, std::memory_order_relaxed);
+            }
         } else if (packet->stream_index == audio_stream_idx_
                    && audio_dec_ctx_ && swr_ctx_ && audio_stream_) {
             enqueuePacketClone(packet, audio_pkt_queue_,
@@ -3173,6 +3265,10 @@ void VideoPlayer::audioDecodeThread() {
                     audio_skip_to_pts_.store(-1e18, std::memory_order_relaxed);
                 }
                 samplePeak_((const int16_t*)tmp.data(), bytes);
+                {
+                    std::lock_guard<std::mutex> lk_tap(audio_tap_mutex_);
+                    if (audio_tap_) audio_tap_(tmp.data(), bytes);
+                }
                 SDL_PutAudioStreamData(audio_stream_, tmp.data(), bytes);
                 std::lock_guard<std::mutex> lk2(clock_mutex_);
                 if (audio_base_needs_capture_ && frame_pts_sec >= 0.0) {
@@ -3238,6 +3334,17 @@ void VideoPlayer::audioDecodeThread() {
                         while (out && !quit_) {
                             int fret = av_buffersink_get_frame(audio_buffersink_, out);
                             if (fret < 0) break;
+                            // Soft-clip filter output before swr converts
+                            // to S16. dynaudnorm's gaussian-smoothed per
+                            // -frame gain can over-boost loud transients
+                            // that land in a window dominated by quiet
+                            // frames (verified: 51 % of samples at full
+                            // scale with p=0.75:m=4 alone), and swr's S16
+                            // conversion then hard-clips them. A soft knee
+                            // at 0.75 with asymptote at 0.95 leaves quiet
+                            // signal untouched and smoothly compresses
+                            // anything that would otherwise clip.
+                            softClipAudioFrame_(out);
                             processAndPush(out);
                             av_frame_unref(out);
                         }

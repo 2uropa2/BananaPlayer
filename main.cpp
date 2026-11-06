@@ -269,6 +269,171 @@ int main(int argc, char* argv[]) {
             break;
         }
     }
+
+    // Headless audio-dump mode. Writes the exact post-filter + post-swr
+    // S16 stereo PCM that would be handed to SDL as a WAV file, then
+    // exits. Used to self-verify audio artifacts (dynaudnorm clipping,
+    // resampler zipper noise, etc.) without needing to listen.
+    //   BananaPlayer.exe --audio-dump OUT.wav [--audio-dump-seconds N]
+    //     [--audio-dump-start SEC] [--audio-dump-normalize]
+    //     [--audio-dump-voiceboost] INPUT
+    // Bypasses SDL video / window / UIController entirely; opens an
+    // audio-only dummy SDL device so VideoPlayer's push path runs.
+    const char* dump_path     = nullptr;
+    const char* dump_input    = nullptr;
+    double      dump_seconds  = 30.0;
+    double      dump_start    = 0.0;
+    bool        dump_loudness = false;
+    bool        dump_voice    = false;
+    std::vector<const char*> positional;
+    for (int i = 1; i < argc; ++i) {
+        const char* a = argv[i];
+        if (!a) continue;
+        if (std::strcmp(a, "--audio-dump") == 0 && i + 1 < argc) {
+            dump_path = argv[++i];
+        } else if (std::strcmp(a, "--audio-dump-seconds") == 0 && i + 1 < argc) {
+            dump_seconds = std::atof(argv[++i]);
+            if (dump_seconds <= 0.0) dump_seconds = 30.0;
+        } else if (std::strcmp(a, "--audio-dump-start") == 0 && i + 1 < argc) {
+            dump_start = std::atof(argv[++i]);
+            if (dump_start < 0.0) dump_start = 0.0;
+        } else if (std::strcmp(a, "--audio-dump-normalize") == 0) {
+            dump_loudness = true;
+        } else if (std::strcmp(a, "--audio-dump-voiceboost") == 0) {
+            dump_voice = true;
+        } else if (a[0] != '-') {
+            positional.push_back(a);
+        }
+    }
+    if (dump_path) {
+        if (positional.empty()) {
+            std::fprintf(stderr, "--audio-dump requires an INPUT file\n");
+            return 2;
+        }
+        dump_input = positional.front();
+
+        // Dummy SDL audio driver: opens a device that accepts samples
+        // but never drains them (we don't care - the tap captures the
+        // bytes before SDL even sees them). Must be set BEFORE SDL_Init.
+        SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "dummy");
+        if (!SDL_Init(SDL_INIT_AUDIO)) {
+            std::fprintf(stderr, "SDL_Init(AUDIO) failed: %s\n", SDL_GetError());
+            return 3;
+        }
+
+        // WAV: write a 44-byte RIFF header with placeholder sizes, then
+        // append raw PCM, then rewind and patch sizes on exit. S16LE
+        // stereo at the source sample rate (set after loadFile).
+        FILE* fp = std::fopen(dump_path, "wb");
+        if (!fp) {
+            std::fprintf(stderr, "cannot open %s for writing\n", dump_path);
+            SDL_Quit();
+            return 4;
+        }
+
+        VideoPlayer dp_player;
+        // Discard video packets at demux so the video queue never
+        // back-pressures the audio decode path in headless mode.
+        dp_player.setDemuxDiscardVideo(true);
+        // Dummy SDL driver never drains the audio stream, so disable
+        // the normal "sleep when SDL queue > 768KB" back-pressure.
+        dp_player.setDemuxIgnoreAudioQueue(true);
+        if (!dp_player.loadFile(dump_input)) {
+            std::fprintf(stderr, "loadFile failed: %s\n", dump_input);
+            std::fclose(fp);
+            SDL_Quit();
+            return 5;
+        }
+        int rate = dp_player.getAudioSampleRate();
+        if (rate <= 0) {
+            std::fprintf(stderr, "no audio stream in %s\n", dump_input);
+            std::fclose(fp);
+            SDL_Quit();
+            return 6;
+        }
+        const int channels = 2;                 // VideoPlayer hardcodes stereo
+        const int bits     = 16;
+        const int byte_rate   = rate * channels * (bits / 8);
+        const int block_align = channels * (bits / 8);
+
+        auto write_u32_le = [&](uint32_t v) {
+            uint8_t b[4] = { (uint8_t)(v & 0xff), (uint8_t)((v >> 8) & 0xff),
+                             (uint8_t)((v >> 16) & 0xff), (uint8_t)((v >> 24) & 0xff) };
+            std::fwrite(b, 1, 4, fp);
+        };
+        auto write_u16_le = [&](uint16_t v) {
+            uint8_t b[2] = { (uint8_t)(v & 0xff), (uint8_t)((v >> 8) & 0xff) };
+            std::fwrite(b, 1, 2, fp);
+        };
+        std::fwrite("RIFF", 1, 4, fp); write_u32_le(0);          // size patched later
+        std::fwrite("WAVE", 1, 4, fp);
+        std::fwrite("fmt ", 1, 4, fp); write_u32_le(16);
+        write_u16_le(1);                                          // PCM
+        write_u16_le((uint16_t)channels);
+        write_u32_le((uint32_t)rate);
+        write_u32_le((uint32_t)byte_rate);
+        write_u16_le((uint16_t)block_align);
+        write_u16_le((uint16_t)bits);
+        std::fwrite("data", 1, 4, fp); write_u32_le(0);          // size patched later
+
+        const uint64_t target_bytes = (uint64_t)(dump_seconds * byte_rate);
+        std::atomic<uint64_t> written{0};
+        std::mutex fp_mutex;
+        dp_player.setAudioTap([&](const uint8_t* data, int n) {
+            uint64_t already = written.load();
+            if (already >= target_bytes) return;
+            int to_write = n;
+            if (already + (uint64_t)to_write > target_bytes) {
+                to_write = (int)(target_bytes - already);
+            }
+            {
+                std::lock_guard<std::mutex> lk(fp_mutex);
+                std::fwrite(data, 1, (size_t)to_write, fp);
+            }
+            written.fetch_add((uint64_t)to_write);
+        });
+
+        if (dump_loudness) dp_player.setLoudnessNormalize(true);
+        if (dump_voice)    dp_player.setVoiceBoost(true);
+        if (dump_start > 0.0) dp_player.seek(dump_start);
+        dp_player.play();
+
+        // Spin until the tap has captured enough. Timeout at 60 s wall
+        // so a stuck decoder doesn't hang the process.
+        Uint64 start_ms = SDL_GetTicks();
+        while (written.load() < target_bytes) {
+            Uint64 elapsed = SDL_GetTicks() - start_ms;
+            if (elapsed > 60000) {
+                std::fprintf(stderr, "timeout after %llu ms, got %llu / %llu bytes\n",
+                             (unsigned long long)elapsed,
+                             (unsigned long long)written.load(),
+                             (unsigned long long)target_bytes);
+                break;
+            }
+            SDL_Delay(20);
+        }
+
+        // Clear tap before player destruction so the decode thread
+        // can't fire into a dangling fp during teardown.
+        dp_player.setAudioTap({});
+        dp_player.unload();
+
+        // Patch WAV header sizes in place.
+        uint64_t data_bytes  = written.load();
+        uint32_t riff_size   = (uint32_t)(36 + data_bytes);
+        std::fflush(fp);
+        std::fseek(fp, 4, SEEK_SET); write_u32_le(riff_size);
+        std::fseek(fp, 40, SEEK_SET); write_u32_le((uint32_t)data_bytes);
+        std::fclose(fp);
+        std::fprintf(stdout,
+            "wrote %s  rate=%d ch=%d bytes=%llu seconds=%.3f  normalize=%d voiceboost=%d start=%.1f\n",
+            dump_path, rate, channels,
+            (unsigned long long)data_bytes,
+            (double)data_bytes / (double)byte_rate,
+            dump_loudness ? 1 : 0, dump_voice ? 1 : 0, dump_start);
+        SDL_Quit();
+        return 0;
+    }
 #ifdef _WIN32
     // Single-instance handoff. Read the persisted setting BEFORE SDL
     // init so the "forward + exit" fast path skips window creation.
