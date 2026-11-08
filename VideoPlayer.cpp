@@ -1678,7 +1678,12 @@ bool VideoPlayer::buildLoudnessGraph_(int rate, AVSampleFormat fmt,
     }
     if (loudness_normalize_.load(std::memory_order_relaxed)) {
         // dynaudnorm parameters.
-        //   f=500  - frame length ms (default 500; see m= note below)
+        //   f=200  - frame length ms (default 500). 500 was tried but
+        //            widened the MediaClock-nudge interval to 2 Hz and
+        //            visibly stuttered video on long files; 200 keeps
+        //            audio push arriving ~5 times/sec which matches
+        //            the MediaClock drift-correction cadence and the
+        //            old value before the format fix landed.
         //   g=15   - gaussian window frames (default 31; 15 = snappier
         //            response to level changes without obvious pumping)
         //   p=0.75 - target peak (default 0.95). Leaving 2.5 dB of
@@ -1700,7 +1705,7 @@ bool VideoPlayer::buildLoudnessGraph_(int rate, AVSampleFormat fmt,
         if (!dyn) { freeLoudnessGraph_(); return false; }
         AVFilterContext* dyn_ctx = nullptr;
         if (avfilter_graph_create_filter(&dyn_ctx, dyn, "dynaudnorm",
-                                         "f=500:g=15:p=0.75:m=4:s=12",
+                                         "f=200:g=15:p=0.75:m=4",
                                          nullptr, audio_filter_graph_) < 0) {
             freeLoudnessGraph_(); return false;
         }
