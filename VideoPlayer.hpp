@@ -274,30 +274,11 @@ public:
     void setMuted(bool m);
     bool isMuted() const { return muted_.load(); }
 
-    // Loudness normalization for quiet content. Runs the FFmpeg
-    // `dynaudnorm` audio filter (dynamic loudness normalization) in
-    // the decode path. Unlike `loudnorm` proper which has ~3 s of
-    // lookahead latency (fine for authoring, breaks A/V sync for
-    // real-time playback), dynaudnorm operates on short windows with
-    // no lookahead - designed exactly for the "movie has quiet
-    // dialogue and I keep reaching for the volume" case.
-    // Runs in ADDITION to setNormalizeMode's peak-based static gain -
-    // typical use is either/or, but they compose cleanly if both.
-    // Persisted in banana.config as `loudness_normalize`.
-    void setLoudnessNormalize(bool on);
-    bool isLoudnessNormalize() const { return loudness_normalize_.load(); }
-
-    // Voice boost. Off (default) leaves audio untouched. On inserts an
-    // FFmpeg `equalizer` filter into the same graph as dynaudnorm (see
-    // buildLoudnessGraph_) with +6 dB centered around 2.5 kHz, which
-    // is the "presence" band where consonants and dialogue clarity
-    // live. Cheap - one biquad per channel. Solves the perennial
-    // "explosions are loud, whispers are inaudible" cross-forum
-    // complaint that dynaudnorm alone doesn't address (dynaudnorm just
-    // compresses dynamic range; it doesn't emphasize the voice band).
-    // Persisted in banana.config as `voice_boost`.
-    void setVoiceBoost(bool on);
-    bool isVoiceBoost() const { return voice_boost_.load(); }
+    // (Loudness normalizer + voice boost removed 2026-11-09. The
+    // dynaudnorm + equalizer filter graph produced A/V desync and
+    // stutter issues that compounded with the MediaClock pacing path
+    // and weren't worth the maintenance overhead. The `--audio-dump`
+    // harness in main.cpp still exists for future audio diagnosis.)
 
     // Scrub hint. Set true while the UI is in an active drag on the
     // seek bar; false for one-shot seeks (arrow keys, click on the
@@ -563,38 +544,9 @@ private:
     bool buildDeinterlaceGraph_(AVPixelFormat pix_fmt, int W, int H,
                                 AVRational time_base);
     void freeDeinterlaceGraph_();
-    // Loudness normalize (dynaudnorm) audio filter graph. Owned by the
-    // decode thread. `loudness_normalize_` is the UI toggle;
-    // `loudness_rebuild_` flips when the toggle changes so the next
-    // decode iteration tears down / rebuilds.
-    std::atomic<bool>            loudness_normalize_{true};
-    std::atomic<bool>            loudness_rebuild_{false};
-    // Voice boost. Same graph as loudness_normalize_ (see
-    // buildLoudnessGraph_) - a change to either flag flips
-    // loudness_rebuild_ so the decode thread reconstructs the chain.
-    std::atomic<bool>            voice_boost_{false};
     // Scrub hint set by the UI while the user drags the seek bar.
     // Read-only from the decode + updateTexture paths.
     std::atomic<bool>            scrubbing_{false};
-    // Set true when a graph build attempt failed for the current audio
-    // configuration. Prevents the decode thread from spinning on
-    // buildLoudnessGraph_() every frame. Cleared on toggle-off / on
-    // rebuild request / on format change.
-    bool                         loudness_build_failed_ = false;
-    AVFilterGraph*   audio_filter_graph_ = nullptr;
-    AVFilterContext* audio_buffersrc_    = nullptr;
-    AVFilterContext* audio_buffersink_   = nullptr;
-    int              audio_filter_rate_     = 0;
-    AVSampleFormat   audio_filter_fmt_      = AV_SAMPLE_FMT_NONE;
-    uint64_t         audio_filter_ch_hash_  = 0;
-    bool buildLoudnessGraph_(int rate, AVSampleFormat fmt,
-                             const AVChannelLayout& layout);
-    void freeLoudnessGraph_();
-    // Soft-knee limiter applied to filter output before swr converts
-    // to the SDL stream's S16. Handles FLTP (the pinned buffersink
-    // format for our normal path) and FLT as a safety case. No-op for
-    // integer formats (they'd already have hard-clipped upstream).
-    static void softClipAudioFrame_(AVFrame* f);
     SwsContext*    sws_hdr_from_rgb_  = nullptr;   // RGB48LE (SDR 709) -> YUV420P
     // Precomputed tables that keep the per-pixel hot loop free of pow(),
     // div, and function calls:
@@ -863,9 +815,8 @@ private:
     std::mutex              audio_pkt_mutex_;
     std::condition_variable audio_pkt_cv_;
     static constexpr size_t kAudioPktQueueMax = 256;
-    // Serializes writes/flushes to audio_dec_ctx_, swr_ctx_,
-    // audio_filter_graph_ (dynaudnorm), and audio_stream_ between
-    // demux (seek flush) and audio decode.
+    // Serializes writes/flushes to audio_dec_ctx_, swr_ctx_, and
+    // audio_stream_ between demux (seek flush) and audio decode.
     std::mutex              audio_ctx_mutex_;
     // Serializes writes/flushes to video_dec_ctx_, sws_ctx_,
     // filter_graph_ (deinterlace) between demux (seek flush) and

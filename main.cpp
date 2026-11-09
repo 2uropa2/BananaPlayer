@@ -275,16 +275,13 @@ int main(int argc, char* argv[]) {
     // exits. Used to self-verify audio artifacts (dynaudnorm clipping,
     // resampler zipper noise, etc.) without needing to listen.
     //   BananaPlayer.exe --audio-dump OUT.wav [--audio-dump-seconds N]
-    //     [--audio-dump-start SEC] [--audio-dump-normalize]
-    //     [--audio-dump-voiceboost] INPUT
+    //     [--audio-dump-start SEC] INPUT
     // Bypasses SDL video / window / UIController entirely; opens an
     // audio-only dummy SDL device so VideoPlayer's push path runs.
     const char* dump_path     = nullptr;
     const char* dump_input    = nullptr;
     double      dump_seconds  = 30.0;
     double      dump_start    = 0.0;
-    bool        dump_loudness = false;
-    bool        dump_voice    = false;
     std::vector<const char*> positional;
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
@@ -297,10 +294,6 @@ int main(int argc, char* argv[]) {
         } else if (std::strcmp(a, "--audio-dump-start") == 0 && i + 1 < argc) {
             dump_start = std::atof(argv[++i]);
             if (dump_start < 0.0) dump_start = 0.0;
-        } else if (std::strcmp(a, "--audio-dump-normalize") == 0) {
-            dump_loudness = true;
-        } else if (std::strcmp(a, "--audio-dump-voiceboost") == 0) {
-            dump_voice = true;
         } else if (a[0] != '-') {
             positional.push_back(a);
         }
@@ -393,8 +386,6 @@ int main(int argc, char* argv[]) {
             written.fetch_add((uint64_t)to_write);
         });
 
-        if (dump_loudness) dp_player.setLoudnessNormalize(true);
-        if (dump_voice)    dp_player.setVoiceBoost(true);
         if (dump_start > 0.0) dp_player.seek(dump_start);
         dp_player.play();
 
@@ -426,11 +417,11 @@ int main(int argc, char* argv[]) {
         std::fseek(fp, 40, SEEK_SET); write_u32_le((uint32_t)data_bytes);
         std::fclose(fp);
         std::fprintf(stdout,
-            "wrote %s  rate=%d ch=%d bytes=%llu seconds=%.3f  normalize=%d voiceboost=%d start=%.1f\n",
+            "wrote %s  rate=%d ch=%d bytes=%llu seconds=%.3f  start=%.1f\n",
             dump_path, rate, channels,
             (unsigned long long)data_bytes,
             (double)data_bytes / (double)byte_rate,
-            dump_loudness ? 1 : 0, dump_voice ? 1 : 0, dump_start);
+            dump_start);
         SDL_Quit();
         return 0;
     }

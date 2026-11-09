@@ -263,7 +263,6 @@ void VideoPlayer::unload() {
     hdr_out_lut_.clear();
     hdr_hlg_gain_lut_.clear();
     freeDeinterlaceGraph_();
-    freeLoudnessGraph_();
     source_interlaced_ = false;
     closeEmbeddedSubtitleDecoder_();
     embedded_sub_tracks_.clear();
@@ -1540,218 +1539,6 @@ void VideoPlayer::setDeinterlaceMode(DeinterlaceMode m) {
     if (deinterlace_mode_.exchange(m) != m) {
         deinterlace_rebuild_.store(true);
     }
-}
-
-void VideoPlayer::setLoudnessNormalize(bool on) {
-    if (loudness_normalize_.exchange(on) != on) {
-        loudness_rebuild_.store(true);
-    }
-}
-
-void VideoPlayer::setVoiceBoost(bool on) {
-    if (voice_boost_.exchange(on) != on) {
-        // Shares the audio filter graph with dynaudnorm - a change to
-        // either flag triggers a rebuild.
-        loudness_rebuild_.store(true);
-    }
-}
-
-// Soft-knee limiter in the filter output domain. Below the threshold
-// signal passes through linearly; above, the overshoot is mapped
-// through a rational curve that asymptotes to the ceiling, so no
-// matter how hot the input, output stays bounded. Applied in place.
-void VideoPlayer::softClipAudioFrame_(AVFrame* f) {
-    if (!f || f->nb_samples <= 0) return;
-    const float thr  = 0.75f;
-    const float ceil = 0.95f;
-    const float knee = ceil - thr;      // 0.20
-    auto clip = [&](float x) -> float {
-        float ax = x < 0.0f ? -x : x;
-        if (ax <= thr) return x;
-        float over = ax - thr;
-        float out  = thr + knee * (over / (over + knee));
-        return (x < 0.0f) ? -out : out;
-    };
-    AVSampleFormat fmt = (AVSampleFormat)f->format;
-    // dynaudnorm actually emits DBLP by default - don't assume FLTP
-    // (that was the first-attempt bug: handling only FLTP left the
-    // real signal unclipped).
-    if (fmt == AV_SAMPLE_FMT_FLTP) {
-        int planes = f->ch_layout.nb_channels;
-        for (int ch = 0; ch < planes; ++ch) {
-            float* p = (float*)f->extended_data[ch];
-            if (!p) continue;
-            for (int i = 0; i < f->nb_samples; ++i) p[i] = clip(p[i]);
-        }
-    } else if (fmt == AV_SAMPLE_FMT_FLT) {
-        float* p = (float*)f->extended_data[0];
-        if (!p) return;
-        int total = f->nb_samples * f->ch_layout.nb_channels;
-        for (int i = 0; i < total; ++i) p[i] = clip(p[i]);
-    } else if (fmt == AV_SAMPLE_FMT_DBLP) {
-        int planes = f->ch_layout.nb_channels;
-        for (int ch = 0; ch < planes; ++ch) {
-            double* p = (double*)f->extended_data[ch];
-            if (!p) continue;
-            for (int i = 0; i < f->nb_samples; ++i)
-                p[i] = (double)clip((float)p[i]);
-        }
-    } else if (fmt == AV_SAMPLE_FMT_DBL) {
-        double* p = (double*)f->extended_data[0];
-        if (!p) return;
-        int total = f->nb_samples * f->ch_layout.nb_channels;
-        for (int i = 0; i < total; ++i)
-            p[i] = (double)clip((float)p[i]);
-    }
-    // Integer formats fell out of the filter already clipped; no op.
-}
-
-void VideoPlayer::freeLoudnessGraph_() {
-    if (audio_filter_graph_) {
-        avfilter_graph_free(&audio_filter_graph_);
-    }
-    audio_filter_graph_   = nullptr;
-    audio_buffersrc_      = nullptr;
-    audio_buffersink_     = nullptr;
-    audio_filter_rate_    = 0;
-    audio_filter_fmt_     = AV_SAMPLE_FMT_NONE;
-    audio_filter_ch_hash_ = 0;
-    // Clear the "give-up" flag so the next file / codec gets a fresh
-    // build attempt. Without this, one file that dynaudnorm couldn't
-    // handle (unusual sample format, exotic layout) would silently
-    // disable loudness normalize for the entire session until the
-    // user toggled it off/on.
-    loudness_build_failed_ = false;
-}
-
-bool VideoPlayer::buildLoudnessGraph_(int rate, AVSampleFormat fmt,
-                                      const AVChannelLayout& layout) {
-    freeLoudnessGraph_();
-    audio_filter_graph_ = avfilter_graph_alloc();
-    if (!audio_filter_graph_) return false;
-
-    const AVFilter* src_flt = avfilter_get_by_name("abuffer");
-    const AVFilter* snk_flt = avfilter_get_by_name("abuffersink");
-    if (!src_flt || !snk_flt) { freeLoudnessGraph_(); return false; }
-
-    char layout_str[128] = "stereo";
-    av_channel_layout_describe(&layout, layout_str, sizeof(layout_str));
-
-    char args[256];
-    std::snprintf(args, sizeof(args),
-        "sample_rate=%d:sample_fmt=%s:channel_layout=%s:time_base=1/%d",
-        rate, av_get_sample_fmt_name(fmt), layout_str, rate);
-    if (avfilter_graph_create_filter(&audio_buffersrc_, src_flt, "ain", args,
-                                     nullptr, audio_filter_graph_) < 0) {
-        freeLoudnessGraph_(); return false;
-    }
-    if (avfilter_graph_create_filter(&audio_buffersink_, snk_flt, "aout",
-                                     nullptr, nullptr, audio_filter_graph_) < 0) {
-        freeLoudnessGraph_(); return false;
-    }
-
-    // Chain composition: buffersrc -> [equalizer if voice_boost_] ->
-    // [dynaudnorm if loudness_normalize_] -> buffersink. Either or both
-    // may be on; caller guarantees at least one (otherwise the whole
-    // graph is bypassed by the decode thread and this function isn't
-    // called at all).
-    AVFilterContext* prev = audio_buffersrc_;
-    if (voice_boost_.load(std::memory_order_relaxed)) {
-        // "Presence" band boost: single biquad centered on 2.5 kHz with
-        // a wide Q so the lift covers ~1.5-4 kHz where consonants and
-        // dialogue clarity live. +6 dB is enough to make whispers
-        // audible over ambient music without pumping vocals in normal
-        // scenes. Uses the built-in `equalizer` filter (one biquad per
-        // channel, near-zero CPU on modern hardware).
-        const AVFilter* eq = avfilter_get_by_name("equalizer");
-        if (!eq) { freeLoudnessGraph_(); return false; }
-        AVFilterContext* eq_ctx = nullptr;
-        if (avfilter_graph_create_filter(&eq_ctx, eq, "voiceboost",
-                                         "f=2500:width_type=q:width=1.0:gain=6",
-                                         nullptr, audio_filter_graph_) < 0) {
-            freeLoudnessGraph_(); return false;
-        }
-        if (avfilter_link(prev, 0, eq_ctx, 0) < 0) {
-            freeLoudnessGraph_(); return false;
-        }
-        prev = eq_ctx;
-    }
-    if (loudness_normalize_.load(std::memory_order_relaxed)) {
-        // dynaudnorm parameters.
-        //   f=200  - frame length ms (default 500). 500 was tried but
-        //            widened the MediaClock-nudge interval to 2 Hz and
-        //            visibly stuttered video on long files; 200 keeps
-        //            audio push arriving ~5 times/sec which matches
-        //            the MediaClock drift-correction cadence and the
-        //            old value before the format fix landed.
-        //   g=15   - gaussian window frames (default 31; 15 = snappier
-        //            response to level changes without obvious pumping)
-        //   p=0.75 - target peak (default 0.95). Leaving 2.5 dB of
-        //            headroom under full scale means the inevitable
-        //            overshoot between per-frame gain estimation and
-        //            actual sample values doesn't push the resampler's
-        //            S16 conversion into hard clipping.
-        //   m=4    - max gain (default 10.0). The default allowed a
-        //            +20 dB boost which, on broadcast-mastered content
-        //            at -24 LUFS, pinned the output to full scale and
-        //            glued large plateaus to the ceiling (verified via
-        //            --audio-dump + astats on Hopeu AMZN WEB-DL: 54 %
-        //            of samples at +/-32767 with the old defaults).
-        //            4x = +12 dB is still plenty to lift a quiet laptop
-        //            source to normal TV loudness.
-        // Chased by an alimiter brick-wall at -1 dBFS as a safety net
-        // for intra-frame peaks that still slip past dynaudnorm.
-        const AVFilter* dyn = avfilter_get_by_name("dynaudnorm");
-        if (!dyn) { freeLoudnessGraph_(); return false; }
-        AVFilterContext* dyn_ctx = nullptr;
-        if (avfilter_graph_create_filter(&dyn_ctx, dyn, "dynaudnorm",
-                                         "f=200:g=15:p=0.75:m=4",
-                                         nullptr, audio_filter_graph_) < 0) {
-            freeLoudnessGraph_(); return false;
-        }
-        if (avfilter_link(prev, 0, dyn_ctx, 0) < 0) {
-            freeLoudnessGraph_(); return false;
-        }
-        prev = dyn_ctx;
-
-        // Explicit aformat back to the decoder's native sample format.
-        // dynaudnorm internally promotes to DBLP and the buffersink pin
-        // (sample_fmts) does NOT force a reconversion: the frame reaches
-        // the sink in DBLP and gets handed to a swr_ctx_ configured for
-        // FLTP input, producing hard-clipped garbage. Inserting an
-        // explicit aformat makes the format conversion visible and
-        // guaranteed. sample_fmt name needed in the options string; we
-        // look it up from the pinned `fmt` param.
-        const AVFilter* afmt = avfilter_get_by_name("aformat");
-        if (afmt) {
-            const char* fmt_name = av_get_sample_fmt_name(fmt);
-            if (fmt_name) {
-                char layout_pin[128];
-                av_channel_layout_describe(&layout, layout_pin, sizeof(layout_pin));
-                char args[256];
-                std::snprintf(args, sizeof(args),
-                    "sample_fmts=%s:sample_rates=%d:channel_layouts=%s",
-                    fmt_name, rate, layout_pin);
-                AVFilterContext* afmt_ctx = nullptr;
-                if (avfilter_graph_create_filter(&afmt_ctx, afmt, "backfmt",
-                                                 args, nullptr, audio_filter_graph_) >= 0
-                    && avfilter_link(prev, 0, afmt_ctx, 0) >= 0) {
-                    prev = afmt_ctx;
-                }
-            }
-        }
-    }
-    if (avfilter_link(prev, 0, audio_buffersink_, 0) < 0) {
-        freeLoudnessGraph_(); return false;
-    }
-    if (avfilter_graph_config(audio_filter_graph_, nullptr) < 0) {
-        freeLoudnessGraph_(); return false;
-    }
-    audio_filter_rate_ = rate;
-    audio_filter_fmt_  = fmt;
-    audio_filter_ch_hash_ = (uint64_t)layout.nb_channels
-                          | ((uint64_t)layout.order << 8);
-    return true;
 }
 
 void VideoPlayer::applyGain() {
@@ -3244,9 +3031,8 @@ void VideoPlayer::audioDecodeThread() {
                     double rms = nsamp ? std::sqrt((double)sqsum / (double)nsamp) : 0.0;
                     static int pc = 0; ++pc;
                     if (pc <= 40 || pc % 50 == 0) {
-                        bool loud_on = loudness_normalize_.load();
-                        bpTrace("[push] #%d loud=%d nb=%d bytes=%d peak=%d rms=%.1f fmt=%d fpts=%.3f",
-                                pc, (int)loud_on, in_samples, bytes, peak, rms,
+                        bpTrace("[push] #%d nb=%d bytes=%d peak=%d rms=%.1f fmt=%d fpts=%.3f",
+                                pc, in_samples, bytes, peak, rms,
                                 (int)frame->format, ptsToSec(frame->pts, audio_time_base_));
                     }
                 }
@@ -3296,68 +3082,7 @@ void VideoPlayer::audioDecodeThread() {
 
             while (!quit_
                    && avcodec_receive_frame(audio_dec_ctx_, dec_frame) >= 0) {
-                // The audio filter graph now hosts EITHER dynaudnorm,
-                // voice-boost equalizer, or both. `want_filter` is true
-                // when at least one is on; the rebuild flag is shared.
-                bool want_loud   = loudness_normalize_.load();
-                bool want_voice  = voice_boost_.load();
-                bool want_filter = want_loud || want_voice;
-                if (loudness_rebuild_.exchange(false)) {
-                    if (!want_filter) freeLoudnessGraph_();
-                    loudness_build_failed_ = false;
-                }
-                bool use_filter = false;
-                if (want_filter && !loudness_build_failed_) {
-                    bool need_rebuild = !audio_filter_graph_
-                        || audio_filter_rate_ != dec_frame->sample_rate
-                        || audio_filter_fmt_  != (AVSampleFormat)dec_frame->format
-                        || audio_filter_ch_hash_ !=
-                           ((uint64_t)dec_frame->ch_layout.nb_channels
-                            | ((uint64_t)dec_frame->ch_layout.order << 8));
-                    if (need_rebuild) {
-                        loudness_build_failed_ = !buildLoudnessGraph_(
-                            dec_frame->sample_rate,
-                            (AVSampleFormat)dec_frame->format,
-                            dec_frame->ch_layout);
-                    }
-                    use_filter = (audio_filter_graph_ != nullptr);
-                }
-
-                if (use_filter) {
-                    // Feed the input, then drain ALL currently-available
-                    // output frames. dynaudnorm's f=200 ms internal frame
-                    // means it buffers ~6 input frames (32 ms E-AC3 each)
-                    // before emitting one 9600-sample output. Pulling
-                    // only one output per input meant we pushed 6 raw +
-                    // 1 filtered per 200 ms of source = ~2x SDL feed
-                    // rate = shredded/glitched audio. Now: raw NEVER
-                    // reaches SDL when the filter is on; only filter
-                    // outputs do.
-                    if (av_buffersrc_add_frame_flags(audio_buffersrc_,
-                            dec_frame, AV_BUFFERSRC_FLAG_KEEP_REF) >= 0) {
-                        AVFrame* out = av_frame_alloc();
-                        while (out && !quit_) {
-                            int fret = av_buffersink_get_frame(audio_buffersink_, out);
-                            if (fret < 0) break;
-                            // Soft-clip filter output before swr converts
-                            // to S16. dynaudnorm's gaussian-smoothed per
-                            // -frame gain can over-boost loud transients
-                            // that land in a window dominated by quiet
-                            // frames (verified: 51 % of samples at full
-                            // scale with p=0.75:m=4 alone), and swr's S16
-                            // conversion then hard-clips them. A soft knee
-                            // at 0.75 with asymptote at 0.95 leaves quiet
-                            // signal untouched and smoothly compresses
-                            // anything that would otherwise clip.
-                            softClipAudioFrame_(out);
-                            processAndPush(out);
-                            av_frame_unref(out);
-                        }
-                        if (out) av_frame_free(&out);
-                    }
-                } else {
-                    processAndPush(dec_frame);
-                }
+                processAndPush(dec_frame);
                 av_frame_unref(dec_frame);
             }
             if (is_flush && audio_stream_) SDL_FlushAudioStream(audio_stream_);

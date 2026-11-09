@@ -303,7 +303,7 @@ older configs survive future versions.
 | `subtitle_outline` | int (0-2) | Thin / Normal / Thick. |
 | `subtitle_font` | int (0-3) | Default / Malgun Bold / Gulim / Batang. |
 | `normalize_mode` | int (0-2) | Volume peak-based auto-normalize: Off / Soft / Strong. |
-| `loudness_normalize` | int (0/1) | Dynamic loudness normalize via `dynaudnorm` (added in 1.4.0). |
+| `loudness_normalize` | int (0/1) | Removed 2026-11-09. Key ignored on load. |
 | `audio_out_latency_ms` | int (0-500) | Assumed SDL-to-ear latency; shifts video-side release. Default 30 matches WASAPI shared + wired audio. |
 | `deinterlace_mode` | int (0-2) | Off (default) / Auto / On. |
 | `hdr_half_res` | int (0-2) | HDR half-resolution tone map: Off (default) / Auto (4K+ only) / Force on. |

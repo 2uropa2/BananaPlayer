@@ -199,12 +199,6 @@ private:
     // 60-200 ms; users on exclusive-mode / low-latency setups can go
     // 0-10 ms. Tuned once per system, not per file.
     int audio_out_latency_ms_ = 30;
-    // Loudness normalize (dynaudnorm). Off default - engages a filter
-    // in the audio decode path. Persists across files.
-    bool loudness_normalize_ = true;
-    // Voice boost. Cross-forum "explosions loud, dialogue quiet" fix.
-    // Off by default so the audio graph stays inert on load.
-    bool voice_boost_ = false;
     // Half-res-HDR user preference. Auto is default and turns half-
     // res on for 4K+ HDR (keeps 4K HDR playback smooth without a
     // config trip). Stored here just to persist to banana.config; the

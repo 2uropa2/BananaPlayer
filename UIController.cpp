@@ -2225,7 +2225,6 @@ void UIController::drawShortcutsPanel(int W, int H) {
             { "+  /  -",         "Same as Up / Down" },
             { "Mouse wheel",     "Volume (over video)" },
             { "M",               "Mute" },
-            { "Shift + N",       "Normalizer toggle (loudness)" },
         }},
         { "Speed", {
             { "[",               "Slower" },
@@ -3655,32 +3654,10 @@ void UIController::drawSettingsDialog(int W, int H) {
         if (ImGui::BeginTabItem("Audio")) {
             ImGui::Spacing();
             if (player_) {
-                // Loudness normalizer first - it's the one audio knob
-                // 99 % of users care about. Big label, no abbreviations,
-                // on at the top instead of buried below the peak-based
-                // mode. Shift+N hotkey shown on the row for muscle-memory.
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.95f, 1.0f, 1.0f));
-                ImGui::TextUnformatted("Loudness normalizer");
-                ImGui::PopStyleColor();
-                ImGui::SameLine();
-                ImGui::TextDisabled("  (Shift+N)");
-                bool ln = player_->isLoudnessNormalize();
-                if (ImGui::Checkbox("##loudness_on", &ln)) {
-                    player_->setLoudnessNormalize(ln);
-                    loudness_normalize_ = ln;
-                    markConfigDirty();
-                }
-                ImGui::SameLine();
-                ImGui::TextUnformatted(ln ? "ON  -  boosts quiet dialogue, caps loud peaks"
-                                          : "OFF  -  source volume unchanged");
-                ImGui::Spacing();
-                ImGui::Separator();
-                ImGui::Spacing();
-
                 VideoPlayer::NormalizeMode ncur = player_->getNormalizeMode();
                 int nm = (ncur == VideoPlayer::NormalizeMode::Strong) ? 2
                        : (ncur == VideoPlayer::NormalizeMode::Soft)   ? 1 : 0;
-                radio_group("Peak-based static gain (legacy)",
+                radio_group("Volume normalize (peak-based static gain)",
                             nm,
                             {{"Off",    0},
                              {"Soft   (peak 0.90)", 1},
@@ -3693,17 +3670,9 @@ void UIController::drawSettingsDialog(int W, int H) {
                                              : VideoPlayer::NormalizeMode::Off;
                                 player_->setNormalizeMode(nn);
                             });
-                ImGui::TextDisabled("One-shot measured gain. Prefer the loudness normalizer above.");
-                ImGui::Spacing();
-                bool vb = player_->isVoiceBoost();
-                if (ImGui::Checkbox("Voice boost (+6 dB @ 2.5 kHz presence band)",
-                                    &vb)) {
-                    player_->setVoiceBoost(vb);
-                    voice_boost_ = vb;
-                    markConfigDirty();
-                }
-                ImGui::TextDisabled("Emphasises consonants + dialogue clarity. "
-                                    "Composes with the normalizer.");
+                ImGui::TextDisabled("One-shot peak-based gain. "
+                                    "Dynamic loudness normalizer + voice boost were "
+                                    "removed in favor of playback stability.");
                 ImGui::Spacing();
                 radio_group("Audio output latency (ms)  -  video shift to match ear",
                             audio_out_latency_ms_,
@@ -7524,23 +7493,6 @@ void UIController::handleEvent(const SDL_Event& event) {
             }
             return;
         }
-        // Audio normalizer toggle (Shift+N). Ties to loudness_normalize
-        // (dynaudnorm in the audio decode graph) - the "make quiet
-        // dialogue louder without clipping loud action" one. Peak-based
-        // Volume normalize stays in Settings only. Checked BEFORE the
-        // plain-N next-in-playlist branch below.
-        if (sc == SDL_SCANCODE_N
-            && (mod & SDL_KMOD_SHIFT)
-            && !(mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT))) {
-            if (player_) {
-                bool nowOn = !player_->isLoudnessNormalize();
-                player_->setLoudnessNormalize(nowOn);
-                loudness_normalize_ = nowOn;
-                showOsd(nowOn ? "Normalizer on" : "Normalizer off");
-                markConfigDirty();
-            }
-            return;
-        }
         // Playlist next/prev. Ctrl+N/Ctrl+B kept for muscle memory; plain N
         // is the shorter standard-player binding when no letter conflicts.
         if (key == SDLK_N && (mod & SDL_KMOD_CTRL))         { playNextInPlaylist(); return; }
@@ -8060,12 +8012,10 @@ void UIController::loadConfig() {
             if (i < 0) i = 0; else if (i > 500) i = 500;
             audio_out_latency_ms_ = i;
         }
-        else if (std::strcmp(k, "loudness_normalize") == 0) {
-            loudness_normalize_ = std::atoi(v) != 0;
-        }
-        else if (std::strcmp(k, "voice_boost") == 0) {
-            voice_boost_ = std::atoi(v) != 0;
-        }
+        // Legacy keys from removed loudness normalizer / voice boost
+        // features; silently ignore so old banana.config parses cleanly.
+        else if (std::strcmp(k, "loudness_normalize") == 0) { /* removed */ }
+        else if (std::strcmp(k, "voice_boost") == 0)        { /* removed */ }
         else if (std::strcmp(k, "time_display_mode") == 0) {
             int i = std::atoi(v);
             if (i < 0 || i > 2) i = 0;
@@ -8160,8 +8110,6 @@ void UIController::loadConfig() {
                                          : VideoPlayer::HighResDownscaleMode::Auto;
         player_->setHighResDownscaleMode(hd);
         player_->setAudioOutputLatencyMs(audio_out_latency_ms_);
-        player_->setLoudnessNormalize(loudness_normalize_);
-        player_->setVoiceBoost(voice_boost_);
     }
 }
 
@@ -8183,8 +8131,6 @@ void UIController::saveConfig() {
     std::fprintf(fp, "yuv_range_mode=%d\n",     (int)yuv_range_mode_);
     std::fprintf(fp, "audio_out_latency_ms=%d\n", audio_out_latency_ms_);
     std::fprintf(fp, "time_display_mode=%d\n",  time_display_mode_);
-    std::fprintf(fp, "loudness_normalize=%d\n",   loudness_normalize_ ? 1 : 0);
-    std::fprintf(fp, "voice_boost=%d\n",          voice_boost_ ? 1 : 0);
     std::fprintf(fp, "hdr_half_res=%d\n",       hdr_half_res_mode_);
     std::fprintf(fp, "hires_downscale=%d\n",    hires_downscale_mode_);
     std::fprintf(fp, "pause_on_focus_loss=%d\n", pause_on_focus_loss_ ? 1 : 0);
