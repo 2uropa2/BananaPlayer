@@ -41,6 +41,20 @@ std::atomic<bool>    g_quit{false};
 std::thread          g_worker;
 std::string          g_cache_path;
 
+// In-flight WinHTTP handles published by the worker thread while a
+// request is open. shutdown() reads them under g_abort_mutex and calls
+// WinHttpCloseHandle on each still-open handle, which aborts any pending
+// sync call (Send/Receive/Read) with ERROR_WINHTTP_OPERATION_CANCELLED
+// so the worker's join returns in milliseconds instead of waiting out
+// the 5s-per-stage timeout. Ownership is transferred: whoever reads a
+// non-null slot under the mutex owns the close and must null the slot.
+#ifdef _WIN32
+std::mutex           g_abort_mutex;
+HINTERNET            g_abort_session = nullptr;
+HINTERNET            g_abort_connect = nullptr;
+HINTERNET            g_abort_request = nullptr;
+#endif
+
 // -------- Tiny JSON extractor (single-object, string-value only) --------
 //
 // The manifest is a flat object with string values only, no arrays and
@@ -172,19 +186,33 @@ std::string httpsGet(const std::string& url) {
                                     WINHTTP_NO_PROXY_NAME,
                                     WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session) return {};
+    { std::lock_guard<std::mutex> lk(g_abort_mutex); g_abort_session = session; }
     WinHttpSetTimeouts(session, 5000, 5000, 5000, 5000);
     HINTERNET connect = WinHttpConnect(session, host, uc.nPort, 0);
-    if (!connect) { WinHttpCloseHandle(session); return {}; }
+    if (!connect) {
+        HINTERNET s;
+        { std::lock_guard<std::mutex> lk(g_abort_mutex); s = g_abort_session; g_abort_session = nullptr; }
+        if (s) WinHttpCloseHandle(s);
+        return {};
+    }
+    { std::lock_guard<std::mutex> lk(g_abort_mutex); g_abort_connect = connect; }
     DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
     HINTERNET request = WinHttpOpenRequest(connect, L"GET", path,
                                            nullptr, WINHTTP_NO_REFERER,
                                            WINHTTP_DEFAULT_ACCEPT_TYPES,
                                            flags);
     if (!request) {
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
+        HINTERNET c, s;
+        {
+            std::lock_guard<std::mutex> lk(g_abort_mutex);
+            c = g_abort_connect; g_abort_connect = nullptr;
+            s = g_abort_session; g_abort_session = nullptr;
+        }
+        if (c) WinHttpCloseHandle(c);
+        if (s) WinHttpCloseHandle(s);
         return {};
     }
+    { std::lock_guard<std::mutex> lk(g_abort_mutex); g_abort_request = request; }
     std::string body;
     if (WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
@@ -198,9 +226,18 @@ std::string httpsGet(const std::string& url) {
             body.append(chunk.data(), got);
         }
     }
-    WinHttpCloseHandle(request);
-    WinHttpCloseHandle(connect);
-    WinHttpCloseHandle(session);
+    // Claim handles back from the abort slots before closing. If shutdown
+    // already closed any of them (and nulled the slot), skip here.
+    HINTERNET r, c, s;
+    {
+        std::lock_guard<std::mutex> lk(g_abort_mutex);
+        r = g_abort_request; g_abort_request = nullptr;
+        c = g_abort_connect; g_abort_connect = nullptr;
+        s = g_abort_session; g_abort_session = nullptr;
+    }
+    if (r) WinHttpCloseHandle(r);
+    if (c) WinHttpCloseHandle(c);
+    if (s) WinHttpCloseHandle(s);
     return body;
 }
 #else
@@ -244,6 +281,22 @@ void start(const std::string& cache_dir) {
 
 void shutdown() {
     g_quit.store(true);
+#ifdef _WIN32
+    // Abort any in-flight WinHTTP call so the worker's blocking Send /
+    // Receive / Read returns immediately. Without this, join below can
+    // wait out WinHTTP's 5s-per-stage timeout (~20s worst case) while
+    // the player's video file handle stays held open.
+    HINTERNET r, c, s;
+    {
+        std::lock_guard<std::mutex> lk(g_abort_mutex);
+        r = g_abort_request; g_abort_request = nullptr;
+        c = g_abort_connect; g_abort_connect = nullptr;
+        s = g_abort_session; g_abort_session = nullptr;
+    }
+    if (r) WinHttpCloseHandle(r);
+    if (c) WinHttpCloseHandle(c);
+    if (s) WinHttpCloseHandle(s);
+#endif
     if (g_worker.joinable()) g_worker.join();
     g_running.store(false);
     std::lock_guard<std::mutex> lk(g_mutex);
